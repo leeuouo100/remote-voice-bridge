@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.venv/
+venv/
+
+# 构建产物（安装包通过 GitHub Release 分发，不进仓库）
+build/
+dist/
+installer/
+*.spec.bak
