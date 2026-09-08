@@ -6,7 +6,8 @@ __pycache__/
 venv/
 
 # 构建产物（安装包通过 GitHub Release 分发，不进仓库）
-build/
-dist/
+# 用通配：本地验证时可能输出到 dist_v2/ build_v2/ 等临时目录
+build*/
+dist*/
 installer/
 *.spec.bak

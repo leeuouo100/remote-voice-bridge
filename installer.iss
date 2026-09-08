@@ -31,7 +31,9 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 语言包随仓库提供：GitHub runner 自带�� Inno Setup 没有中文包，
+; 直接引用 compiler:Languages\ChineseSimplified.isl 会编译失败。
+Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
