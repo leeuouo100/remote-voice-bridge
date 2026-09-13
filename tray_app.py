@@ -29,6 +29,12 @@ LOG_FILE  = CONFIG_DIR / "bridge.log"
 RUN_KEY   = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "RemoteVoiceBridge"
 
+# 控制台日志面板的加载上限。
+# 这个日志实测能长到 2.4MB / 34000 行 —— 首次打开时一次性塞进 Text 控件
+# 会让窗口卡死好几秒，所以只加载尾部，并限制控件内保留的行数。
+_LOG_TAIL_BYTES = 120_000
+_LOG_MAX_LINES  = 3000
+
 _stop = threading.Event()
 _icon: "pystray.Icon | None" = None
 
@@ -189,6 +195,45 @@ def build_menu(icon) -> pystray.Menu:
     )
 
 
+# ── 波形绘制 ─────────────────────────────────────────────────────────────────
+def _draw_waveform(canvas, pts: list[int], fresh: bool,
+                   w: int | None = None, h: int | None = None) -> None:
+    """在 canvas 上画实时波形。
+
+    自适应幅度：波形的用途是"一眼看出有没有声音进来"。若用固定满量程刻度，
+    说话音量偏小就会画成一条直线，看起来像坏了 —— 所以按窗口内峰值归一化，
+    真实音量交给旁边的「峰值」数字表达。
+
+    w/h 可显式传入，便于离屏测试（未 map 的 canvas 上 winfo_width() 恒为 1）。
+    """
+    w = max(1, w if w is not None else canvas.winfo_width())
+    h = max(1, h if h is not None else canvas.winfo_height())
+    mid = h / 2.0
+    canvas.delete("all")
+    canvas.create_line(0, mid, w, mid, fill="#ececec")
+
+    if not pts:
+        # 这一段会话还没收到任何音频
+        canvas.create_text(w / 2, mid, fill="#b0b0b0",
+                           font=("Microsoft YaHei UI", 9),
+                           text="等待音频…（按住遥控器语音键说话）")
+        return
+
+    peak = max((abs(p) for p in pts), default=0) or 1
+    scale = (h * 0.44) / peak
+    step = w / max(1, len(pts) - 1)
+    coords: list[float] = []
+    for i, p in enumerate(pts):
+        coords.extend((i * step, mid - p * scale))
+    if len(coords) >= 4:
+        # 停止后**不清空**波形，只转灰 ——
+        # 否则一松手波形就消失，看不到刚才说了什么。
+        canvas.create_line(*coords, fill=("#e86030" if fresh else "#cfcfcf"), width=1.4)
+    canvas.create_text(6, 10, anchor="w", fill="#c8c8c8",
+                       font=("Microsoft YaHei UI", 8),
+                       text="实时 · 自适应放大" if fresh else "已停止 · 上一段")
+
+
 # ── 控制台窗口 ────────────────────────────────────────────────────────────────
 def _console_main():
     import tkinter as tk
@@ -196,10 +241,10 @@ def _console_main():
 
     root = tk.Tk()
     root.title(f"{APP_NAME} · 控制台")
-    root.geometry("720x460")
-    root.minsize(560, 360)
+    root.geometry("780x620")
+    root.minsize(640, 500)
 
-    # 状态区
+    # ── 状态行 ──────────────────────────────────────────────────────────────
     top = tk.Frame(root)
     top.pack(fill="x", padx=12, pady=(12, 6))
 
@@ -209,20 +254,35 @@ def _console_main():
     lbl_im = tk.Label(top, text="", font=("Microsoft YaHei UI", 9), fg="#666")
     lbl_im.pack(side="right")
 
-    # 电平条
+    # ── 实时波形 ────────────────────────────────────────────────────────────
+    tk.Label(root, text="实时语音输入", font=("Microsoft YaHei UI", 9),
+             fg="#666").pack(anchor="w", padx=12)
+
+    wave = tk.Canvas(root, height=116, bg="#ffffff",
+                     highlightthickness=1, highlightbackground="#dddddd")
+    wave.pack(fill="x", padx=12, pady=(2, 6))
+
+    # ── 电平条 ──────────────────────────────────────────────────────────────
     lvl_frame = tk.Frame(root)
-    lvl_frame.pack(fill="x", padx=12, pady=(0, 8))
+    lvl_frame.pack(fill="x", padx=12, pady=(0, 2))
     tk.Label(lvl_frame, text="电平", font=("Microsoft YaHei UI", 9),
              fg="#666").pack(side="left")
-    canvas = tk.Canvas(lvl_frame, height=10, bg="#eeeeee", highlightthickness=0)
-    canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
+    level_canvas = tk.Canvas(lvl_frame, height=10, bg="#eeeeee",
+                             highlightthickness=0, width=220)
+    level_canvas.pack(side="left", padx=(8, 8))
+    lbl_lvl = tk.Label(lvl_frame, text="0%", font=("Consolas", 9), fg="#666")
+    lbl_lvl.pack(side="left")
 
-    # 日志区
-    txt = scrolledtext.ScrolledText(root, font=("Consolas", 9), wrap="none")
+    # ── 诊断指标 ────────────────────────────────────────────────────────────
+    lbl_stat = tk.Label(root, text="", font=("Consolas", 9), fg="#666", anchor="w")
+    lbl_stat.pack(fill="x", padx=12, pady=(0, 8))
+
+    # ── 日志区 ──────────────────────────────────────────────────────────────
+    txt = scrolledtext.ScrolledText(root, font=("Consolas", 9), wrap="none", height=12)
     txt.pack(fill="both", expand=True, padx=12, pady=(0, 12))
     txt.configure(state="disabled")
 
-    # 按钮区
+    # ── 按钮区 ──────────────────────────────────────────────────────────────
     btns = tk.Frame(root)
     btns.pack(fill="x", padx=12, pady=(0, 12))
     tk.Button(btns, text="重新连接", command=lambda: subprocess.Popen(_launch_cmd())
@@ -235,8 +295,14 @@ def _console_main():
 
     last_size = [0]
 
+    def _draw_wave(s) -> None:
+        fresh = bool(s.audio_last_at) and (time.time() - s.audio_last_at) < 1.0
+        _draw_waveform(wave, state.wave_snapshot(), fresh)
+
     def refresh():
         s = state.get()
+
+        # 状态
         if s.streaming:
             lbl_status.configure(text=f"● 语音中 · {s.device or '遥控器'}", fg="#e86030")
         elif s.connected:
@@ -246,17 +312,46 @@ def _console_main():
 
         cfg = Config.load()
         im = INPUT_METHODS.get(cfg.input_method, {})
-        lbl_im.configure(text=f"输入法：{im.get('desc', cfg.input_method)}")
+        lbl_im.configure(
+            text=f"输入法：{im.get('desc', cfg.input_method)}　语音键："
+                 f"{'+'.join(cfg.trigger_keys_windows()) or '未配置'}（{cfg.hotkey_mode}）"
+        )
+
+        # 波形
+        _draw_wave(s)
 
         # 电平
-        canvas.delete("bar")
-        cw = max(1, canvas.winfo_width())
+        level_canvas.delete("bar")
+        cw = max(1, level_canvas.winfo_width())
         fill_w = int(cw * min(100, max(0, s.level)) / 100)
         if fill_w > 0:
-            canvas.create_rectangle(0, 0, fill_w, 10, fill="#e86030",
-                                    outline="", tags="bar")
+            level_canvas.create_rectangle(0, 0, fill_w, 10, fill="#e86030",
+                                          outline="", tags="bar")
+        lbl_lvl.configure(text=f"{s.level}%")
 
-        # 日志增量追加
+        # 诊断指标 —— 这一行就是用来回答"输入法没反应，到底是没收到音频还是没触发输入法"
+        ago = (time.time() - s.audio_last_at) if s.audio_last_at else None
+        parts = []
+        if s.sample_rate:
+            parts.append(f"{s.sample_rate}Hz")
+        if s.frame_bytes:
+            parts.append(f"{s.frame_bytes}B/帧")
+        if ago is not None:
+            parts.append(f"最后音频 {ago:.1f}s 前")
+        tail = "　·　".join(parts)
+
+        if s.streaming and s.audio_frames == 0:
+            lbl_stat.configure(
+                text=f"⚠ 本次 0 帧 —— 音频根本没上来（遥控器在推流，但解码后没有数据）",
+                fg="#c62828")
+        elif s.audio_frames:
+            lbl_stat.configure(
+                text=f"本次 {s.audio_frames} 帧　·　峰值 {s.audio_peak}{('　·　' + tail) if tail else ''}",
+                fg="#444444")
+        else:
+            lbl_stat.configure(text=tail, fg="#999999")
+
+        # 日志增量追加（首次只取尾部，见 _LOG_TAIL_BYTES 的说明）
         try:
             if LOG_FILE.exists():
                 size = LOG_FILE.stat().st_size
@@ -267,17 +362,24 @@ def _console_main():
                     txt.configure(state="disabled")
                 if size > last_size[0]:
                     with LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
-                        f.seek(last_size[0])
+                        if last_size[0] == 0 and size > _LOG_TAIL_BYTES:
+                            f.seek(size - _LOG_TAIL_BYTES)
+                            f.readline()          # 丢掉被截断的半行
+                        else:
+                            f.seek(last_size[0])
                         chunk = f.read()
                     last_size[0] = size
                     txt.configure(state="normal")
                     txt.insert("end", chunk)
+                    if int(txt.index("end-1c").split(".")[0]) > _LOG_MAX_LINES:
+                        txt.delete("1.0", f"{_LOG_MAX_LINES // 2}.0")
                     txt.see("end")
                     txt.configure(state="disabled")
         except Exception:
             pass
 
-        root.after(400, refresh)
+        # 150ms：波形要跟得上，又不能太费 —— 这个窗口本身很轻
+        root.after(150, refresh)
 
     def on_close():
         global _console_open

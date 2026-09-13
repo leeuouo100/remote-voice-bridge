@@ -37,8 +37,12 @@ DEVICES: dict[str, DeviceSig] = {
 # ── Input method bindings ────────────────────────────────────────────────────
 INPUT_METHODS = {
     "wechat": {
-        "macos_keys":    ["option", "command"],   # Option+Command
-        "windows_keys":  ["alt", "shift", "m"],   # Alt+Shift+M
+        # ⚠ 必须与「微信输入法 → 设置 → 语音输入 / 快捷键」里显示的快捷键一致。
+        # 默认取 Ctrl+Win：微信输入法（2.1.3+）与微信 PC 的语音输入都是
+        # 「按住说话、松开结束识别」，是 PTT 语义，与本桥的按住模型天然对应。
+        # 若你的输入法实际显示别的组合，改这里，或直接改 config.json 的 voice_hotkey。
+        "macos_keys":    ["option", "command"],
+        "windows_keys":  ["ctrl", "win"],
         "bundle_macos":  "com.tencent.xinshurufa",
         "desc": "微信输入法（默认）",
     },
@@ -110,15 +114,23 @@ class Config:
     heartbeat_cooldown: float   = 2.0
     gatt_timeout:     float     = 5.0
     voice_mode:       str       = "toggle"    # "toggle" | "hold"
+    # 语音快捷键的触发方式：
+    #   "hold" = 按住（微信输入法 / 微信 PC 都是「长按说话、松开结束识别」）← 默认
+    #   "tap"  = 点一下开始、再点一下结束（部分输入法是端点式）
+    hotkey_mode:      str       = "hold"
+    # 非空则覆盖 INPUT_METHODS 内置组合，例如 ["ctrl","win"] 或 ["alt","shift","m"]
+    voice_hotkey:     list[str] = field(default_factory=list)
     # True = 拦截已映射的键。注意遥控器走 HID，与物理键盘无法区分，
     # 开启后物理键盘的 Enter/Esc/方向键也会被吞掉，故默认关闭。
     suppress_keys:    bool      = False
 
     def trigger_keys_windows(self) -> list[str]:
         """Return the Windows hotkey list for the configured input method."""
+        if self.voice_hotkey:
+            return list(self.voice_hotkey)
         im = INPUT_METHODS.get(self.input_method, INPUT_METHODS["wechat"])
         if self.input_method == "custom":
-            return self.custom_keys if self.custom_keys else ["alt", "shift", "m"]
+            return self.custom_keys if self.custom_keys else ["ctrl", "win"]
         return im["windows_keys"]
 
     def trigger_keys_macos(self) -> list[str]:

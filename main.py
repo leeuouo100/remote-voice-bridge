@@ -23,7 +23,7 @@ from atvv import (
 )
 from adpcm import IMAADPCMDecoder
 from session import SessionCoordinator, Phase
-from keys import trigger_voice_hotkey
+from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up
 from buttons import resolve_button
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -47,6 +47,29 @@ logger = logging.getLogger("rvb")
 _sample_queue = queue.Queue(maxsize=65536)
 _pending_samples = deque()
 _GAIN = 10.0
+
+# 诊断计数：用来判断"遥控器到底有没有把音频推上来"。
+# 之前这两个数字完全没有记录，导致"输入法没反应"无法区分是没收到音频、
+# 还是收到了但没触发输入法 —— 只能靠猜。
+_audio_frames = 0
+_audio_peak   = 0
+
+
+def _downsample(samples: list[int], n: int = 4) -> list[int]:
+    """把一帧音频压成 n 个代表点，给 UI 画波形用。
+
+    每段取**绝对值最大**的那个，而不是平均 —— 波形的用途是"一眼看出有没有
+    声音进来"，平均值会把语音削平成一条直线，峰值能保住轮廓。
+    """
+    if not samples:
+        return [0] * n
+    step = max(1, len(samples) // n)
+    out: list[int] = []
+    for i in range(0, len(samples), step):
+        seg = samples[i:i + step]
+        if seg:
+            out.append(max(seg, key=abs))
+    return (out + [0] * n)[:n]
 
 
 def _find_cable(device_name: str = "CABLE Input"):
@@ -145,6 +168,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     logger.info("remote-voice-bridge starting")
     logger.info(f"  Device : {cfg.device}  ({sig.vid:04X}:{sig.pid:04X})" if sig else f"  Device : {cfg.device}")
     logger.info(f"  IM     : {cfg.input_method}  audio: {cfg.audio_output}  gain: {_GAIN}x")
+    logger.info(f"  Voice  : {'+'.join(cfg.trigger_keys_windows()) or '(未配置)'}  mode={cfg.hotkey_mode}")
     logger.info(f"  Watchdog: {cfg.watchdog_timeout}s  Reconnect: {cfg.reconnect_delay}s")
     logger.info("=" * 60)
 
@@ -257,6 +281,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search
+        global _audio_frames, _audio_peak
         last_ble_activity = time.time()
         try:
             data = bytes(args.characteristic_value)
@@ -277,13 +302,18 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 atvv.state.decoder.reset()
                 _pending_samples.clear()
                 logger.info("▶ Audio START")
+                _audio_frames = 0
+                _audio_peak   = 0
+                state.clear_audio()          # 清掉上一次的波形，UI 从空开始画
                 state.update(streaming=True, last_event="语音中…")
-                trigger_voice_hotkey()
+                # hold 模式 = 按住快捷键（微信输入法：长按说话，松开结束识别）
+                voice_hotkey_down()
             elif event["type"] == "audio_stop":
                 session.on_audio_stop(event["reason"])
-                logger.info("⏹ Audio STOP")
+                # 必须先松开快捷键，再打日志：松手这一刻输入法才会开始识别并上屏
+                voice_hotkey_up()
+                logger.info(f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，峰值 {_audio_peak}）")
                 state.update(streaming=False, level=0, last_event="语音结束")
-                trigger_voice_hotkey()
             elif event["type"] == "mic_open_result":
                 session.on_mic_open_result(event["code"])
             elif event["type"] == "start_search":
@@ -303,6 +333,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     def on_audio(sender, args):
         nonlocal last_ble_activity
+        global _audio_frames, _audio_peak
         last_ble_activity = time.time()
         if not atvv.state.stream_active:
             return
@@ -311,7 +342,24 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             samples = atvv.decode_audio(raw)
             if samples is None:
                 return
-            _pending_samples.extend(samples)
+            _audio_frames += 1
+            peak = max((abs(s) for s in samples), default=0)
+            if peak > _audio_peak:
+                _audio_peak = peak
+            # 电平表：按 int16 满量程折算，×3 让正常说话也能推出半格
+            level = min(100, int(peak * 300 / 32768))
+            # 喂给 UI：波形点 + 诊断指标（帧数/峰值/采样率）
+            state.push_audio(_downsample(samples, 4), level, _audio_frames, _audio_peak,
+                             atvv.state.sample_rate, len(raw))
+            if _audio_frames == 1:
+                logger.info(f"🔊 收到第一个音频帧：{len(raw)}B → {len(samples)} 采样")
+            elif _audio_frames % 100 == 0:
+                logger.info(f"🔊 音频帧 {_audio_frames}（{len(raw)}B/帧，峰值 {_audio_peak}）")
+
+            # ⚠ 只能走队列这一条路。
+            # 早前这里还额外做了一次 `_pending_samples.extend(samples)`，
+            # 而播放回调在 `_pending_samples` 空时也会从同一个队列里取同一批数据
+            # —— 等于每个采样被播两遍，音频变成断续碎片，喂给输入法必然是垃圾。
             try:
                 _sample_queue.put_nowait(samples)
             except queue.Full:
@@ -380,9 +428,11 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     }
 
     def _on_key(e):
-        nonlocal last_key_activity
+        nonlocal last_key_activity, last_ble_activity
         if e.event_type == "down":
             last_key_activity = time.time()
+            # 遥控器按键 = 它还活着。也算一次"活动"，避免被 watchdog 误判掉线。
+            last_ble_activity = time.time()
 
         # Map key name → button_id
         btn_id = KEY_MAP.get(e.name, "")
@@ -408,10 +458,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     logger.info(f"✅ Keyboard hooks active (suppress={cfg.suppress_keys})")
 
     # ── Health check ──
-    async def check_health() -> bool:
+    async def check_health(force: bool = False) -> bool:
         nonlocal last_health_check
         now = time.time()
-        if now - last_health_check < cfg.heartbeat_cooldown:
+        if not force and now - last_health_check < cfg.heartbeat_cooldown:
             return True
         last_health_check = now
         try:
@@ -441,10 +491,18 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 logger.warning("📡 Disconnected")
                 break
 
+            # ⚠ 原来的逻辑：ATVV 静默超过 watchdog_timeout 就断线重连。
+            # 但遥控器的按键走的是 HID 通道，不产生 ATVV 通知 —— 所以「ATVV 静默」
+            # 完全不等于「链路断了」。实测后果：每 180 秒无条件重连一次，
+            # 每次重连约 4 秒内遥控器不可用（日志里 02:14:11 / 02:17:15 两次即是）。
+            # 正确做法：静默只当作"疑似"，必须再做一次 GATT 读确认才断开。
             idle = time.time() - last_ble_activity
             if idle > cfg.watchdog_timeout:
-                logger.warning(f"⏱️  Watchdog: {idle:.0f}s idle → reconnect")
-                break
+                if not await check_health(force=True):
+                    logger.warning(f"⏱️  Watchdog: ATVV 静默 {idle:.0f}s 且健康检查失败 → reconnect")
+                    break
+                last_ble_activity = time.time()
+                logger.debug(f"💓 Watchdog: ATVV 静默 {idle:.0f}s，但链路正常，继续")
 
             if (time.time() - last_key_activity < cfg.key_check_window and
                     time.time() - last_health_check > cfg.heartbeat_cooldown):
@@ -456,6 +514,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         ran_ok = True
         logger.info("\n⏹️  Interrupted")
     finally:
+        # 安全兜底：退出/断线时绝不能把快捷键按着不放 ——
+        # 否则 Ctrl / Win 会一直处于按下状态，整台电脑的键盘都会不正常。
+        try: hotkey_up()
+        except Exception: pass
         state.reset()
         if stream:
             try: stream.stop(); stream.close()

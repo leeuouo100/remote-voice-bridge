@@ -2,7 +2,7 @@
 ; 构建： iscc installer.iss   （需先跑 pyinstaller 产出 dist/RemoteVoiceBridge/）
 
 #define MyAppName "Remote Voice Bridge"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "remote-voice-bridge"
 #define MyAppURL "https://github.com/leeuouo100/remote-voice-bridge"
 #define MyAppExeName "RemoteVoiceBridge.exe"
