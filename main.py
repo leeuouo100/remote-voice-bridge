@@ -15,7 +15,7 @@ import uuid
 from collections import deque
 from typing import Optional
 
-from config import DEVICES, Config, find_device_by_name
+from config import DEVICES, Config, find_device_by_name, hotkey_label
 import state
 from atvv import (
     ATVVProtocol, SERVICE_UUID, TX_UUID, AUDIO_UUID, CTL_UUID,
@@ -168,7 +168,8 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     logger.info("remote-voice-bridge starting")
     logger.info(f"  Device : {cfg.device}  ({sig.vid:04X}:{sig.pid:04X})" if sig else f"  Device : {cfg.device}")
     logger.info(f"  IM     : {cfg.input_method}  audio: {cfg.audio_output}  gain: {_GAIN}x")
-    logger.info(f"  Voice  : {'+'.join(cfg.trigger_keys_windows()) or '(未配置)'}  mode={cfg.hotkey_mode}")
+    _vk = cfg.trigger_keys_windows()
+    logger.info(f"  Voice  : {hotkey_label(_vk) or '(未配置)'}  [{'+'.join(_vk) or '-'}]  mode={cfg.hotkey_mode}")
     logger.info(f"  Watchdog: {cfg.watchdog_timeout}s  Reconnect: {cfg.reconnect_delay}s")
     logger.info("=" * 60)
 

@@ -21,7 +21,7 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
-from config import CONFIG_DIR, INPUT_METHODS, Config
+from config import CONFIG_DIR, INPUT_METHODS, Config, hotkey_label
 import state
 
 APP_NAME  = "Remote Voice Bridge"
@@ -312,9 +312,10 @@ def _console_main():
 
         cfg = Config.load()
         im = INPUT_METHODS.get(cfg.input_method, {})
+        _vk = cfg.trigger_keys_windows()
         lbl_im.configure(
             text=f"输入法：{im.get('desc', cfg.input_method)}　语音键："
-                 f"{'+'.join(cfg.trigger_keys_windows()) or '未配置'}（{cfg.hotkey_mode}）"
+                 f"{hotkey_label(_vk) or '未配置'}（{cfg.hotkey_mode}）"
         )
 
         # 波形

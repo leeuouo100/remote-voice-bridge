@@ -37,20 +37,29 @@ DEVICES: dict[str, DeviceSig] = {
 # ── Input method bindings ────────────────────────────────────────────────────
 INPUT_METHODS = {
     "wechat": {
-        # ⚠ 必须与「微信输入法 → 设置 → 语音输入 / 快捷键」里显示的快捷键一致。
-        # 默认取 Ctrl+Win：微信输入法（2.1.3+）与微信 PC 的语音输入都是
-        # 「按住说话、松开结束识别」，是 PTT 语义，与本桥的按住模型天然对应。
-        # 若你的输入法实际显示别的组合，改这里，或直接改 config.json 的 voice_hotkey。
-        "macos_keys":    ["option", "command"],
-        "windows_keys":  ["ctrl", "win"],
+        # ⚠ 必须与「微信输入法 → 设置 → 语音输入」里显示的键一致。
+        #
+        # 微信输入法的语音唤起键是「长按**右 Alt**」——注意是右侧那个 Alt
+        # （AltGr），与左 Alt 不是同一个键，所以这里写 "ralt" 而不是 "alt"。
+        # 它**全局生效**：微信、豆包、记事本、浏览器……任何输入框都能用。
+        #
+        # 别跟「微信 PC 客户端」（4.1.8+）搞混：那是按住 Ctrl+Win，
+        # 但只在微信自己的窗口里生效，在豆包之类的地方按了毫无反应。
+        #
+        # 若你的输入法里显示的是别的组合，直接改 config.json 的 voice_hotkey，
+        # 不必改这里。
+        "macos_keys":    [],                      # macOS 版是长按 Fn，系统级合成受限，见 custom_keys
+        "windows_keys":  ["ralt"],
         "bundle_macos":  "com.tencent.xinshurufa",
-        "desc": "微信输入法（默认）",
+        "desc": "微信输入法（默认，长按右 Alt）",
     },
     "doubao": {
-        "macos_keys":    ["option"],              # Option (单键)
-        "windows_keys":  ["ctrl", "win"],         # Ctrl+Win
+        # 豆包输入法设置里可选「右 Alt / 右 Alt + 空格 / 左 Ctrl + Win」，
+        # 默认是右 Alt，与微信输入法一致。
+        "macos_keys":    [],                      # macOS 版是长按右 Option，同上
+        "windows_keys":  ["ralt"],
         "bundle_macos":  "com.bytedance.inputmethod.doubaoime",
-        "desc": "豆包输入法",
+        "desc": "豆包输入法（长按右 Alt）",
     },
     "custom": {
         "macos_keys":    [],
@@ -100,6 +109,25 @@ DEFAULT_KEYMAP = {
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# 把内部键名翻成人话，给控制台/日志用。
+# 为什么要翻：`ralt` 这种写法用户看不懂，而「右 Alt / 左 Alt 是两个不同的键」
+# 恰恰是这个项目最容易踩的坑，直接显示中文能省掉一轮排查。
+_KEY_LABELS = {
+    "ralt": "右Alt", "altgr": "右Alt", "lalt": "左Alt", "alt": "Alt",
+    "lctrl": "左Ctrl", "rctrl": "右Ctrl", "ctrl": "Ctrl", "control": "Ctrl",
+    "lshift": "左Shift", "rshift": "右Shift", "shift": "Shift",
+    "lwin": "左Win", "rwin": "右Win", "win": "Win",
+    "space": "空格", "enter": "回车", "tab": "Tab", "esc": "Esc",
+}
+
+
+def hotkey_label(keys: list[str] | None) -> str:
+    """['ralt'] → '右Alt'；不认识的原样大写返回。"""
+    if not keys:
+        return ""
+    return "+".join(_KEY_LABELS.get(str(k).strip().lower(), str(k).upper()) for k in keys)
+
+
 @dataclass
 class Config:
     device:           str       = "chromecast"
@@ -115,10 +143,13 @@ class Config:
     gatt_timeout:     float     = 5.0
     voice_mode:       str       = "toggle"    # "toggle" | "hold"
     # 语音快捷键的触发方式：
-    #   "hold" = 按住（微信输入法 / 微信 PC 都是「长按说话、松开结束识别」）← 默认
+    #   "hold" = 按住（微信输入法 / 豆包输入法都是「长按说话、松开结束识别」）← 默认
     #   "tap"  = 点一下开始、再点一下结束（部分输入法是端点式）
     hotkey_mode:      str       = "hold"
-    # 非空则覆盖 INPUT_METHODS 内置组合，例如 ["ctrl","win"] 或 ["alt","shift","m"]
+    # 非空则覆盖 INPUT_METHODS 内置组合。
+    # 键名支持：ralt(右Alt) / lalt / alt / ctrl / win / shift / 字母 / f1-f24 / space …
+    # 例如 ["ralt"] 或 ["ctrl","win"] 或 ["ralt","space"]
+    # 用 tools/test_voice_hotkey.py 可以直接试哪组键能唤起输入法。
     voice_hotkey:     list[str] = field(default_factory=list)
     # True = 拦截已映射的键。注意遥控器走 HID，与物理键盘无法区分，
     # 开启后物理键盘的 Enter/Esc/方向键也会被吞掉，故默认关闭。
@@ -130,13 +161,13 @@ class Config:
             return list(self.voice_hotkey)
         im = INPUT_METHODS.get(self.input_method, INPUT_METHODS["wechat"])
         if self.input_method == "custom":
-            return self.custom_keys if self.custom_keys else ["ctrl", "win"]
+            return self.custom_keys if self.custom_keys else ["ralt"]
         return im["windows_keys"]
 
     def trigger_keys_macos(self) -> list[str]:
         im = INPUT_METHODS.get(self.input_method, INPUT_METHODS["wechat"])
         if self.input_method == "custom":
-            return self.custom_keys if self.custom_keys else ["option", "command"]
+            return self.custom_keys if self.custom_keys else ["option"]
         return im["macos_keys"]
 
     def to_dict(self) -> dict:

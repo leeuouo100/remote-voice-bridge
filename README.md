@@ -44,16 +44,26 @@ Copyright © 2026 Sima Qingfeng）。原项目为本仓库提供了协议与会�
 
 ---
 
-## v1.0.1：真机实测抓到的三个问题
+## v1.0.1：真机实测抓到的四个问题
 
 v1.0.0 发布后在真机上跑，**遥控器这一侧完全正常**（配对、ATVV 握手、MIC_OPEN、
 遥控器推流全都对），但**按着说话输入法一个字都不出**。日志把范围锁死到了音频之后：
 
+> ⚠️ **最容易搞混的一点：微信输入法 ≠ 微信 PC 客户端。**
+>
+> | 产品 | 语音唤起键 | 生效范围 |
+> |---|---|---|
+> | **微信输入法**（本程序对接的） | **长按右 Alt** | **全局**——微信、豆包、记事本、浏览器都能用 |
+> | 微信 PC 客户端 4.1.8+ | 按住 Ctrl+Win | **仅微信自己的窗口内** |
+>
+> 所以默认键位是 `ralt`（右 Alt），不是 `Ctrl+Win`。
+
 | # | 问题 | 后果 | 修复 |
 |---|------|------|------|
-| 1 | 把「按住说话」做成了「点一下」，且键位写的是 `Alt+Shift+M` | 微信输入法/微信 PC 的语音输入都是**长按说话、松开结束识别**，点一下只录到约 50ms 空气；`Alt+Shift` 还是 Windows 切换输入法的系统热键 | `keys.py` 改用 **SendInput** 的 key-down/key-up，语音开始=按住、结束=松开；默认键位改 `Ctrl+Win`，可用 `voice_hotkey` 覆盖，`hotkey_mode` 支持 `hold`/`tap` |
+| 1 | 把「按住说话」做成了「点一下」，且键位写的是 `Alt+Shift+M` | 输入法的语音输入都是**长按说话、松开结束识别**，点一下只录到约 50ms 空气；`Alt+Shift` 还是 Windows 切换输入法的系统热键 | `keys.py` 改用 **SendInput** 的 key-down/key-up，语音开始=按住、结束=松开；`hotkey_mode` 支持 `hold`/`tap` |
 | 2 | **每个采样被播放两遍**：`on_audio` 既直接塞进播放缓冲、又入队，而播放回调两条路都会取到同一批数据 | 音频变成断续、倍速的碎片，就算触发了输入法，喂给 ASR 的也是垃圾 | 删掉直接 extend，音频只走队列一条路 |
 | 3 | watchdog 每 **180 秒**无条件重连：它以为「ATVV 静默 = 掉线」，但**遥控器按键走 HID 通道、不产生 ATVV 通知** | 每次重连约 4 秒内遥控器完全不可用 | ATVV 静默只当「疑似」，必须再做一次 GATT 读确认失败才断开；HID 按键也刷新活动时间 |
+| 4 | 默认触发键写成了 `Ctrl+Win` | 那是**微信 PC 客户端**（4.1.8+）的语音键，**只在微信自己的窗口里生效**——在豆包、记事本、浏览器里按了毫无反应。而微信输入法 / 豆包输入法用的都是**长按右 Alt**，全局生效 | 默认改为 `ralt`。右 Alt 必须用 `KEYEVENTF_SCANCODE` 下发硬件扫描码（`0x38` + 扩展位），否则只发通用 `VK_MENU(0x12)` 会被输入法当成**左** Alt 直接忽略 |
 
 同时补齐了**音频可见性**（此前完全没有）：控制台现在有
 **实时语音波形 + 电平 + 本次帧数/峰值 + 「最后音频 N 秒前」**，
@@ -119,7 +129,7 @@ pyinstaller remote-voice-bridge.spec --noconfirm
 iscc installer.iss            :: 需安装 Inno Setup 6
 ```
 
-产物：`installer\RemoteVoiceBridge-Setup-1.0.0.exe`
+产物：`installer\RemoteVoiceBridge-Setup-1.0.1.exe`
 
 ### GitHub Actions 自动构建（推荐）
 
@@ -127,7 +137,7 @@ iscc installer.iss            :: 需安装 Inno Setup 6
 `Setup.exe` 挂到 Release：
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.0.1 && git push origin v1.0.1
 ```
 
 也可在 Actions 页面手动 `Run workflow`。

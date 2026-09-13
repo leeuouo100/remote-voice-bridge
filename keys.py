@@ -94,22 +94,48 @@ def trigger_voice_hotkey(keys: list[str] | None = None) -> None:
 
 # ── Press-and-hold hotkey (Windows SendInput) ────────────────────────────────
 # 为什么必须"按住"而不是"点一下"：
-#   微信输入法 / 微信 PC 的语音输入都是「长按说话、松开结束识别」。
+#   微信输入法 / 豆包输入法的语音输入都是「长按说话、松开结束识别」。
 #   点按一次只会录到几十毫秒的空气，识别结果必然是空的。
 #   遥控器的语音键本身就是 PTT —— 按下=开麦，松开=停麦，
 #   与"按住快捷键"天然一一对应，所以用 key-down / key-up 而不是 tap。
 #
+# 为什么默认是「右 Alt」：
+#   微信输入法（Windows 2.1.0+）的语音唤起键是长按**右 Alt**，全局生效；
+#   豆包输入法提供「右 Alt / 右 Alt+空格 / 左 Ctrl+Win」三种，默认也是右 Alt。
+#   别跟「微信 PC 客户端」搞混：那是按住 Ctrl+Win，但只在微信自己的窗口里有用，
+#   在豆包、记事本、浏览器里按了没有任何反应。
+#
 # 不用 keyboard 库做这件事：它的键名是字符串（"win" 未必能解析），
-# 且 press/release 需要自己配对；SendInput 直接下发 VK，语义确定。
+# 且 press/release 需要自己配对；SendInput 直接下发 VK/扫描码，语义确定。
 import ctypes
 from ctypes import wintypes
 
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP       = 0x0002
+_KEYEVENTF_SCANCODE    = 0x0008
 _INPUT_KEYBOARD        = 1
 
 # 扩展键（必须带 EXTENDEDKEY 标志，否则左/右 Win、方向键会被系统认成小键盘）
 _EXTENDED_VKS = {0x5B, 0x5C, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E}
+
+# 左右分体的修饰键 → (扫描码, 是否扩展键)
+#
+# 为什么这几个键不能走虚拟键（VK）：微信输入法和豆包输入法的语音唤起键都是
+# **右 Alt** —— 注意是右侧那个 Alt，和左 Alt 不是同一个键。若只下发通用
+# VK_MENU(0x12)，输入法会当成左 Alt 而直接忽略，表现就是「按了没反应」。
+# 走 KEYEVENTF_SCANCODE 下发真实硬件的扫描码，系统会像处理物理按键一样
+# 自行推导出 VK_RMENU，与真人按下去的事件完全一致，不用去猜输入法认哪个 VK。
+_SCANCODE_MAP: dict[str, tuple[int, bool]] = {
+    "lalt":   (0x38, False),
+    "ralt":   (0x38, True),    # AltGr = 右侧 Alt ← 微信输入法 / 豆包输入法都用它
+    "altgr":  (0x38, True),
+    "lctrl":  (0x1D, False),
+    "rctrl":  (0x1D, True),
+    "lshift": (0x2A, False),
+    "rshift": (0x36, False),
+    "lwin":   (0x5B, True),
+    "rwin":   (0x5C, True),
+}
 
 _VK_MAP: dict[str, int] = {
     "ctrl": 0x11, "control": 0x11,
@@ -156,57 +182,70 @@ class _INPUT(ctypes.Structure):
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True) if hasattr(ctypes, "WinDLL") else None
 
-_held_vks: list[int] = []
+_held_keys: list[str] = []
 
 
-def _send_vk(vk: int, up: bool) -> None:
+def _resolve_key(name: str) -> tuple[int, int, int] | None:
+    """键名 → (wVk, wScan, 基础 flags)。不认识的键返回 None。"""
+    n = str(name).strip().lower()
+    if n in _SCANCODE_MAP:
+        scan, ext = _SCANCODE_MAP[n]
+        return 0, scan, _KEYEVENTF_SCANCODE | (_KEYEVENTF_EXTENDEDKEY if ext else 0)
+    vk = _VK_MAP.get(n)
+    if vk is None:
+        return None
+    return vk, 0, (_KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0)
+
+
+def _send_key(name: str, up: bool) -> bool:
+    """下发一次按下/抬起。键名不认识则返回 False。"""
     if _user32 is None:
-        return
+        return False
+    spec = _resolve_key(name)
+    if spec is None:
+        logger.warning(f"unknown key name '{name}' — skipped")
+        return False
+    vk, scan, flags = spec
+    if up:
+        flags |= _KEYEVENTF_KEYUP
     inp = _INPUT(type=_INPUT_KEYBOARD)
-    inp.u.ki.wVk    = vk
-    inp.u.ki.wScan  = 0
-    flags = _KEYEVENTF_KEYUP if up else 0
-    if vk in _EXTENDED_VKS:
-        flags |= _KEYEVENTF_EXTENDEDKEY
+    inp.u.ki.wVk         = vk
+    inp.u.ki.wScan       = scan
     inp.u.ki.dwFlags     = flags
     inp.u.ki.time        = 0
     inp.u.ki.dwExtraInfo = None
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    return True
 
 
 def hotkey_down(keys: list[str]) -> None:
     """按下并保持一组键（不自动释放）。"""
-    global _held_vks
+    global _held_keys
     if _user32 is None:
         logger.warning("SendInput unavailable — press-and-hold not supported")
         return
-    if _held_vks:                      # 上一轮没释放干净 → 先松开，防止残留
+    if _held_keys:                     # 上一轮没释放干净 → 先松开，防止残留
         hotkey_up()
-    vks: list[int] = []
-    for k in keys:
-        vk = _VK_MAP.get(str(k).strip().lower())
-        if vk is None:
-            logger.warning(f"unknown key name '{k}' — skipped")
-            continue
-        vks.append(vk)
-    if not vks:
+    done: list[str] = []
+    for k in keys:                     # 依次按下（修饰键在前）
+        if _send_key(str(k), up=False):
+            done.append(str(k))
+            time.sleep(0.015)
+    if not done:
         return
-    for vk in vks:                     # 依次按下（修饰键在前）
-        _send_vk(vk, up=False)
-        time.sleep(0.015)
-    _held_vks = vks
-    logger.info(f"🎤 voice hotkey DOWN (hold): {'+'.join(keys)}")
+    _held_keys = done
+    logger.info(f"🎤 voice hotkey DOWN (hold): {'+'.join(done)}")
 
 
 def hotkey_up() -> None:
     """释放上一次 hotkey_down 按住的键。"""
-    global _held_vks
-    if not _held_vks:
+    global _held_keys
+    if not _held_keys:
         return
-    for vk in reversed(_held_vks):
-        _send_vk(vk, up=True)
+    for k in reversed(_held_keys):
+        _send_key(k, up=True)
         time.sleep(0.015)
-    _held_vks = []
+    _held_keys = []
     logger.info("🎙️ voice hotkey UP")
 
 
