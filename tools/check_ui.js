@@ -7,18 +7,54 @@
  *   node tools/check_ui.js <url> [输出前缀]
  *   node tools/check_ui.js http://127.0.0.1:9083/ ./_shot
  *
- * 依赖：playwright + 已安装的 chromium（playwright 自己知道装在哪，无需配置）。
- *   需要指定别的 chrome 时，用 CHROME_EXE 指向 chrome.exe。
+ * 依赖：playwright + 任一版本的 chromium。
+ *   playwright 会用自己版本对应的浏览器；版本对不上时脚本会自动退到
+ *   playwright 缓存里已有的那个 chromium。也可以直接用 CHROME_EXE 指定。
+ *   （要彻底修好默认解析：npx playwright install chromium）
  *
  * ⚠️ 截图内容来自**真实的控制台状态**，因此可能包含本机路径
  *   （「设置 → 关于」里的配置目录会显示成 C:\Users\<你的用户名>\AppData\...）。
  *   这类截图**不要直接提交到公开仓库**。
  */
 const { chromium } = require('playwright');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 // 不要在这里写死某台机器的绝对路径 —— 那既不可移植，也会把用户名带进仓库。
-// 默认交给 playwright 自己解析浏览器位置；只有显式设了 CHROME_EXE 才覆盖。
+// 优先级：CHROME_EXE > playwright 默认解析 > 自己去 playwright 缓存里找一个。
 const EXE = process.env.CHROME_EXE || null;
+
+/* 在 playwright 的浏览器缓存目录里找一个"完整版"chrome。
+ *
+ * 为什么要这层兜底：playwright 版本与已下载浏览器对不上时，默认解析会去找
+ * chrome-headless-shell（-1243 那类），而本机可能只装了完整版 chromium（-1234），
+ * 于是 launch 直接报 "Executable doesn't exist"。退回完整版 chrome 一样能截图。 */
+function findLocalChrome() {
+  const roots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'ms-playwright'),
+    path.join(os.homedir(), '.cache', 'ms-playwright'),
+  ].filter(Boolean);
+  const rels = [
+    'chrome-win64/chrome.exe', 'chrome-win/chrome.exe',
+    'chrome-linux/chrome', 'chrome-mac/Chromium.app/Contents/MacOS/Chromium',
+  ];
+  const hits = [];
+  for (const root of roots) {
+    let names = [];
+    try { names = fs.readdirSync(root); } catch { continue; }
+    for (const d of names) {
+      if (!d.startsWith('chromium')) continue;   // 跳过 ffmpeg / headless_shell
+      for (const rel of rels) {
+        const p = path.join(root, d, rel);
+        if (fs.existsSync(p)) hits.push(p);
+      }
+    }
+  }
+  hits.sort();                                   // 目录名里带版本号，字典序够用
+  return hits.length ? hits[hits.length - 1] : null;
+}
 
 (async () => {
   const url = process.argv[2];
@@ -28,7 +64,15 @@ const EXE = process.env.CHROME_EXE || null;
     process.exit(2);
   }
 
-  const browser = await chromium.launch(EXE ? { executablePath: EXE } : {});
+  let browser;
+  try {
+    browser = await chromium.launch(EXE ? { executablePath: EXE } : {});
+  } catch (e) {
+    const local = EXE ? null : findLocalChrome();
+    if (!local) throw e;                    // 没有兜底就把原始错误抛出去，别掩盖问题
+    console.log('（默认浏览器不可用，改用本机已有的 chromium: ' + local + '）');
+    browser = await chromium.launch({ executablePath: local });
+  }
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 2,
   });

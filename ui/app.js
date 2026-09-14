@@ -321,6 +321,23 @@ function renderMapping() {
     if (sel && document.activeElement !== sel) sel.value = b.value;
   });
   $('#mapping-enabled').checked = !!state.config.mapping_enabled;
+
+  // 「原样直通」说明：文案由后端 config.NATIVE_TARGET_HINT 提供，界面和文档共用一份。
+  // ⚠️ 这个 div 以前一直是空的 —— 后端已经在 /api/state 里给了 native_hint，
+  // 前端却没人去填，文案只活在文档里，改配置的人以为界面会跟着变。
+  const hint = $('#native-hint');
+  if (hint) {
+    const text = state.native_hint || '';
+    if (hint.dataset.text !== text) {
+      hint.dataset.text = text;
+      hint.textContent = '';
+      // 按行渲染（用 textNode 而不是 innerHTML，文案里有自由文本，不拼 HTML）
+      text.split('\n').forEach((line, i) => {
+        if (i) hint.appendChild(document.createElement('br'));
+        hint.appendChild(document.createTextNode(line));
+      });
+    }
+  }
 }
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
