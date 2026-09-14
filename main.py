@@ -229,6 +229,11 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     if device_type:
         cfg.device = device_type
 
+    # ⚠ 主事件循环引用 —— BLE 回调线程往回投递任务全靠它，见 _send_tx。
+    # v1.0.3 真机事故：MIC_OPEN/MIC_CLOSE 在 BLE 回调线程上直接
+    # asyncio.get_event_loop()，那里没有事件循环，写入**一次都没发出去**。
+    _bridge_loop = asyncio.get_running_loop()
+
     sig = DEVICES.get(cfg.device)
 
     # 配置文件里的增益是"开机值"，启动时灌进实时增益；之后控制台说了算。
@@ -303,10 +308,21 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # ── Protocol + Session ──
     atvv = ATVVProtocol()
 
-    def _send_tx(cmd: bytes, tag: str = "TX") -> None:
-        """Write raw bytes to the ATVV TX characteristic (fire-and-forget)."""
+    def _send_tx(cmd: bytes, tag: str = "TX") -> bool:
+        """Write raw bytes to the ATVV TX characteristic (fire-and-forget).
+
+        返回 True = **已成功投递到主事件循环**（写入本身异步进行）。
+
+        ⚠ 必须用 run_coroutine_threadsafe 投递回主循环，不能在当前线程直接
+        asyncio.get_event_loop().create_task() —— BLE 通知回调跑在 WinRT/COM
+        线程池线程（线程名 Dummy-XXXX）上，那里**没有事件循环**，get_event_loop()
+        会抛 "There is no current event loop in thread 'Dummy-XXXX'"。
+        v1.0.3 的真机事故正是这个：MIC_OPEN/MIC_CLOSE 一次都没发出去，
+        而调用方（session.ensure_mic_open）只看命令构造成功就打了"补发成功"，
+        日志一片祥和、实际全是假的。
+        """
         if not cmd:
-            return
+            return False
 
         async def _write():
             try:
@@ -314,23 +330,29 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 w.write_bytes(cmd)
                 r = await tx_char.write_value_with_result_async(w.detach_buffer())
                 logger.info(f"📤 {tag} [{cmd.hex(' ')}] status={r.status}")
+                return r.status == GattCommunicationStatus.SUCCESS
             except Exception as e:
                 logger.error(f"{tag} write failed: {e}")
+                return False
 
         try:
-            asyncio.get_event_loop().create_task(_write())
+            asyncio.run_coroutine_threadsafe(_write(), _bridge_loop)
+            return True
         except Exception as e:
             logger.error(f"{tag} schedule failed: {e}")
+            return False
 
     def _on_mic_open(sid: int):
-        """Host 主动开麦 — 必须真正写入 BLE，否则遥控器不会推流。"""
+        """Host 主动开麦 — 必须真正写入 BLE，否则遥控器不会推流。
+
+        返回 None = 没发出去（构造失败或调度失败），调用方据此不置 mic_open_sent。
+        """
         try:
             cmd = atvv.mic_open_cmd()
         except Exception as e:
             logger.error(f"mic_open_cmd failed: {e}")
             return None
-        _send_tx(cmd, "MIC_OPEN")
-        return cmd
+        return cmd if _send_tx(cmd, "MIC_OPEN") else None
 
     def _on_mic_close(sid: int):
         try:
@@ -338,8 +360,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         except Exception as e:
             logger.error(f"mic_close_cmd failed: {e}")
             return None
-        _send_tx(cmd, "MIC_CLOSE")
-        return cmd
+        return cmd if _send_tx(cmd, "MIC_CLOSE") else None
 
     session = SessionCoordinator(
         on_mic_open=_on_mic_open,
@@ -460,6 +481,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                         atvv.state.stream_active = True
                         mic_reopen_at = time.time()
                         logger.info("🎤 松手后自动重新开麦 → 遥控器麦克风继续收音")
+                    elif not session.state.mic_open_sent:
+                        # ensure_mic_open 返回 False 有两种：已发过（正常），
+                        # 和**根本没发出去**（事故）。必须分开说，不许报喜不报忧 ——
+                        # v1.0.3 就是在这里假成功，武哥松手后录音直接断流。
+                        logger.error(
+                            "❌ MIC_OPEN 未能发出 —— 松手后遥控器不会再推流，"
+                            "语音会断！请把这段日志发出来定位"
+                        )
                     logger.info(
                         f"⏹ 松手（语音仍在继续 · 本次 {_audio_frames} 帧，峰值 {_audio_peak}）"
                     )

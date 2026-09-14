@@ -4,8 +4,8 @@ Manages the voice session state machine: closed → opening → open → closing
 """
 
 from __future__ import annotations
-import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
@@ -60,8 +60,15 @@ class SessionCoordinator:
         self.state  = SessionState()
         self._mode  = "toggle"   # "toggle" or "hold"
         self._held  = False
-        self._open_timer:  Optional[asyncio.TimerHandle] = None
-        self._close_timer: Optional[asyncio.TimerHandle] = None
+        # ⚠ 定时器必须用 threading.Timer，不能用 asyncio.call_later。
+        # 这个类的所有公开方法都从 **BLE 通知回调线程**（WinRT/COM 线程池，
+        # 线程名 Dummy-XXXX）调用，那里没有事件循环，
+        # asyncio.get_event_loop() 会抛
+        # "There is no current event loop in thread 'Dummy-XXXX'"
+        # —— v1.0.3 真机事故：MIC_OPEN/MIC_CLOSE 一次都没真正发出，
+        # 根子就是这些调度全在回调线程上炸掉了。
+        self._open_timer:  Optional[threading.Timer] = None
+        self._close_timer: Optional[threading.Timer] = None
 
     # ── Public API ─────────────────────────────────────────────────────────
     def set_mode(self, mode: str) -> None:
@@ -138,18 +145,26 @@ class SessionCoordinator:
 
     def on_mic_open_result(self, code: int) -> None:
         if code == 0:
-            loop = asyncio.get_event_loop()
-            self._open_timer = loop.call_later(self.OPEN_TIMEOUT, self._open_timeout)
+            if self._open_timer:            # 先撤旧的再挂新的，别让旧定时器到点空响
+                self._open_timer.cancel()
+            self._open_timer = self._schedule(self.OPEN_TIMEOUT, self._open_timeout)
         else:
             logger.warning(f"MIC_OPEN failed: code=0x{code:04X}")
             self.state.open_attempts += 1
             if self.state.open_attempts < self.MAX_ATTEMPTS:
-                loop = asyncio.get_event_loop()
-                loop.call_later(1.0, self._retry_open)
+                self._schedule(1.0, self._retry_open)
             else:
                 self._set(Phase.CLOSED, "mic_open max retries exceeded")
 
     # ── Internal ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _schedule(delay: float, fn: Callable[[], None]) -> threading.Timer:
+        """线程安全的延时调度（BLE 回调线程里没有 asyncio 事件循环可用）。"""
+        t = threading.Timer(delay, fn)
+        t.daemon = True
+        t.start()
+        return t
+
     def _try_open(self) -> None:
         if self.state.phase != Phase.CLOSED:
             return
@@ -159,8 +174,7 @@ class SessionCoordinator:
             logger.info(f"📤 Sent MIC_OPEN (attempt {self.state.open_attempts+1})")
             self.state.mic_open_sent = True
             self.state.open_attempts += 1
-            loop = asyncio.get_event_loop()
-            self._open_timer = loop.call_later(self.OPEN_TIMEOUT, self._open_timeout)
+            self._open_timer = self._schedule(self.OPEN_TIMEOUT, self._open_timeout)
         else:
             self._set(Phase.CLOSED, "mic_open command returned None")
 
@@ -169,8 +183,7 @@ class SessionCoordinator:
             return
         self._set(Phase.CLOSING, "voice_key_up")
         self._on_mic_close(self.state.stream_id)
-        loop = asyncio.get_event_loop()
-        self._close_timer = loop.call_later(self.CLOSE_TIMEOUT, self._close_timeout)
+        self._close_timer = self._schedule(self.CLOSE_TIMEOUT, self._close_timeout)
 
     def _set(self, phase: Phase, reason: str) -> None:
         self.state.phase = phase
