@@ -12,7 +12,7 @@ from typing import Callable
 logger = logging.getLogger("rvb.btn")
 
 from config import CHROMECAST_BUTTONS, DEFAULT_KEYMAP, Config
-from keys import send_key, send_combo, handle_mute_hold
+from keys import send_key, send_combo, handle_mute_hold, hotkey_down, hotkey_up
 
 
 # VK_DEFAULTS 已经删除：早前它把"按键 → 键名"硬编码在代码里，
@@ -51,6 +51,23 @@ def resolve_button(
     # 静音键按住 = 连发退格（沿用上游 remote-voice-bridge 的便捷行为）
     if button_id == "mute" and mapped == "mute":
         handle_mute_hold(event_type == "down")
+        return True
+
+    # 按住说话（PTT）—— 与语音键的「按一下开始 / 再按一下结束」是两套独立的键。
+    #
+    # ⚠ 必须放在下面 `if event_type != "down": return True` **之前**：
+    #   那句是给普通映射用的（只在按下时触发一次、抬起不重复），
+    #   PTT 恰恰**需要** up 事件去松开按键，被它挡掉的话
+    #   Ctrl/Win 会永远卡在按下状态 —— 键盘直接失控。
+    #
+    # 用 HID 通道做 PTT 比用 ATVV 语音键合适得多：HID 的 down/up 天然配对，
+    # 不像 ATVV 只能从 audio_start/audio_stop 两个沿去推断。
+    if mapped == "voice_ptt":
+        keys = Config.load().voice_ptt_keys or ["ctrl", "win"]
+        if event_type == "down":
+            hotkey_down(keys)
+        else:
+            hotkey_up()
         return True
 
     # 其它映射只在按下时触发一次，抬起不重复

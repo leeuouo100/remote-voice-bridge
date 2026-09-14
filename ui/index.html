@@ -207,43 +207,63 @@
       <!-- 白色底托：把遥控器衬成"产品图"（对标 vRemoter 的白底实拍）。
            直接放在深色卡片上的话，深色机身几乎看不见。 -->
       <div class="remote-plate">
+      <!-- 布局严格对照 Chromecast 语音遥控器实物（参考 vRemoter 的
+           assets/remotes/chromecast-voice-remote.png），不要凭印象画：
+             顶部  D-pad（方向键环）＋ 圆心就是确认键
+             右上  音量＋/－ 是机身**右侧的实体按键**，不在正面
+             依次  返回 | 语音(Google Assistant)  ·  Home | 静音  ·  YouTube | Netflix
+             底部  药丸区：电源 · 麦克风孔 · 信源，下面一颗麦克风指示灯
+           ⚠ 语音键＝右边那颗深色 Google Assistant 键（不是正面的麦克风），
+             旧版画成正面橙色麦克风键是错的，用户会按图找错键。 -->
       <svg viewBox="0 0 120 300" class="remote-svg" id="remote-svg" aria-label="遥控器示意图">
         <!-- 机身 -->
-        <rect x="14" y="6" width="92" height="288" rx="30" fill="#1a1a1e" stroke="#33333a" stroke-width="1.5"/>
-        <!-- 电源 / 信源 -->
-        <circle data-btn="power" cx="46" cy="36" r="11" fill="#232329" stroke="#3a3a42"/>
-        <path data-btn="power" d="M46 30v7M41.5 33.5a7 7 0 1 0 9 0" stroke="#8b8b90" stroke-width="1.6" fill="none" stroke-linecap="round"/>
-        <circle data-btn="input" cx="74" cy="36" r="11" fill="#232329" stroke="#3a3a42"/>
-        <path data-btn="input" d="M70 32v8M74 32v8M74 36h5" stroke="#8b8b90" stroke-width="1.5" fill="none" stroke-linecap="round"/>
-        <!-- 语音 -->
-        <circle data-btn="voice" cx="60" cy="74" r="15" fill="#2b2118" stroke="#e8a33d"/>
-        <path data-btn="voice" d="M60 68a2.4 2.4 0 0 1 2.4 2.4v4.2a2.4 2.4 0 0 1-4.8 0v-4.2A2.4 2.4 0 0 1 60 68z" fill="#e8a33d"/>
-        <path data-btn="voice" d="M55.6 74a4.4 4.4 0 0 0 8.8 0M60 78.6v3" stroke="#e8a33d" stroke-width="1.5" fill="none" stroke-linecap="round"/>
-        <!-- D-pad -->
-        <circle cx="60" cy="140" r="34" fill="#202027" stroke="#3a3a42"/>
-        <path data-btn="up"    d="M60 112l7 10H53z"   fill="#8b8b90"/>
-        <path data-btn="down"  d="M60 168l7-10H53z"   fill="#8b8b90"/>
-        <path data-btn="left"  d="M32 140l10-7v14z"   fill="#8b8b90"/>
-        <path data-btn="right" d="M88 140l-10-7v14z"  fill="#8b8b90"/>
-        <circle data-btn="ok" cx="60" cy="140" r="13" fill="#2c2c34" stroke="#4a4a54"/>
-        <text data-btn="ok" x="60" y="144" text-anchor="middle" font-size="9" fill="#c9c9cf">OK</text>
-        <!-- back / home -->
-        <circle data-btn="back" cx="40" cy="198" r="11" fill="#232329" stroke="#3a3a42"/>
-        <path data-btn="back" d="M43 193l-6 5 6 5" stroke="#8b8b90" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle data-btn="home" cx="68" cy="198" r="11" fill="#232329" stroke="#3a3a42"/>
-        <path data-btn="home" d="M62 198l6-5 6 5v6a1 1 0 0 1-1 1h-3v-4h-4v4h-3a1 1 0 0 1-1-1z" fill="none" stroke="#8b8b90" stroke-width="1.5" stroke-linejoin="round"/>
-        <!-- youtube / netflix -->
-        <rect data-btn="youtube" x="28" y="220" width="30" height="17" rx="6" fill="#232329" stroke="#3a3a42"/>
-        <path data-btn="youtube" d="M40 225l6 3.5-6 3.5z" fill="#8b8b90"/>
-        <rect data-btn="netflix" x="62" y="220" width="30" height="17" rx="6" fill="#232329" stroke="#3a3a42"/>
-        <text data-btn="netflix" x="77" y="232.5" text-anchor="middle" font-size="8" fill="#8b8b90">Netflix</text>
-        <!-- 音量 -->
-        <circle data-btn="vol_up"   cx="40" cy="256" r="10" fill="#232329" stroke="#3a3a42"/>
-        <text data-btn="vol_up"   x="40" y="260" text-anchor="middle" font-size="11" fill="#8b8b90">＋</text>
-        <circle data-btn="vol_down" cx="68" cy="256" r="10" fill="#232329" stroke="#3a3a42"/>
-        <text data-btn="vol_down" x="68" y="260" text-anchor="middle" font-size="11" fill="#8b8b90">－</text>
-        <circle data-btn="mute"     cx="60" cy="280" r="10" fill="#232329" stroke="#3a3a42"/>
-        <path data-btn="mute" d="M55 279h3l4-3v9l-4-3h-3z" fill="#8b8b90"/>
+        <rect x="14" y="6" width="92" height="288" rx="26" fill="#ffffff" stroke="#c8c8d2" stroke-width="1.5"/>
+        <!-- D-pad：方向键环，圆心即确认键 -->
+        <circle cx="60" cy="54" r="34" fill="#f1f1f5" stroke="#d8d8e0"/>
+        <path data-btn="up"    d="M60 29l5.5 10h-11z"   fill="#8a8a96"/>
+        <path data-btn="down"  d="M60 79l-5.5-10h11z"   fill="#8a8a96"/>
+        <path data-btn="left"  d="M35 54l10-5.5v11z"    fill="#8a8a96"/>
+        <path data-btn="right" d="M85 54l-10-5.5v11z"   fill="#8a8a96"/>
+        <circle data-btn="ok" cx="60" cy="54" r="12" fill="#ffffff" stroke="#c9c9d2"/>
+        <text data-btn="ok" x="60" y="56.6" text-anchor="middle" font-size="7" fill="#4a4a56">OK</text>
+        <!-- 音量：机身右侧实体键。刻意与机身右缘重叠 6 格，
+             这样读起来是"长在侧面的按键"，而不是浮在旁边的小方块。 -->
+        <rect data-btn="vol_up"   x="100" y="44" width="9" height="27" rx="4.5" fill="#ececf2" stroke="#d8d8e0"/>
+        <rect data-btn="vol_down" x="100" y="71" width="9" height="27" rx="4.5" fill="#ececf2" stroke="#d8d8e0"/>
+        <path data-btn="vol_up"   d="M101.5 57.5h6M104.5 54.5v6" stroke="#8a8a96" stroke-width="1.1" stroke-linecap="round"/>
+        <path data-btn="vol_down" d="M101.5 84.5h6"             stroke="#8a8a96" stroke-width="1.1" stroke-linecap="round"/>
+        <!-- 返回 | 语音（Google Assistant） -->
+        <circle data-btn="back" cx="38" cy="110" r="14" fill="#ffffff" stroke="#cfcfd9"/>
+        <path data-btn="back" d="M41 104.5L35 110l6 5.5" stroke="#5f5f6b" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle data-btn="voice" cx="82" cy="110" r="14" fill="#202124"/>
+        <circle data-btn="voice" cx="82" cy="105.4" r="2.3" fill="#4285F4"/>
+        <circle data-btn="voice" cx="86.6" cy="110" r="2.3" fill="#EA4335"/>
+        <circle data-btn="voice" cx="82" cy="114.6" r="2.3" fill="#FBBC05"/>
+        <circle data-btn="voice" cx="77.4" cy="110" r="2.3" fill="#34A853"/>
+        <!-- 语音键的橙色标记环，让用户一眼看出哪颗是语音键 -->
+        <circle data-btn="voice" cx="82" cy="110" r="16.6" fill="none" stroke="#e8a33d" stroke-width="1"/>
+        <!-- Home | 静音 -->
+        <circle data-btn="home" cx="38" cy="148" r="14" fill="#ffffff" stroke="#cfcfd9"/>
+        <path data-btn="home" d="M32.6 148.2L38 143.6l5.4 4.6v5.2h-3.2v-3.6h-4.4v3.6h-3.2z" fill="none" stroke="#5f5f6b" stroke-width="1.4" stroke-linejoin="round"/>
+        <circle data-btn="mute" cx="82" cy="148" r="14" fill="#ffffff" stroke="#cfcfd9"/>
+        <path data-btn="mute" d="M75.5 145.4h2.8l3.6-2.8v10.8l-3.6-2.8h-2.8z" fill="#5f5f6b"/>
+        <path data-btn="mute" d="M84.8 145.4l3.6 7.2M88.4 145.4l-3.6 7.2" stroke="#5f5f6b" stroke-width="1.3" stroke-linecap="round"/>
+        <!-- YouTube | Netflix -->
+        <circle data-btn="youtube" cx="38" cy="186" r="14" fill="#ffffff" stroke="#cfcfd9"/>
+        <rect data-btn="youtube" x="31.6" y="182.6" width="12.8" height="6.8" rx="3" fill="#e52d27"/>
+        <path data-btn="youtube" d="M36.6 184.6l3.4 1.9-3.4 1.9z" fill="#ffffff"/>
+        <circle data-btn="netflix" cx="82" cy="186" r="14" fill="#ffffff" stroke="#cfcfd9"/>
+        <path data-btn="netflix" d="M79 181.6v8.8M85 181.6v8.8M79 181.6l6 8.8" stroke="#e50914" stroke-width="1.8" fill="none"/>
+        <!-- 底部药丸：电源 · 麦克风孔 · 信源 -->
+        <rect x="30" y="210" width="62" height="17" rx="8.5" fill="#f1f1f5" stroke="#d8d8e0"/>
+        <circle data-btn="power" cx="39" cy="218.5" r="8" fill="transparent"/>
+        <path data-btn="power" d="M39 213.4v4.6M35.9 216.2a5.2 5.2 0 1 0 6.2 0" stroke="#5f5f6b" stroke-width="1.3" fill="none" stroke-linecap="round"/>
+        <rect x="56.5" y="217" width="7" height="3" rx="1.5" fill="#b9b9c4"/>
+        <circle data-btn="input" cx="81" cy="218.5" r="8" fill="transparent"/>
+        <path data-btn="input" d="M80.4 215.6h2.4a1.5 1.5 0 0 1 1.5 1.5v2.8a1.5 1.5 0 0 1-1.5 1.5h-2.4" stroke="#5f5f6b" stroke-width="1.3" fill="none" stroke-linecap="round"/>
+        <path data-btn="input" d="M75.6 217.5h4.6M78.8 216.4l1.5 1.1-1.5 1.1" stroke="#5f5f6b" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <!-- 麦克风指示灯 -->
+        <circle cx="60" cy="238" r="2.6" fill="#cfcfd8"/>
       </svg>
       </div>
       <div class="map-figure-foot" id="map-count">14 个可映射键</div>

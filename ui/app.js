@@ -345,8 +345,11 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
 const cssEsc = s => String(s ?? '').replace(/["\\]/g, '\\$&');
 
 function highlightBtn(id, on) {
-  const el = $(`#remote-svg [data-btn="${cssEsc(id)}"]`);
-  el?.classList.toggle('hl', !!on);
+  // ⚠ 必须用 querySelectorAll：一颗按键在图上往往是**多个图形**拼出来的
+  // （底圆 + 图标，语音键还有一圈橙色标记环）。只取第一个的话，
+  // 悬停时只有底圆亮、图标不亮，看起来像"没选中"。
+  const els = document.querySelectorAll(`#remote-svg [data-btn="${cssEsc(id)}"]`);
+  els.forEach(el => el.classList.toggle('hl', !!on));
 }
 
 async function saveMapping(btn, value) {

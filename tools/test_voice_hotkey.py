@@ -2,14 +2,18 @@
 语音快捷键自检工具 —— 不需要装任何第三方依赖（只用标准库）。
 
 用法（在 remote-voice-bridge 目录下）：
-    python tools/test_voice_hotkey.py ralt
-    python tools/test_voice_hotkey.py ctrl win
-    python tools/test_voice_hotkey.py alt shift m
+
+  # 按住说话（PTT）—— 微信输入法「按住说话」Ctrl+Win 就是这一类
+  python tools/test_voice_hotkey.py ctrl win
+
+  # 按一下开始 / 再按一下结束（切换模式）—— 微信输入法「启动语音输入」
+  # 左Ctrl+左Win+左Shift 就是这一类，**必须带 --tap**
+  python tools/test_voice_hotkey.py lctrl lwin lshift --tap
 
 它会：
   1. 给你 5 秒切到能输入文字的地方（记事本 / 编程工具的输入框）
-  2. 按住这组键 6 秒（模拟"遥控器语音键按住说话"）
-  3. 松开
+  2-A. 不带 --tap：按住这组键 6 秒，再松开（模拟"按住说话"）
+  2-B. 带 --tap：点按一次 → 等 8 秒看界面是否**持续留着** → 再点一次结束
 
 判定：
   · 这 6 秒里输入法的「语音输入」界面弹出来了 → 这组键是对的
@@ -47,7 +51,7 @@ from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出�
 
 _setup_utf8()
 
-from keys import hotkey_down, hotkey_up  # noqa: E402
+from keys import hotkey_down, hotkey_up, send_combo  # noqa: E402
 
 # 常见候选，按"最可能可用"排序：默认对接的微信输入法用的就是 Ctrl+Win，先试它；
 # 再试不涉及 Win、注入路径最干净的右 Alt（豆包的键）。
@@ -61,19 +65,41 @@ CANDIDATES = [
 
 
 def main() -> None:
-    keys = sys.argv[1:]
+    args = sys.argv[1:]
+    # --tap / -t：点按一次（对应「启动语音输入」这类**切换模式**）。
+    # 不带这个参数 = 按住 6 秒（对应「按住说话」这类 PTT 模式）。
+    tap = "--tap" in args or "-t" in args
+    keys = [a for a in args if a not in ("--tap", "-t")]
+
     if not keys:
         print("没给按键。可以先按下面这些候选逐个试：\n")
         for c in CANDIDATES:
             print("    python tools/test_voice_hotkey.py " + " ".join(c))
+        print("\n切换模式（按一下开始 / 再按一下结束）要加 --tap，例如：")
+        print("    python tools/test_voice_hotkey.py lctrl lwin lshift --tap")
         print("\n更好的做法：打开微信 / 豆包的设置，直接看「语音输入」的快捷键写的是什么。")
         return
 
-    print(f"快捷键 = {' + '.join(keys)}")
-    print("5 秒后开始按住 6 秒 —— 现在切到能输入文字的地方（记事本 / 编程工具输入框）")
+    mode = "点按（切换模式）" if tap else "按住（PTT）"
+    print(f"快捷键 = {' + '.join(keys)}   模式 = {mode}")
+    print("5 秒后开始 —— 现在切到能输入文字的地方（记事本 / 编程工具输入框）")
     for i in range(5, 0, -1):
         print(f"  {i}...", end="\r", flush=True)
         time.sleep(1)
+
+    if tap:
+        # 切换模式：**点一下就开始**，之后不用按住，界面应当一直留在那儿。
+        print("  点按一次 —— 看语音输入界面有没有弹出来**并且留着不消失**", flush=True)
+        send_combo(keys)
+        print("  已点按。接下来 8 秒请**不要碰键盘鼠标**，只观察界面是否持续在。")
+        print("  （这 8 秒里对着麦克风说句话，看看有没有文字上屏）")
+        time.sleep(8)
+        print("  再点一次，结束这一次测试。")
+        send_combo(keys)
+        print("  已再点一次。")
+        print("  ✓ 第 1 次点按后界面弹出并持续、说话有字上屏 → 这组键可用作切换模式")
+        print("  ✗ 没弹 / 弹出后立刻消失 → 这组键注入没被输入法认到，看下面的兜底办法")
+        return
 
     print("  按住中 —— 看输入法的语音输入界面有没有弹出来", flush=True)
     try:

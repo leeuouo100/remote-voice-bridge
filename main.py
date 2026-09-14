@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -27,6 +28,16 @@ from session import SessionCoordinator, Phase
 from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up
 from buttons import resolve_button
 import mixer
+
+# 语音会话最长持续时间（秒）。超过就由程序自动收尾 ——
+# 用户按了「开始」却忘了按第二下（或遥控器没电/走开了）时，
+# 不能让输入法一直挂着听。这是本程序"管好语音功能"的一部分，不能指望用户记得。
+VOICE_MAX_SECONDS = 600
+
+# 松手后自动重开麦 → 遥控器多半会回一个 audio_start。
+# 这段时间内收到的 audio_start 是**我们自己触发的**，不是用户"第二次按下"，
+# 绝不能当成结束信号，否则会"刚开立刻被关"。
+MIC_REOPEN_GRACE = 1.5
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 # 必须写到用户目录而不是程序目录：打包成 exe 后程序目录是 PyInstaller 的
@@ -342,12 +353,29 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     last_key_activity  = 0.0
     last_health_check  = 0.0
     last_start_search  = 0.0   # START_SEARCH 去抖（对标 vRemoter 0.5s）
+
+    # ── 语音会话状态 —— **由本程序自己记账**，不能甩给输入法 ──────────────
+    #
+    # 为什么必须有这一层：遥控器语音键是 PTT 硬件，一次按键必然产生
+    # audio_start(按下) + audio_stop(松开) 两个事件；而用户要的是
+    # "按一下开始、松手继续说、再按一下才结束" —— **松手 ≠ 语音结束**。
+    # 这个区别只有本程序知道：输入法只认按键本身，它分不清
+    # "用户松手了" 和 "用户想结束这一段"。
+    #
+    # 分工是这样的：
+    #   · 输入法那一半 = 它原生就有的能力（按一下开始听 / 再按一下结束），我们去**适配**它
+    #   · 程序这一半   = 什么时候算开始、什么时候算结束、会不会卡死、异常怎么恢复
+    # 两边都要有，缺一个都不行。
+    voice_active     = False   # 语音会话是否正在进行
+    voice_started_at = 0.0     # 本次会话开始时刻（超时兜底用）
+    mic_reopen_at    = 0.0     # 上次"松手后自动重开麦"的时刻（防自激用）
     ctl_token = aud_token = None
     stream    = None
     sysmic    = None
 
     def on_control(sender, args):
-        nonlocal last_ble_activity, last_start_search
+        nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
+        nonlocal mic_reopen_at
         global _audio_frames, _audio_peak
         last_ble_activity = time.time()
         try:
@@ -378,14 +406,66 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 # 而开麦命令原先只挂在 start_search 分支 → 遥控器永远收不到 MIC_OPEN
                 # → 一帧音频都不推，日志表现就是连续「本次共收到 0 个音频帧」。
                 session.ensure_mic_open()
-                # hold 模式 = 按住快捷键（微信输入法：长按说话，松开结束识别）
-                voice_hotkey_down()
+                # ── 语音会话状态机：**每一次按下 = 一次翻转** ──────────────
+                #   第 1 次按下 → 开始   第 2 次按下 → 结束
+                # 松手（audio_stop）不参与翻转，见下面那个分支的注释。
+                #
+                # 底层用的是微信输入法原生就有的能力，我们只是去适配它：
+                #   tap  模式 → 「启动语音输入」左Ctrl+左Win+左Shift，点一下开始/再点一下结束
+                #   hold 模式 → 「按住说话」Ctrl+Win，按下保持/再按松开
+                # 至于"现在到底算不算在说话"，是本程序在这里记账。
+                # ⚠ 防自激：刚自动重开麦后，遥控器多半会回一个 audio_start。
+                #   那是我们自己触发的，不是用户"第二次按下" —— 当成结束就会
+                #   "刚开立刻被关"，必须在这里挡掉。
+                if mic_reopen_at and (time.time() - mic_reopen_at) < MIC_REOPEN_GRACE:
+                    mic_reopen_at = 0.0
+                    logger.debug("↩ 忽略自动重开麦触发的 audio_start（非用户第二次按下）")
+                elif not voice_active:
+                    voice_hotkey_down()      # tap=点按开始 / hold=按下并保持
+                    voice_active     = True
+                    voice_started_at = time.time()
+                    state.update(streaming=True, last_event="语音中…")
+                    logger.info("🎙️ 语音会话【开始】—— 可以松手了，会一直听着")
+                else:
+                    voice_hotkey_up()        # tap=再点按结束 / hold=松开结束
+                    voice_active     = False
+                    voice_started_at = 0.0
+                    state.update(streaming=False, level=0, last_event="语音结束")
+                    logger.info("🎙️ 语音会话【结束】（第二次按下语音键）")
             elif event["type"] == "audio_stop":
                 session.on_audio_stop(event["reason"])
-                # 必须先松开快捷键，再打日志：松手这一刻输入法才会开始识别并上屏
-                voice_hotkey_up()
-                logger.info(f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，峰值 {_audio_peak}）")
-                state.update(streaming=False, level=0, last_event="语音结束")
+                # ⚠ 松手 **不等于** 语音结束。
+                #
+                # 遥控器语音键是 PTT 硬件：按下必发 audio_start、松开必发 audio_stop。
+                # 可用户要的是「按一下开始、松手继续说」—— 所以这里**只结算音频统计，
+                # 绝不结束语音会话**。结束只可能来自两处：
+                #   ① 再一次按下语音键（上面的 audio_start 分支翻转）
+                #   ② 按下确认键（见 _on_key）
+                #
+                # 早前正是这里无条件调用 voice_hotkey_up()，于是「按下开启 → 松手立刻结束」，
+                # 每次只能录到松手前那一小段 —— 「按一下长输」完全不生效的根因。
+                if voice_active:
+                    # 让遥控器麦克风**继续收音** —— 不用一直按着。
+                    #
+                    # 遥控器松手时会自己停推流（audio_stop），但它只认 host 的开麦命令：
+                    # 再发一次 MIC_OPEN，它就会重新开始推。
+                    # vRemoter v1.1.1 修的「短按只打开输入法、遥控器麦克风却未持续收音」
+                    # 说的正是这件事 —— 所以这不是硬件的墙，是我们该做到而没做到的。
+                    #
+                    # ⚠ 两件事必须一起做，少一件都收不到声音：
+                    #   ① session.ensure_mic_open()     → 让遥控器重新开始推流
+                    #   ② atvv.state.stream_active=True  → 否则 atvv 层把后续帧**全部丢掉**
+                    #      （on_audio 与 decode_audio 都先看这个标志，audio_stop 时已被置 False）
+                    if session.ensure_mic_open():
+                        atvv.state.stream_active = True
+                        mic_reopen_at = time.time()
+                        logger.info("🎤 松手后自动重新开麦 → 遥控器麦克风继续收音")
+                    logger.info(
+                        f"⏹ 松手（语音仍在继续 · 本次 {_audio_frames} 帧，峰值 {_audio_peak}）"
+                    )
+                else:
+                    logger.info(f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，峰值 {_audio_peak}）")
+                    state.update(streaming=False, level=0, last_event="语音结束")
             elif event["type"] == "mic_open_result":
                 session.on_mic_open_result(event["code"])
             elif event["type"] == "start_search":
@@ -512,6 +592,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         "browser home":               "home",
         "home":                       "home",
         "back":                       "back",
+        "browser back":               "back",   # HID 消费键，遥控器返回键常报这个名字
         "enter":                      "ok",
         "return":                     "ok",
         "escape":                     "back",
@@ -548,7 +629,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         return _cfg_cache
 
     def _on_key(e):
-        nonlocal last_key_activity, last_ble_activity
+        nonlocal last_key_activity, last_ble_activity, voice_active, voice_started_at
         if e.event_type == "down":
             last_key_activity = time.time()
             # 遥控器按键 = 它还活着。也算一次"活动"，避免被 watchdog 误判掉线。
@@ -563,11 +644,31 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
         # Map key name → button_id
         btn_id = KEY_MAP.get(e.name, "")
-        if not btn_id:
+        if not btn_id and e.name:
+            # ⚠ 兜底只跑**多词复合键**（键名里带空格），单词键一律不动。
+            # 单词键（up/down/left/right/back/home/enter/escape…）已由第 567 行
+            # 的 `KEY_MAP.get` 精确匹配兜住，绝不能进兜底循环：
+            # 词边界下 "up" 会误中物理键盘的 "page up"、"left" 误中 "left windows"，
+            # 导致按方向/翻页键时顺手注入一个方向键。
+            # 复合键（"browser back" / "browser start and home" / "volume up" 等）
+            # 即便未来 keyboard 库换种写法、精确匹配失手，也能兜底接住。
             for k, v in KEY_MAP.items():
-                if k in (e.name or ""):
+                if " " in k and re.search(rf"\b{re.escape(k)}\b", e.name):
                     btn_id = v
                     break
+
+        # 语音进行中按「确认键」= 结束这一段（用户要的"最后按确认就算完成"）。
+        #
+        # ⚠ 这个判断只能靠程序自己记的 voice_active：输入法分不清用户这一下
+        #   是想"确认输入文字"还是"结束这段语音"，它只看到来了一个键。
+        #   由程序拍板：语音开着的时候，确认键就专管收尾，不再当 Enter 往外发。
+        if voice_active and btn_id == "ok" and e.event_type == "down":
+            voice_hotkey_up()
+            voice_active     = False
+            voice_started_at = 0.0
+            state.update(streaming=False, level=0, last_event="语音结束（确认键）")
+            logger.info("🎙️ 语音会话【结束】（确认键）")
+            return False                     # 吞掉这一下，不让它再当 Enter 发出去
 
         if btn_id and btn_id != "voice":
             cached = _get_cfg()
@@ -590,8 +691,21 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     # ── Health check ──
     async def check_health(force: bool = False) -> bool:
-        nonlocal last_health_check
+        nonlocal last_health_check, voice_active, voice_started_at
         now = time.time()
+
+        # 语音会话超时兜底：用户按了「开始」却忘了收尾，程序自己收场。
+        # 「管理好语音输入功能」包含这一条 —— 不能指望用户永远记得按第二下。
+        if voice_active and voice_started_at and (now - voice_started_at) > VOICE_MAX_SECONDS:
+            logger.warning(
+                f"⏰ 语音会话已持续 {int(now - voice_started_at)} 秒，超过上限 "
+                f"{VOICE_MAX_SECONDS} 秒 → 自动结束，避免一直挂着听"
+            )
+            voice_hotkey_up()
+            voice_active     = False
+            voice_started_at = 0.0
+            state.update(streaming=False, level=0, last_event="语音结束（超时自动收尾）")
+
         if not force and now - last_health_check < cfg.heartbeat_cooldown:
             return True
         last_health_check = now

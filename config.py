@@ -60,12 +60,17 @@ INPUT_METHODS = {
         "desc": "微信输入法（按住说话 Ctrl+Win）",
     },
     "wechat_hold_mode": {
-        # 「持续输入」模式：按一次开始，再按一次（或回车）结束，不用一直按着。
-        # 微信 PC 客户端用 Ctrl+Win+Shift；微信输入法面板里这条叫「启动语音输入」，
-        # 显示的是 左Win+左Ctrl+左Shift —— 两家不一样，这里给的是客户端那一套。
+        # 「启动语音输入」= 微信输入法面板上的**切换模式**：
+        #   按一下开始聆听，**再按一下（或按任意键）结束**，全程不用按住。
+        # 与下面 wechat 那条「按住说话」（Ctrl+Win，松手结束）是**两套独立的键**，
+        # 解决的是同一个痛点（不想一直按着）的两个不同方案，别混用。
+        #
+        # 键位以微信输入法「设置 → 语音输入」面板为准：**左Ctrl + 左Win + 左Shift**。
+        # 面板明确写的是"左"，所以这里必须下发 lctrl/lwin/lshift ——
+        # 用通用的 ctrl/shift 属于"碰运气能触发"，右键不会被认成这一组。
         "macos_keys":    [],
-        "windows_keys":  ["ctrl", "win", "shift"],
-        "desc": "微信 · 持续输入（Ctrl+Win+Shift）",
+        "windows_keys":  ["lctrl", "lwin", "lshift"],
+        "desc": "微信输入法 · 启动语音输入（左Ctrl+左Win+左Shift · 按一下开始）",
     },
     "doubao": {
         "macos_keys":    [],
@@ -135,7 +140,13 @@ CHROMECAST_BUTTONS = {
 MAPPING_TARGETS: dict[str, str] = {
     "":            "禁用（不发送任何按键）",
     "native":      "原样直通（遥控器自己的按键生效）",
-    "voice":       "语音输入（长按唤起输入法）",
+    "voice":       "语音输入（ATVV 语音键专用）",
+    # 按住说话（PTT）—— 给**非语音键**（默认挂在静音键上）用的第二种语音方式。
+    # 与语音键那套「按一下开始 / 再按一下结束」是**两套独立的键、两条独立的通道**：
+    #   · 语音键 走 ATVV（audio_start/audio_stop），只能感知"按下/松开"两个沿 → 适合切换
+    #   · 静音键 走 HID，down/up 天然配对                                → 适合按住
+    # 一个键当开关、一个键当油门，互不干扰，两种习惯都能照顾到。
+    "voice_ptt":   "按住说话 PTT（按下=开始，松开=结束）",
     "up":          "方向上  ↑",
     "down":        "方向下  ↓",
     "left":        "方向左  ←",
@@ -193,7 +204,10 @@ DEFAULT_KEYMAP = {
     "netflix": "",
     "power":   "",
     "input":   "",
-    "mute":    "mute",
+    # 静音键默认给「按住说话」用：它是遥控器上唯一一个**按着不别扭**的键，
+    # 而语音键已经分给「按一下开始 / 再按一下结束」了。
+    # 想要回系统静音，在按键映射界面把它改回「系统静音」即可。
+    "mute":    "voice_ptt",
     "vol_up":  "volumeup",
     "vol_down":"volumedown",
     "voice":   "voice",
@@ -242,7 +256,10 @@ def hotkey_label(keys: list[str] | None) -> str:
 class Config:
     device:           str       = "chromecast"
     keymap:           dict[str, str] = field(default_factory=lambda: dict(DEFAULT_KEYMAP))
-    input_method:     str       = "wechat"      # "wechat" | "doubao" | "custom"
+    # 默认直接给「按一下就能长输」那一套，装好即用、不用做任何选择：
+    # 语音键转发微信输入法原生的「启动语音输入」（切换式），状态由微信自己管。
+    # 想退回"按住说话"，在控制台「设置」页把触发方式改回「按住说话」即可。
+    input_method:     str       = "wechat_hold_mode"
     custom_keys:      list[str] = field(default_factory=list)  # e.g. ["alt", "shift", "m"]
     audio_output:     str       = "CABLE Input"
     gain:             float     = 10.0
@@ -253,14 +270,19 @@ class Config:
     gatt_timeout:     float     = 5.0
     voice_mode:       str       = "toggle"    # "toggle" | "hold"
     # 语音快捷键的触发方式：
-    #   "hold" = 按住（微信输入法 / 豆包输入法都是「长按说话、松开结束识别」）← 默认
-    #   "tap"  = 点一下开始、再点一下结束（部分输入法是端点式）
-    hotkey_mode:      str       = "hold"
+    #   "tap"  = 点一下开始、再点一下结束（切换式）← **默认**
+    #            配合上面的「启动语音输入」，遥控语音键按一下就能长输，松手不断。
+    #   "hold" = 按住（「按住说话」PTT：长按说话、松开结束识别）
+    hotkey_mode:      str       = "tap"
     # 非空则覆盖 INPUT_METHODS 内置组合。
     # 键名支持：ralt(右Alt) / lalt / alt / ctrl / win / shift / 字母 / f1-f24 / space …
     # 例如 ["ralt"] 或 ["ctrl","win"] 或 ["ralt","space"]
     # 用 tools/test_voice_hotkey.py 可以直接试哪组键能唤起输入法。
     voice_hotkey:     list[str] = field(default_factory=list)
+    # 静音键等「按住说话」键位用的组合键，与 voice_hotkey 是**两套独立的键**。
+    # 默认 Ctrl+Win = 微信输入法「按住说话」（按住可语音，松手结束）。
+    # 想改成别的（例如豆包的右 Alt）就在这里填，例如 ["ralt"]。
+    voice_ptt_keys:   list[str] = field(default_factory=lambda: ["ctrl", "win"])
     # True = 拦截已映射的键。注意遥控器走 HID，与物理键盘无法区分，
     # 开启后物理键盘的 Enter/Esc/方向键也会被吞掉，故默认关闭。
     suppress_keys:    bool      = False
@@ -323,6 +345,33 @@ class Config:
             json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+
+def apply_recommended() -> "Config":
+    """一键套用「呆瓜配置」——把该设的一次性全设好，一个选择都不留给用户。
+
+    设计目标是**以傻子为设计目的**：装上、配对，按语音键就能长篇输入，
+    全程不需要打开任何设置、不需要理解 ATVV / HID / 点按 / 按住 这些概念。
+
+    这套组合的每一条都对应微信输入法**原生支持**的一种模式，程序只做转发：
+
+      遥控语音键 → 微信「启动语音输入」左Ctrl+左Win+左Shift，点一下开始、
+                   松手不断，**再按一下（或按任意键，含确认键）结束**
+      遥控静音键 → 微信「按住说话」Ctrl+Win，按住说、松手结束
+
+    两者互不干扰：一个当开关，一个当油门。状态全部由微信输入法自己维护，
+    本程序不自建任何语音状态机 —— 别人已经造好的轮子，不重复造。
+    """
+    c = Config.load()
+    c.input_method       = "wechat_hold_mode"          # 语音键 → 启动语音输入（切换式）
+    c.hotkey_mode        = "tap"                       # 点一下开始 / 再点一下结束
+    c.voice_hotkey       = []                          # 清掉自定义覆盖，用输入法内置组合
+    c.keymap             = dict(DEFAULT_KEYMAP)        # 含 静音键 → voice_ptt
+    c.voice_ptt_keys     = ["ctrl", "win"]             # 静音键 → 按住说话
+    c.system_mic_enabled = True                        # 切换模式下松手后，声音靠电脑麦克风
+    c.mapping_enabled    = True
+    c.save()
+    return c
 
 
 def find_device_by_name(name: str) -> Optional[DeviceSig]:
