@@ -29,11 +29,15 @@ from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出�
 
 _setup_utf8()
 
-from config import CHROMECAST_BUTTONS, DEFAULT_KEYMAP, MAPPING_TARGETS  # noqa: E402
+from config import (  # noqa: E402
+    CHROMECAST_BUTTONS, DEFAULT_KEYMAP, MAPPING_TARGETS, VIRTUAL_TARGETS,
+)
 from keys import _resolve_key, combo_bad_parts, normalize_combo_part  # noqa: E402
 
-# 这几个不是"要下发某个键"的值，不参与解析校验
-_SPECIAL = {"", "native", "voice"}
+# 虚拟目标（禁用 / 原样直通 / 语音键 / 按住说话）不是"要下发某个组合键"，
+# 由程序内部逻辑接管，不参与键名解析校验。清单统一放在 config.VIRTUAL_TARGETS，
+# 免得新增虚拟目标时这里漏改、自检误报。
+_SPECIAL = set(VIRTUAL_TARGETS)
 
 # 录制器里用户可能按到的、必须能解析的键名（keyboard 库的原始叫法）。
 # 这张表照着库的键名表抄的，加键名时先在这里加一条。

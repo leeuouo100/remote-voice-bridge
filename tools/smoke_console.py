@@ -178,8 +178,15 @@ def main() -> int:
 
         # ── 3. 写入接口 ──
         st2 = req("/api/state")[0]
-        check(st2["hotkey"]["preset"] == "ctrl+win",
-              f"默认触发键预设应是 ctrl+win，实际 {st2['hotkey']['preset']}")
+        # 默认档 = 微信输入法「启动语音输入」左Ctrl+左Win+左Shift（按一下长输）。
+        # 内置键写成 lctrl/lwin/lshift，预设表里是 ctrl/win/shift，
+        # combo_equivalent 认定二者等价，所以落在 "ctrl+win+shift" 这一档。
+        check(st2["hotkey"]["preset"] == "ctrl+win+shift",
+              f"默认触发键预设应是 ctrl+win+shift（微信输入法启动语音输入），"
+              f"实际 {st2['hotkey']['preset']}")
+        check(st2["config"]["hotkey_mode"] == "tap",
+              f"默认触发方式应是 tap（按一下开始/再按一下结束），实际 "
+              f"{st2['config'].get('hotkey_mode')}")
 
         r, _ = req("/api/config", "POST", {"gain": 12.5, "hotkey_mode": "tap"})
         check(r.get("ok"), "POST /api/config 失败")
@@ -266,8 +273,9 @@ def main() -> int:
         # ── 4. 关键映射目标的键名必须真的能解析 ──
         from keys import _resolve_key
         from config import MAPPING_TARGETS
+        from config import VIRTUAL_TARGETS
         for value in MAPPING_TARGETS:
-            if value in ("", "native", "voice"):
+            if value in VIRTUAL_TARGETS:
                 continue
             for part in value.split("+"):
                 check(_resolve_key(part) is not None,

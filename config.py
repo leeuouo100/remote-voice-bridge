@@ -14,7 +14,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 
 # ── Device signatures ────────────────────────────────────────────────────────
@@ -99,9 +99,14 @@ VOICE_HOTKEY_PRESETS: list[dict] = [
     {"id": "ctrl+win",       "keys": ["ctrl", "win"],          "label": "Ctrl + Win",
      "hint": "微信输入法「按住说话」就是这一组（设置 → 语音输入里写的）· "
              "注入式 Win 组合受系统限制，建议先用 tools/test_voice_hotkey.py 实测一次"},
+    # ⚠️ 这一档现在就是**默认档**：微信输入法的「启动语音输入」写的正是
+    #    左Ctrl+左Win+左Shift（按一下开始、再按一下结束）。
+    #    表里存的是不带左右前缀的 ctrl/win/shift，而 input_method 内置的是
+    #    lctrl/lwin/lshift —— combo_equivalent 认为它们是同一只键，所以下拉框
+    #    会正确落在这一档上（别再改成"左右不同"的第二档，会撞档）。
     {"id": "ctrl+win+shift", "keys": ["ctrl", "win", "shift"], "label": "Ctrl + Win + Shift",
-     "hint": "微信 PC 客户端 · 持续输入（按一次开始，不用一直按住）· "
-             "微信输入法里那条切换键是「左Win+左Ctrl+左Shift」，和这组不一样"},
+     "hint": "微信输入法「启动语音输入」· 按一下开始、再按一下结束（**默认档**，本程序语音键用的就是它）· "
+             "键位以输入法「设置 → 语音输入」面板为准"},
     {"id": "ralt",           "keys": ["ralt"],                 "label": "右 Alt",
      "hint": "豆包输入法默认 · 按住说话 · 不涉及 Win，注入路径最干净"},
     {"id": "ralt+space",     "keys": ["ralt", "space"],        "label": "右 Alt + 空格",
@@ -147,6 +152,7 @@ MAPPING_TARGETS: dict[str, str] = {
     #   · 静音键 走 HID，down/up 天然配对                                → 适合按住
     # 一个键当开关、一个键当油门，互不干扰，两种习惯都能照顾到。
     "voice_ptt":   "按住说话 PTT（按下=开始，松开=结束）",
+
     "up":          "方向上  ↑",
     "down":        "方向下  ↓",
     "left":        "方向左  ←",
@@ -177,6 +183,16 @@ MAPPING_TARGETS: dict[str, str] = {
     "ctrl+a":      "全选  Ctrl+A",
     "ctrl+shift+esc": "任务管理器  Ctrl+Shift+Esc",
 }
+
+# 这几个目标**不是"要下发某个组合键"**，而是由程序内部逻辑接管的虚拟动作，
+# 不能拿去 keys._resolve_key() 解析 —— 自检脚本遇到它们要跳过。
+#   ""          禁用
+#   "native"    原样直通（不注入任何键）
+#   "voice"     ATVV 语音键专用（走语音会话状态机，不是组合键）
+#   "voice_ptt" 按住说话 PTT（按下发组合键、松开发抬起，逻辑在 buttons.py）
+# 新增虚拟目标时**必须同步加进这个集合**，否则 check_keymap.py 会把它当组合键
+# 去解析然后报「键名无法解析」而失败。
+VIRTUAL_TARGETS = {"", "native", "voice", "voice_ptt"}
 
 # 「原样直通」的说明 —— 界面和文档共用同一份文案，避免两处说法不一致。
 NATIVE_TARGET_HINT = (
@@ -257,7 +273,9 @@ class Config:
     device:           str       = "chromecast"
     keymap:           dict[str, str] = field(default_factory=lambda: dict(DEFAULT_KEYMAP))
     # 默认直接给「按一下就能长输」那一套，装好即用、不用做任何选择：
-    # 语音键转发微信输入法原生的「启动语音输入」（切换式），状态由微信自己管。
+    # 语音键转发微信输入法原生的「启动语音输入」（切换式）。
+    # 注意分工：输入法的原生能力负责"怎么说话"，**语音会话的开始/结束由本程序管**
+    # （见 main.py 的 voice_active 状态机）。
     # 想退回"按住说话"，在控制台「设置」页把触发方式改回「按住说话」即可。
     input_method:     str       = "wechat_hold_mode"
     custom_keys:      list[str] = field(default_factory=list)  # e.g. ["alt", "shift", "m"]
@@ -359,8 +377,12 @@ def apply_recommended() -> "Config":
                    松手不断，**再按一下（或按任意键，含确认键）结束**
       遥控静音键 → 微信「按住说话」Ctrl+Win，按住说、松手结束
 
-    两者互不干扰：一个当开关，一个当油门。状态全部由微信输入法自己维护，
-    本程序不自建任何语音状态机 —— 别人已经造好的轮子，不重复造。
+    两者互不干扰：一个当开关，一个当油门。
+
+    ⚠️ 分工要说清楚：**「怎么说话」用输入法的原生能力（不重复造轮子），
+    但「这段语音会话什么时候开始、什么时候结束」由本程序自己管。**
+    因为只有程序知道「松开遥控器按键 ≠ 说完」—— 输入法判断不了这件事。
+    所以程序里有一套自己的语音会话状态机（按下翻转、确认键结束、超时兜底）。
     """
     c = Config.load()
     c.input_method       = "wechat_hold_mode"          # 语音键 → 启动语音输入（切换式）
