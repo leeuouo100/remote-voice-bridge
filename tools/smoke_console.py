@@ -151,12 +151,25 @@ def main() -> int:
         devs = st.get("devices", {})
         for k in ("input_list", "output_list", "output_resolved", "output"):
             check(k in devs, f"/api/state.devices 缺少字段 {k}")
-        check(devs.get("output_resolved") in (devs.get("output_list") or [""]),
-              f"output_resolved={devs.get('output_resolved')!r} 不在输出设备列表里，"
-              f"设置页下拉框会显示空白")
+
+        # ⚠ 这条只在**本机真的装了那个设备**时才成立：
+        # 配置里写着 "CABLE Input"，而这台机器没装 VB-CABLE（CI runner 就是
+        # 一张声卡都没有），列表里自然匹配不上 —— 此时下拉框空白是**正确**行为，
+        # 不是 bug。所以先判断"本机到底有没有这个设备"，有才查前缀解析；
+        # 没有就明确跳过，别把环境差异报成代码缺陷（CI 上已经栽过这一跤）。
+        ol = devs.get("output_list") or []
+        want = str(devs.get("output") or "").strip().lower()
+        can_match = bool(want) and any(o.lower().startswith(want) for o in ol)
+        if can_match:
+            check(devs.get("output_resolved") in ol,
+                  f"output_resolved={devs.get('output_resolved')!r} 不在输出设备列表里，"
+                  f"设置页下拉框会显示空白")
+        else:
+            print(f"       [skip] 本机没有 {devs.get('output')!r} 这个输出设备"
+                  f"（列表 {len(ol)} 项），前缀解析这项无法验证")
         # 设备名去重：同一只声卡在 MME/DirectSound/WASAPI 下会重复出现，
         # 不去重的话列表里会有 4 个长得一样的 CABLE Input。
-        ol = devs.get("output_list") or []
+        # （ol 在上面那段已经取过，这里不重复取）
         check(len(ol) == len(set(ol)), "输出设备列表里有完全重名项")
         trunc_pairs = [(a, b) for a in ol for b in ol
                        if a != b and len(a) >= 12 and b.lower().startswith(a.lower())]
