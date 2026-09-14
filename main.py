@@ -10,12 +10,13 @@ import logging
 import os
 import queue
 import sys
+import threading
 import time
 import uuid
 from collections import deque
 from typing import Optional
 
-from config import DEVICES, Config, find_device_by_name, hotkey_label
+from config import DEVICES, Config, find_device_by_name, hotkey_label, CONFIG_PATH
 import state
 from atvv import (
     ATVVProtocol, SERVICE_UUID, TX_UUID, AUDIO_UUID, CTL_UUID,
@@ -25,6 +26,7 @@ from adpcm import IMAADPCMDecoder
 from session import SessionCoordinator, Phase
 from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up
 from buttons import resolve_button
+import mixer
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 # 必须写到用户目录而不是程序目录：打包成 exe 后程序目录是 PyInstaller 的
@@ -46,13 +48,24 @@ logger = logging.getLogger("rvb")
 # ── Audio queue ────────────────────────────────────────────────────────────────
 _sample_queue = queue.Queue(maxsize=65536)
 _pending_samples = deque()
-_GAIN = 10.0
+# 增益不再是常量：控制台的滑块通过 state.set_mix() 随时改，
+# 输出回调每个块读一次（见 _create_stream），改完立即生效。
 
 # 诊断计数：用来判断"遥控器到底有没有把音频推上来"。
 # 之前这两个数字完全没有记录，导致"输入法没反应"无法区分是没收到音频、
 # 还是收到了但没触发输入法 —— 只能靠猜。
 _audio_frames = 0
 _audio_peak   = 0
+
+# 手动重连请求。控制台点「重新连接」时置位，主循环看到就断开重来。
+# 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
+# 连接和同一个托盘图标，谁赢不确定，表现为"点了重连就时好时坏"。
+_reconnect_request = threading.Event()
+
+
+def request_reconnect() -> None:
+    """由 UI 线程调用：请求桥线程断开并按新配置重连。"""
+    _reconnect_request.set()
 
 
 def _downsample(samples: list[int], n: int = 4) -> list[int]:
@@ -131,24 +144,67 @@ async def find_remote(device_type: str | None = None, name_hint: str | None = No
 
 
 # ── Audio stream ───────────────────────────────────────────────────────────────
-def _create_stream(out_dev: int, sample_rate: int):
+def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
+    """输出流：把「遥控器麦克风」和「电脑麦克风」按各自的增益/静音/独奏相加后写出去。
+
+    为什么输出流要**一直开着**（而不是只在遥控器推流时开）：
+    电脑麦克风那一路是持续的，关掉输出流等于把房间里的声音也一起掐了 ——
+    微信就完全听不见你说话了，那还不如不装这个软件。
+    """
     import sounddevice as sd
 
     def cb(outdata, frames, timeinfo, status):
         if status:
             logger.debug(f"Audio status: {status}")
+        # 混合波形取点密度：按"每秒约 200 个点"折算，让三路波形的时间窗口一致
+        # （遥控器那一路是每 20ms 帧推 4 点，电脑麦克风是每块推 4 点）。
+        # 不折算的话 48kHz 输出下每块只有 5ms，波形会被压成短短一小段。
+        wave_step = max(1, int(frames * 200 / max(1, sample_rate)))
+        wave_pts: list[int] = []
+        mx = state.mix_params()
+        # 增益为 0 == 这一路不发声（静音/未参与混音/被别人独奏压掉）
+        r_gain = float(mx["remote_gain"]) if state.source_audible("remote") else 0.0
+        s_gain = float(mx["sys_gain"]) if state.source_audible("sys") else 0.0
+
+        sys_blk = None
+        if sysmic is not None and s_gain > 0.0:
+            try:
+                sys_blk = sysmic.read(frames)
+            except Exception:                      # noqa: BLE001
+                sys_blk = None
+        sys_len = len(sys_blk) if sys_blk is not None else 0
+
+        peak = 0
         for i in range(frames):
-            if _pending_samples:
-                val = int(_pending_samples.popleft()) * _GAIN
-                outdata[i, 0] = max(-32768, min(32767, val))
-            else:
-                try:
-                    batch = _sample_queue.get_nowait()
-                    _pending_samples.extend(batch)
-                    val = int(_pending_samples.popleft()) * _GAIN
-                    outdata[i, 0] = max(-32768, min(32767, val))
-                except queue.Empty:
-                    outdata[i, 0] = 0
+            v = 0.0
+            if r_gain > 0.0:
+                if _pending_samples:
+                    v = int(_pending_samples.popleft()) * r_gain
+                else:
+                    try:
+                        _pending_samples.extend(_sample_queue.get_nowait())
+                        v = int(_pending_samples.popleft()) * r_gain
+                    except queue.Empty:
+                        v = 0.0
+            if i < sys_len:
+                v += float(sys_blk[i]) * s_gain
+
+            iv = int(v)
+            if iv > 32767:
+                iv = 32767
+            elif iv < -32768:
+                iv = -32768
+            outdata[i, 0] = iv
+            a = iv if iv >= 0 else -iv
+            if a > peak:
+                peak = a
+            if i % wave_step == 0:
+                wave_pts.append(iv)
+
+        # 混合输出的电平 + 波形：UI 上「混合输出」那张卡片就是看这两个
+        state.push_levels(mix_db=state.db_from_peak(peak))
+        if wave_pts:
+            state.push_mix_audio(wave_pts)
 
     return sd.OutputStream(
         device=out_dev, channels=1, dtype="int16",
@@ -164,10 +220,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     sig = DEVICES.get(cfg.device)
 
+    # 配置文件里的增益是"开机值"，启动时灌进实时增益；之后控制台说了算。
+    state.set_gain(cfg.gain)
+    state.set_mix(
+        remote_gain=cfg.gain,
+        sys_gain=cfg.system_mic_gain,
+        sys_enabled=cfg.system_mic_enabled,
+        remote_enabled=cfg.remote_mic_enabled,
+    )
+
     logger.info("=" * 60)
     logger.info("remote-voice-bridge starting")
     logger.info(f"  Device : {cfg.device}  ({sig.vid:04X}:{sig.pid:04X})" if sig else f"  Device : {cfg.device}")
-    logger.info(f"  IM     : {cfg.input_method}  audio: {cfg.audio_output}  gain: {_GAIN}x")
+    logger.info(f"  IM     : {cfg.input_method}  audio: {cfg.audio_output}  gain: {state.get_gain()}x")
     _vk = cfg.trigger_keys_windows()
     logger.info(f"  Voice  : {hotkey_label(_vk) or '(未配置)'}  [{'+'.join(_vk) or '-'}]  mode={cfg.hotkey_mode}")
     logger.info(f"  Watchdog: {cfg.watchdog_timeout}s  Reconnect: {cfg.reconnect_delay}s")
@@ -279,6 +344,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     last_start_search  = 0.0   # START_SEARCH 去抖（对标 vRemoter 0.5s）
     ctl_token = aud_token = None
     stream    = None
+    sysmic    = None
 
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search
@@ -307,6 +373,11 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 _audio_peak   = 0
                 state.clear_audio()          # 清掉上一次的波形，UI 从空开始画
                 state.update(streaming=True, last_event="语音中…")
+                # ⚠ 必须补发 MIC_OPEN。
+                # 遥控器按语音键时只会上报 AUDIO_START(0x04)，从不发 START_SEARCH(0x08)，
+                # 而开麦命令原先只挂在 start_search 分支 → 遥控器永远收不到 MIC_OPEN
+                # → 一帧音频都不推，日志表现就是连续「本次共收到 0 个音频帧」。
+                session.ensure_mic_open()
                 # hold 模式 = 按住快捷键（微信输入法：长按说话，松开结束识别）
                 voice_hotkey_down()
             elif event["type"] == "audio_stop":
@@ -406,9 +477,24 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         )
         return False
     logger.info(f"✅ Audio output: device {out_dev}")
+    state.update(out_dev_name=cfg.audio_output)
+
+    # ── 电脑麦克风（混音的另一路）──
+    # 采不到不影响遥控器那一路能用 —— 降级成"只有遥控器麦克风"，而不是整体失败。
+    sysmic = None
+    if cfg.system_mic_enabled:
+        sysmic = mixer.SystemMic(cfg.system_mic_device, atvv.state.sample_rate or 16000)
+        ok = await loop.run_in_executor(None, sysmic.start)
+        if ok:
+            state.update(sys_mic_ready=True, sys_mic_name=sysmic.device_label)
+        else:
+            state.update(sys_mic_ready=False, sys_mic_name="")
+            sysmic = None
+    else:
+        logger.info("ℹ️  电脑麦克风已在设置里关闭，本次只桥接遥控器一路")
 
     def _start_stream():
-        return _create_stream(out_dev, atvv.state.sample_rate or 16000)
+        return _create_stream(out_dev, atvv.state.sample_rate or 16000, sysmic)
 
     stream = await loop.run_in_executor(None, _start_stream)
     await loop.run_in_executor(None, stream.start)
@@ -416,17 +502,50 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     # ── Keyboard hooks ──
     import keyboard as _kb
+    from keys import was_self_injected
 
+    # 遥控器按键（HID）→ 内部 button_id。
+    # 键名是 keyboard 库的写法，必须和它实际报出来的名字一致，
+    # 否则这个按键在映射界面里改了也不会有反应。
     KEY_MAP = {
         "browser start and home":     "home",
+        "browser home":               "home",
+        "home":                       "home",
         "back":                       "back",
         "enter":                      "ok",
+        "return":                     "ok",
         "escape":                     "back",
+        "up":                         "up",
+        "down":                       "down",
+        "left":                       "left",
+        "right":                      "right",
         "volume mute":                "mute",
         "volume up":                  "vol_up",
         "volume down":                "vol_down",
         "media play pause":           "ok",
     }
+
+    # keymap 缓存：按键事件可能一秒来好几个，不能每次都读一遍 config.json。
+    # 用 mtime 判断是否被控制台/手改过 —— 改了立即生效，不用重启。
+    _cfg_cache: dict = {}
+    _cfg_mtime: float = -1.0
+
+    def _get_cfg() -> dict:
+        nonlocal _cfg_cache, _cfg_mtime
+        try:
+            mt = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            mt = -1.0
+        if mt != _cfg_mtime:
+            _cfg_mtime = mt
+            try:
+                new = Config.load()
+                _cfg_cache = {"keymap": new.keymap,
+                              "mapping_enabled": bool(getattr(new, "mapping_enabled", True))}
+                logger.debug(f"config reloaded (mtime={mt})")
+            except Exception as e:
+                logger.error(f"config reload failed: {e}")
+        return _cfg_cache
 
     def _on_key(e):
         nonlocal last_key_activity, last_ble_activity
@@ -434,6 +553,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             last_key_activity = time.time()
             # 遥控器按键 = 它还活着。也算一次"活动"，避免被 watchdog 误判掉线。
             last_ble_activity = time.time()
+
+        # ⚠ 丢掉自己的回声。
+        # 遥控器与物理键盘在 Windows 上不可区分，键盘钩子既能看到用户按的键，
+        # 也能看到我们自己注入的键。若映射目标正好又落回同一个键
+        # （确认键 → Enter 就是典型），不挡掉就会无限自激。
+        if was_self_injected(e.name):
+            return True
 
         # Map key name → button_id
         btn_id = KEY_MAP.get(e.name, "")
@@ -444,8 +570,12 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     break
 
         if btn_id and btn_id != "voice":
+            cached = _get_cfg()
+            if not cached.get("mapping_enabled", True):
+                return True                  # 映射总开关关掉 → 遥控器当普通遥控器用
             handled = resolve_button(
                 btn_id, event_type=e.event_type,
+                keymap=cached.get("keymap") or {},
                 on_voice=None,
             )
             if handled:
@@ -488,6 +618,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         while True:
             await asyncio.sleep(0.2)
 
+            # 控制台点了「重新连接」/ 改了输出设备 → 断开重来，用上新配置
+            if _reconnect_request.is_set():
+                _reconnect_request.clear()
+                logger.info("♻️  手动重连请求 → 断开并按新配置重建")
+                ran_ok = True
+                break
+
             if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
                 logger.warning("📡 Disconnected")
                 break
@@ -520,6 +657,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         try: hotkey_up()
         except Exception: pass
         state.reset()
+        if sysmic is not None:
+            try: sysmic.stop()
+            except Exception: pass
         if stream:
             try: stream.stop(); stream.close()
             except Exception: pass

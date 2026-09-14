@@ -1,0 +1,518 @@
+/* Remote Voice Bridge · 控制台
+   视觉基线对齐 vRemoter：暗色、卡片、细边框、橙色高亮。
+   这里全部用 CSS 变量，方便统一调色。                               */
+
+:root {
+  --bg:            #0a0a0c;
+  --panel:         #131316;
+  --card:          #1b1b1f;
+  --card-2:        #202026;
+  --line:          #2b2b33;
+  --line-soft:     #232329;
+
+  --text:          #ececf1;
+  --text-2:        #9a9aa6;
+  --text-3:        #6c6c78;
+
+  --accent:        #e8a33d;   /* 主强调：橙 */
+  --accent-dim:    #8a6222;
+  --ok:            #35c759;
+  --warn:          #e0574a;
+
+  --radius:        14px;
+  --radius-sm:     9px;
+  --font: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei",
+          -apple-system, "Segoe UI", system-ui, sans-serif;
+  --mono: "SF Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+svg { display: block; }
+code { font-family: var(--mono); font-size: 11.5px; color: var(--text-2);
+       background: #101014; padding: 1px 5px; border-radius: 4px; }
+
+/* ── 顶栏 ───────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 22px;
+  padding: 12px 22px;
+  background: rgba(12,12,14,.92);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line-soft);
+}
+.brand { display: flex; align-items: center; gap: 11px; min-width: 240px; }
+/* 对标 vRemoter：图标装在一个圆角方块的"底托"里，不是裸图标浮在背景上 */
+.brand-mark {
+  width: 34px; height: 34px; padding: 6px;
+  border-radius: 10px;
+  background: #1b1b1f; border: 1px solid var(--line);
+}
+.brand-name { font-size: 14px; font-weight: 600; letter-spacing: .2px; }
+.brand-sub  { font-size: 11px; color: var(--text-3); }
+
+/* 标签组做成一个胶囊容器，选中的那个自己再是一颗胶囊 —— 
+   比三个各自独立的按钮更像一个"控件"，也更接近参考版的样子。 */
+.tabs {
+  display: flex; gap: 2px; flex: 0 0 auto;
+  padding: 4px; border-radius: 999px;
+  background: #131316; border: 1px solid var(--line-soft);
+}
+.tab {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 13px; border-radius: 999px; cursor: pointer;
+  background: transparent; border: 1px solid transparent;
+  color: var(--text-2); font-family: inherit; font-size: 12.5px;
+  transition: background .14s, color .14s, border-color .14s;
+}
+.tab:hover { background: #1d1d22; color: var(--text); }
+.tab.is-active { background: var(--card-2); color: var(--text); border-color: var(--line); }
+.tab-ico { width: 14px; height: 14px; }
+
+.run-state {
+  display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2);
+  margin-left: auto;
+  padding: 6px 13px; border-radius: 999px;
+  background: #131316; border: 1px solid var(--line-soft);
+}
+.run-state .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+
+.dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-3); display: inline-block; flex: 0 0 auto;
+}
+.dot.ok   { background: var(--ok); box-shadow: 0 0 6px rgba(53,199,89,.5); }
+.dot.warn { background: var(--accent); box-shadow: 0 0 6px rgba(232,163,61,.5); }
+.dot.bad  { background: var(--warn); }
+
+main { padding: 18px 22px 40px; max-width: 1180px; margin: 0 auto; }
+
+/* ── 页面切换 ────────────────────────────────────────────── */
+.page { display: none; }
+.page.is-active { display: block; animation: fade .16s ease; }
+@keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+/* ── 卡片 ───────────────────────────────────────────────── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.card-title { font-size: 13.5px; font-weight: 600; }
+.card-desc  { font-size: 11.5px; color: var(--text-3); margin-top: 3px; line-height: 1.45; }
+.card-ico   { width: 20px; height: 20px; color: var(--accent); flex: 0 0 auto; }
+.card-ico.sm{ width: 16px; height: 16px; }
+.sec-title  { font-size: 12px; font-weight: 600; color: var(--text-2);
+              letter-spacing: .4px; margin-bottom: 12px; }
+
+/* ── 语音触发键 ──────────────────────────────────────────────
+   对标 vRemoter：一整行卡片 —— 左边一个图标，中间标题 + 说明 + 当前生效值，
+   右边一个**紧凑**下拉。早前那版把下拉和两个大按钮平铺在右边，
+   下拉里还塞了一整句话（"Ctrl + Win（微信默认 · 按住说话）"），
+   结果整张卡片又宽又乱，重点全糊在一起。                     */
+.trigger-card { display: flex; align-items: center; gap: 14px; padding: 15px 18px; }
+
+.trigger-ico {
+  flex: 0 0 auto; width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 11px;
+  background: #241d13; border: 1px solid var(--accent-dim);
+  color: var(--accent);
+}
+.trigger-ico svg { width: 21px; height: 21px; }
+
+.trigger-body { flex: 1 1 auto; min-width: 0; }
+.trigger-title { font-size: 14px; font-weight: 600; }
+.trigger-desc {
+  font-size: 11.5px; color: var(--text-3);
+  margin-top: 3px; line-height: 1.5; max-width: 62ch;
+}
+.trigger-desc b { color: var(--text-2); font-weight: 600; }
+
+.trigger-live {
+  display: flex; align-items: center; gap: 7px;
+  margin-top: 8px; font-size: 12px; color: var(--text-3);
+}
+.trigger-live b {
+  font-family: var(--mono); font-size: 12.5px;
+  color: var(--accent); font-weight: 600;
+  letter-spacing: .2px;
+}
+.tl-sep { color: var(--line); }
+
+.trigger-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.trigger-actions { display: flex; gap: 6px; }
+
+/* 下拉本身只要显示"按哪几个键"，宽度随内容走 */
+.select-compact { min-width: 0; width: auto; padding-right: 28px; }
+
+.icon-btn {
+  width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: #16161a; border: 1px solid var(--line);
+  border-radius: 8px; color: var(--text-2); cursor: pointer;
+  transition: border-color .14s, color .14s, background .14s;
+}
+.icon-btn svg { width: 15px; height: 15px; }
+.icon-btn:hover { border-color: var(--accent-dim); color: var(--accent); background: #1c1810; }
+.icon-btn.is-rec { border-color: var(--warn); color: var(--warn); }
+
+.hint-line { font-size: 11.5px; color: var(--text-3); margin: 8px 4px 16px; min-height: 16px; }
+.hint-line.warn { color: var(--accent); }
+
+/* ── 控件 ───────────────────────────────────────────────── */
+.select {
+  appearance: none;
+  background: #16161a url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M3 4.5L6 8l3-3.5' stroke='%239a9aa6' stroke-width='1.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>") no-repeat right 10px center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit; font-size: 12.5px;
+  padding: 7px 30px 7px 11px;
+  cursor: pointer; min-width: 210px;
+  transition: border-color .14s;
+}
+.select:hover  { border-color: #3b3b45; }
+.select:focus  { outline: none; border-color: var(--accent-dim); }
+.select.grow   { flex: 1; min-width: 0; }
+.select optgroup { background: #16161a; color: var(--text-3); }
+
+.btn {
+  border: 1px solid var(--line);
+  background: var(--card-2);
+  color: var(--text);
+  font-family: inherit; font-size: 12.5px;
+  padding: 7px 13px; border-radius: var(--radius-sm);
+  cursor: pointer; transition: background .14s, border-color .14s, color .14s;
+  white-space: nowrap;
+}
+.btn:hover  { background: #2a2a32; border-color: #3b3b45; }
+.btn:active { transform: translateY(1px); }
+.btn-ghost { background: transparent; color: var(--text-2); }
+.btn-ghost:hover { color: var(--text); }
+
+.btn-pill.is-on {
+  background: rgba(232,163,61,.15);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.range { appearance: none; height: 4px; border-radius: 2px; background: #2c2c34; flex: 1; }
+.range::-webkit-slider-thumb {
+  appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; border: none;
+  box-shadow: 0 0 0 3px rgba(232,163,61,.16);
+}
+
+.chk { display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+       font-size: 12px; color: var(--text-2); user-select: none; }
+.chk input { appearance: none; width: 15px; height: 15px; border-radius: 4px;
+             border: 1.4px solid #3f3f49; background: #16161a; cursor: pointer;
+             position: relative; margin: 0; transition: background .14s, border-color .14s; }
+.chk input:checked { background: var(--accent); border-color: var(--accent); }
+.chk input:checked::after {
+  content: ""; position: absolute; left: 4px; top: 1px;
+  width: 4px; height: 8px; border: solid #17130a;
+  border-width: 0 2px 2px 0; transform: rotate(42deg);
+}
+
+/* ── 三路音频 ───────────────────────────────────────────── */
+.mix-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+@media (max-width: 980px) { .mix-row { grid-template-columns: 1fr; } }
+
+.chan { display: flex; flex-direction: column; gap: 10px; }
+.chan-head { display: flex; flex-direction: column; gap: 2px; }
+.chan-title { font-size: 15px; font-weight: 600; letter-spacing: .2px; }
+.chan-sub   { font-size: 11.5px; color: var(--text-3); }
+
+.lvl-state { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); }
+.lvl-db { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-3); }
+
+/* ── 波形 ────────────────────────────────────────────────────
+   每一路一条真波形：浅色填充是上下对称的包络（"这一段有多响"），
+   亮色细线是带正负的真实采样（"像不像人在说话"）。
+   三条并排，哪一段断了——麦克风没采到 / 遥控器没推流 / 混音被压掉——
+   一眼就能看出来，不用去猜。                                   */
+.wave {
+  position: relative;
+  height: 56px; border-radius: var(--radius-sm);
+  background: #101014; border: 1px solid var(--line-soft);
+  overflow: hidden;
+}
+.wave-svg { width: 100%; height: 100%; }
+.wave-axis { stroke: #26262e; stroke-width: 1; vector-effect: non-scaling-stroke; }
+
+.wave-fill { stroke: none; opacity: .3; }
+.wave-line {
+  fill: none; stroke-width: 1.5;
+  stroke-linejoin: round; stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+/* 每路一个色调（都是暖色系，避开通用蓝紫） */
+[data-chan="sys"]    .wave-fill { fill: #d8a13c; }
+[data-chan="sys"]    .wave-line { stroke: #e8bc63; }
+[data-chan="remote"] .wave-fill { fill: #e8752f; }
+[data-chan="remote"] .wave-line { stroke: #ff9455; }
+[data-chan="mix"]    .wave-fill { fill: #4fae7c; }
+[data-chan="mix"]    .wave-line { stroke: #6fd39b; }
+
+.wave-idle {
+  position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 11px; color: var(--text-3);
+  background: rgba(16,16,20,.86);
+  padding: 2px 9px; border-radius: 99px;
+  pointer-events: none; opacity: 0;
+  transition: opacity .2s;
+}
+.wave-idle.is-on { opacity: 1; }
+
+/* 波形下面压一张分段电平表：波形看"形状"，这张看"响度"
+   （对标 vRemoter —— 一格一格亮起来，亮到第几格是可数的） */
+.meter-wrap { display: flex; flex-direction: column; gap: 5px; }
+.meter { display: grid; grid-template-columns: repeat(14, 1fr); gap: 3px; height: 13px; }
+.meter i {
+  border-radius: 2px; background: #232329;
+  transition: background .06s linear;
+}
+.meter-scale {
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--text-3);
+}
+
+/* 每路一个色调（都是暖色系，避开通用蓝紫） */
+[data-chan="sys"]    .meter i.is-on { background: #e8bc63; }
+[data-chan="remote"] .meter i.is-on { background: #ff9455; }
+[data-chan="mix"]    .meter i.is-on { background: #6fd39b; }
+/* 顶部三格亮起来就转红 —— 快到削顶了，该把增益调小 */
+.meter i.is-hot { background: var(--warn) !important; box-shadow: 0 0 5px rgba(224,87,74,.55); }
+
+.chan-btns { display: flex; gap: 8px; }
+/* 静音 / 独奏：等宽铺满一行（参考版就是这样，比两个小按钮好点中） */
+.btn-pill {
+  flex: 1;
+  padding: 9px 0; border-radius: 10px;
+  background: transparent; border: 1px solid var(--line);
+  color: var(--text-2); font-size: 12.5px;
+}
+.btn-pill:hover { border-color: #3b3b45; color: var(--text); background: #1d1d22; }
+
+.chan-note { font-size: 11px; color: var(--text-3); line-height: 1.45; }
+/* 卡片底注：三张卡片的底注都贴着底边对齐，视觉上齐平 */
+.chan-foot {
+  margin-top: auto; padding-top: 2px;
+  font-size: 11px; color: var(--text-3);
+  display: flex; align-items: center; gap: 7px;
+}
+.chan-foot.chk { font-size: 11px; }
+.chan-foot code { font-size: 10.5px; }
+
+/* 混合输出卡片高亮：整张卡片带暖调 + 顶部一条橙色细线（对标 vRemoter） */
+.chan-mix {
+  background: linear-gradient(180deg, #2a2118 0%, #221b13 58%, var(--card) 100%);
+  border-color: #4a381d;
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.chan-mix .chan-title { color: var(--accent); }
+.mix-pill {
+  display: flex; align-items: center; gap: 8px;
+  background: #121215; border: 1px solid var(--line);
+  border-radius: 999px; padding: 7px 13px; font-size: 12px; color: var(--text-2);
+}
+.mix-pill .dot { background: var(--accent); box-shadow: 0 0 6px rgba(232,163,61,.6); }
+.mix-pill code { background: transparent; padding: 0; color: var(--text); }
+
+/* ── 状态清单 ───────────────────────────────────────────── */
+/* 对标 vRemoter：左边一列固定宽度的名字，右边紧跟状态值（不是甩到最右）。
+   名字列宽度一致 = 值自然对齐成一条竖线，扫一眼就知道哪一项有问题。 */
+.status-card { margin-top: 14px; padding: 6px 20px; }
+.status-list { display: flex; flex-direction: column; }
+.status-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 0; border-bottom: 1px solid var(--line-soft);
+  font-size: 12.5px;
+}
+.status-row:last-child { border-bottom: none; }
+.status-row .name  { color: var(--text-2); min-width: 176px; }
+.status-row .val   { color: var(--text); font-family: var(--mono); font-size: 12px; }
+.status-row .val.muted { color: var(--text-3); font-family: var(--font); }
+
+/* ── 诊断 ───────────────────────────────────────────────── */
+.diag-card { margin-top: 14px; }
+.diag-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+             color: var(--text-2); margin-bottom: 12px; }
+.diag-head .card-ico { color: var(--text-3); }
+.diag-hint { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
+.diag-hint.bad { color: var(--warn); }
+.diag-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+@media (max-width: 760px) { .diag-grid { grid-template-columns: repeat(2, 1fr); } }
+.diag-grid > div { background: #16161a; border: 1px solid var(--line-soft);
+                   border-radius: var(--radius-sm); padding: 9px 11px; }
+.diag-grid label { display: block; font-size: 10.5px; color: var(--text-3); margin-bottom: 3px; }
+.diag-grid b { font-family: var(--mono); font-size: 13px; font-weight: 500; }
+
+.footer-note { text-align: center; font-size: 11.5px; color: var(--text-3); margin-top: 22px; }
+
+/* ── 按键映射 ───────────────────────────────────────────── */
+/* 三栏等高：右侧映射表最高，另两栏跟着拉伸，遥控器示意图自动垂直居中，
+   视觉上比「三块长短不一」干净得多。 */
+/* 第一栏留够宽度：设备名 "Chromecast Voice Remote" 必须能一行放下，
+   挤成两行会让右边那枚「已连接 / 未连接」标签被顶得歪掉。
+   真遇到更长的型号名也只会收成省略号，不会把布局撑坏。 */
+.map-row { display: grid; grid-template-columns: 272px 176px 1fr; gap: 14px; align-items: stretch; }
+@media (max-width: 1080px) { .map-row { grid-template-columns: 1fr; } }
+
+.map-figure { justify-content: center; }
+
+.map-devices-foot { margin-top: auto; padding-top: 14px; font-size: 11px;
+                    color: var(--text-3); display: flex; align-items: center; gap: 6px; }
+.map-devices { display: flex; flex-direction: column; min-height: 300px; }
+
+.dev-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 11px; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); margin-bottom: 9px;
+  background: #17171b; cursor: default;
+}
+.dev-item.is-active { border-color: var(--accent-dim); background: #1e1a13; }
+/* 设备名一行放下；状态标签必须整块不折 —— 否则「未连接」会被挤成两行 */
+.dev-item > div { min-width: 0; }
+.dev-item .dev-name { font-size: 11.5px; font-weight: 600;
+                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dev-item .dev-id   { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
+.dev-item .dev-state{ margin-left: auto; flex: none; white-space: nowrap;
+                      font-size: 10px; color: var(--text-3); }
+.dev-item .dev-state.ok { color: var(--ok); }
+
+.map-figure { display: flex; flex-direction: column; align-items: center; padding: 16px 12px; }
+/* 白色底托 —— 深色机身直接放在深色卡片上几乎看不见，
+   加一层浅色衬底就变成"产品图"，和参考版的观感一致。 */
+.remote-plate {
+  width: 100%;
+  display: flex; justify-content: center;
+  background: linear-gradient(180deg, #f4f4f7 0%, #e6e6ec 100%);
+  border-radius: var(--radius-sm);
+  padding: 14px 8px;
+}
+.remote-svg { width: 100%; max-width: 132px; height: auto; }
+.remote-svg [data-btn] { cursor: pointer; transition: opacity .12s; }
+.remote-svg [data-btn]:hover { opacity: .72; }
+.remote-svg .hl { filter: drop-shadow(0 0 5px var(--accent)); }
+.map-figure-foot { font-size: 11px; color: var(--text-3); margin-top: 10px; }
+
+.map-table { padding: 16px 18px 12px; }
+.map-table-head { display: flex; align-items: flex-start; justify-content: space-between;
+                  gap: 12px; margin-bottom: 12px; }
+.map-table-title { font-size: 14px; font-weight: 600; }
+.map-table-sub   { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.switch input { display: none; }
+.switch-track { width: 36px; height: 20px; border-radius: 999px; background: #34343d;
+                position: relative; transition: background .16s; flex: 0 0 auto; }
+.switch-thumb { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+                border-radius: 50%; background: #fff; transition: transform .16s; }
+.switch input:checked + .switch-track { background: var(--accent); }
+.switch input:checked + .switch-track .switch-thumb { transform: translateX(16px); }
+.switch-label { font-size: 12px; color: var(--text-2); }
+
+/* 不做内层滚动：15 个按键固定就那么多行，内滚会把最后一行切成半截，
+   看起来像渲染坏了。让整页滚更干净。 */
+.map-rows { margin: 0 -6px; padding: 0 6px; }
+
+/* 映射行：左边图标 + 名字（占满剩余宽度），右边一个**等宽**下拉。
+   等宽 = 所有下拉的左右边缘对齐成两列，看着像一张表；
+   早前让下拉 flex:1 撑满，每行宽度都不一样，很碎。 */
+.map-item { display: flex; align-items: center; gap: 11px; padding: 7px 0;
+            border-bottom: 1px solid var(--line-soft); }
+.map-item:last-child { border-bottom: none; }
+.map-item .btn-ico { width: 22px; height: 22px; color: var(--text-3); flex: 0 0 auto; }
+.map-item .btn-name { flex: 1 1 auto; font-size: 12.5px; color: var(--text-2); }
+.map-item .select { min-width: 0; width: 168px; flex: 0 0 auto; }
+.map-item.is-locked .btn-name { color: var(--text-3); }
+.map-item .lock { font-size: 11px; color: var(--text-3); }
+
+.map-table-foot { display: flex; align-items: center; justify-content: space-between;
+                  gap: 10px; padding-top: 12px; border-top: 1px solid var(--line-soft); margin-top: 8px; }
+.save-note { font-size: 11.5px; color: var(--accent); }
+
+/* ── 设置 ───────────────────────────────────────────────── */
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+@media (max-width: 980px) { .settings-grid { grid-template-columns: 1fr; } }
+.set-card { display: flex; flex-direction: column; }
+.set-row { display: flex; align-items: center; gap: 12px; padding: 9px 0;
+           border-bottom: 1px solid var(--line-soft); }
+.set-row:last-child { border-bottom: none; }
+.set-row.col { flex-direction: column; align-items: stretch; gap: 6px; }
+.set-row.btns { gap: 8px; flex-wrap: wrap; }
+.set-row > label:first-child { font-size: 12.5px; color: var(--text-2); min-width: 116px; }
+.set-row b { font-size: 12.5px; font-weight: 500; margin-left: auto; }
+.set-row .range { max-width: 190px; }
+.set-row b.mono, b.mono { font-family: var(--mono); font-size: 12px; }
+.set-row b { margin-left: auto; }
+.set-row .select { margin-left: auto; }
+.set-row .select.grow { margin-left: auto; }
+.tiny-note { font-size: 11px; color: var(--text-3); line-height: 1.5; }
+.vb-note { font-size: 11px; color: var(--text-3); line-height: 1.55;
+           background: #16161a; border: 1px solid var(--line-soft);
+           border-radius: var(--radius-sm); padding: 10px 12px; margin-top: 12px; }
+b.tiny { font-size: 10.5px; color: var(--text-3); }
+
+/* ── 日志 ───────────────────────────────────────────────── */
+.log-card { padding: 16px 18px 12px; }
+.log-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.log-head .sec-title { margin-bottom: 0; }
+.log-tools { display: flex; align-items: center; gap: 12px; }
+.log-body {
+  margin: 0; height: 520px; overflow: auto;
+  background: #0e0e11; border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm); padding: 12px 14px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
+  color: #b9b9c4; white-space: pre-wrap; word-break: break-all;
+}
+.log-body::-webkit-scrollbar { width: 9px; }
+.log-body::-webkit-scrollbar-thumb { background: #2e2e37; border-radius: 4px; }
+
+/* ── 弹层 / Toast ───────────────────────────────────────── */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0,0,0,.62); backdrop-filter: blur(3px);
+  display: none; align-items: center; justify-content: center;
+}
+.modal-mask.is-open { display: flex; }
+.modal {
+  width: 400px; background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 22px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.6);
+}
+.modal-title { font-size: 14.5px; font-weight: 600; margin-bottom: 6px; }
+.modal-desc  { font-size: 12px; color: var(--text-3); }
+.rec-keys { display: flex; gap: 7px; flex-wrap: wrap; margin: 16px 0 4px; min-height: 34px; }
+.rec-keys kbd {
+  font-family: var(--mono); font-size: 12px;
+  background: #101014; border: 1px solid var(--line);
+  border-bottom-width: 2px; border-radius: 6px; padding: 5px 10px; color: var(--text);
+}
+.modal-foot { display: flex; justify-content: flex-end; margin-top: 10px; }
+
+.toast {
+  position: fixed; left: 50%; bottom: 30px; transform: translate(-50%, 14px);
+  background: #26262e; border: 1px solid var(--line); color: var(--text);
+  padding: 9px 18px; border-radius: 999px; font-size: 12.5px;
+  opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 60;
+}
+.toast.is-on { opacity: 1; transform: translate(-50%, 0); }
+.toast.bad { border-color: var(--warn); color: #ffd9d4; }

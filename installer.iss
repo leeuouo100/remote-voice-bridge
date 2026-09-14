@@ -1,8 +1,17 @@
 ; Inno Setup 脚本 — 把 PyInstaller 输出打包成 Setup.exe
 ; 构建： iscc installer.iss   （需先跑 pyinstaller 产出 dist/RemoteVoiceBridge/）
+;
+; 版本号有两个来源，刻意这样设计：
+;   · 本地直接编译时用下面这个默认值，必须和 config.py 的 APP_VERSION 一致
+;     （tools/check_version.py 会校验，CI 也会校验）
+;   · CI 打 tag 构建时由 workflow 用 /DMyAppVersion=x.y.z 覆盖，
+;     tag 就是唯一真源 —— 避免"tag 打的是 1.0.3、装出来的还是 1.0.2"这种事故。
+
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.2"
+#endif
 
 #define MyAppName "Remote Voice Bridge"
-#define MyAppVersion "1.0.1"
 #define MyAppPublisher "remote-voice-bridge"
 #define MyAppURL "https://github.com/leeuouo100/remote-voice-bridge"
 #define MyAppExeName "RemoteVoiceBridge.exe"

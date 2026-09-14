@@ -1,35 +1,23 @@
 """
-Button mapper — resolves Chromecast Remote HID events to Windows actions.
+Button mapper — resolves remote button events to Windows actions.
+
+映射规则完全由 config.json 的 `keymap` 决定，键位表见 config.MAPPING_TARGETS。
+本模块只负责"查表 → 分发"，不内置任何按键行为，这样按键映射界面改完即时生效。
 """
 
 from __future__ import annotations
 import logging
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger("rvb.btn")
 
 from config import CHROMECAST_BUTTONS, DEFAULT_KEYMAP, Config
-from keys import send_key, trigger_voice_hotkey, handle_mute_hold
+from keys import send_key, send_combo, handle_mute_hold
 
-# ── Resolution ────────────────────────────────────────────────────────────────
-# (vk_name, is_hold_action)
-VK_DEFAULTS = {
-    "up":      ("up",      False),
-    "down":    ("down",    False),
-    "left":    ("left",    False),
-    "right":   ("right",   False),
-    "ok":      ("enter",   False),
-    "back":    ("escape",  False),
-    "home":    ("win+d",   False),
-    "mute":    ("",        True),   # hold → backspace loop
-    "vol_up":  ("volumeup",   False),
-    "vol_down":("volumedown", False),
-    "youtube": ("",          False),
-    "netflix": ("",          False),
-    "power":   ("",          False),
-    "input":   ("",          False),
-    "voice":   ("voice",     False),  # special
-}
+
+# VK_DEFAULTS 已经删除：早前它把"按键 → 键名"硬编码在代码里，
+# 于是 config 里的 keymap 只对不上号的那几个键有效，改配置改不动行为。
+# 现在唯一的真源是 config.json 的 keymap。
 
 
 def resolve_button(
@@ -42,37 +30,35 @@ def resolve_button(
     Handle a remote button event.
     Returns True if the event was handled (should suppress system default).
     """
-    cfg  = keymap or Config.load().keymap
-    mapped = cfg.get(button_id, "")
+    cfg  = keymap if keymap is not None else Config.load().keymap
+    mapped = str(cfg.get(button_id, "") or "").strip()
 
-    # Voice button
+    # 语音键 —— 永远由 ATVV 语音通道处理，不参与普通按键映射
     if button_id == "voice" or mapped == "voice":
         if on_voice:
             on_voice(event_type == "down")
         return True
 
-    # Disabled
+    # 禁用：什么都不做，也不拦截（遥控器原生键仍然生效）
     if not mapped:
         return False
 
-    # Combo key (e.g. "ctrl+win")
+    # 原样直通：遥控器自己的按键在 Windows 上本来就收得到，
+    # 我们再注入一次只会变成双份。所以这里主动什么都不发。
+    if mapped == "native":
+        return False
+
+    # 静音键按住 = 连发退格（沿用上游 remote-voice-bridge 的便捷行为）
+    if button_id == "mute" and mapped == "mute":
+        handle_mute_hold(event_type == "down")
+        return True
+
+    # 其它映射只在按下时触发一次，抬起不重复
+    if event_type != "down":
+        return True
+
     if "+" in mapped:
-        if event_type == "down":
-            trigger_voice_hotkey(keys=mapped.split("+"))
-        return True
-
-    # Check if mapped key matches a VK default for this button
-    default_vk, default_hold = VK_DEFAULTS.get(button_id, ("", False))
-
-    # Mute hold
-    if button_id == "mute" and default_hold:
-        if event_type == "down":
-            handle_mute_hold(True)
-        else:
-            handle_mute_hold(False)
-        return True
-
-    # Normal tap
-    if event_type == "down":
+        send_combo([k.strip() for k in mapped.split("+") if k.strip()])
+    else:
         send_key(mapped)
     return True

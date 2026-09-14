@@ -13,6 +13,9 @@ from typing import Optional
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "remote-voice-bridge"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+# 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
+APP_VERSION = "1.0.2"
+
 
 # ── Device signatures ────────────────────────────────────────────────────────
 @dataclass
@@ -35,65 +38,149 @@ DEVICES: dict[str, DeviceSig] = {
 
 
 # ── Input method bindings ────────────────────────────────────────────────────
+#
+# ⚠ 更正（2026-09-14 实测 + 官方说明）：
+# 早前这里写的是「微信输入法默认长按右 Alt，Ctrl+Win 只在微信窗口内有效」——
+# **那是错的**。实际是：
+#   · 微信 PC 端 4.1.8+ 的语音输入 = 按住 **Ctrl+Win**（Mac 是 Fn），
+#     系统级全局可用（Word / WPS / 浏览器 / 记事本都行），不是只在微信窗口内；
+#     不想一直按住就用 **Ctrl+Win+Shift** 切换"持续输入"模式。
+#   · 微信输入法自己的「设置 → 语音输入」里也是 Ctrl+Win / Ctrl+Win+Shift。
+#   · **右 Alt 是豆包输入法**的默认（它给 右Alt / 右Alt+空格 / 左Ctrl+Win 三选一）。
+#
+# 但这两家都允许用户改键，所以**不要把键位当真理写死** ——
+# 控制台里可以直接改、也可以录制任意组合键（voice_hotkey 覆盖内置值）。
 INPUT_METHODS = {
     "wechat": {
-        # ⚠ 必须与「微信输入法 → 设置 → 语音输入」里显示的键一致。
-        #
-        # 微信输入法的语音唤起键是「长按**右 Alt**」——注意是右侧那个 Alt
-        # （AltGr），与左 Alt 不是同一个键，所以这里写 "ralt" 而不是 "alt"。
-        # 它**全局生效**：微信、豆包、记事本、浏览器……任何输入框都能用。
-        #
-        # 别跟「微信 PC 客户端」（4.1.8+）搞混：那是按住 Ctrl+Win，
-        # 但只在微信自己的窗口里生效，在豆包之类的地方按了毫无反应。
-        #
-        # 若你的输入法里显示的是别的组合，直接改 config.json 的 voice_hotkey，
-        # 不必改这里。
-        "macos_keys":    [],                      # macOS 版是长按 Fn，系统级合成受限，见 custom_keys
-        "windows_keys":  ["ralt"],
+        "macos_keys":    [],
+        "windows_keys":  ["ctrl", "win"],
         "bundle_macos":  "com.tencent.xinshurufa",
-        "desc": "微信输入法（默认，长按右 Alt）",
+        "desc": "微信（按住 Ctrl+Win）",
+    },
+    "wechat_hold_mode": {
+        # 「持续输入」模式：按一次开始，再按一次（或回车）结束，不用一直按着。
+        "macos_keys":    [],
+        "windows_keys":  ["ctrl", "win", "shift"],
+        "desc": "微信 · 持续输入（Ctrl+Win+Shift）",
     },
     "doubao": {
-        # 豆包输入法设置里可选「右 Alt / 右 Alt + 空格 / 左 Ctrl + Win」，
-        # 默认是右 Alt，与微信输入法一致。
-        "macos_keys":    [],                      # macOS 版是长按右 Option，同上
+        "macos_keys":    [],
         "windows_keys":  ["ralt"],
         "bundle_macos":  "com.bytedance.inputmethod.doubaoime",
-        "desc": "豆包输入法（长按右 Alt）",
+        "desc": "豆包输入法（按住右 Alt）",
     },
     "custom": {
         "macos_keys":    [],
         "windows_keys":  [],
-        "desc": "自定义组合键",
+        "desc": "自定义（下面自己录制）",
     },
 }
 
 
+# 语音触发键的预设档 —— 控制台下拉框直接用这张表。
+# 值 = 键名列表；"custom" 是哨兵，表示"用下面录制的组合键"。
+#
+# label 刻意只写**按键本身**（对标 vRemoter 下拉里的 "Option (⌥)"），
+# 那一长串「哪个输入法用它」的说明放进 hint，由界面放在下拉的 tooltip 里 ——
+# 下拉项太长会撑破卡片，而且用户扫一眼要的是"按哪几个键"，不是读句子。
+VOICE_HOTKEY_PRESETS: list[dict] = [
+    # label 只放按键本身（对标 vRemoter 的 "Option (⌥)"）；
+    # 哪个输入法用它、有什么限制，全部放 hint（悬浮提示），
+    # 否则下拉框会被一整句话撑得又宽又长，反而看不清按的是哪个键。
+    {"id": "ctrl+win",       "keys": ["ctrl", "win"],          "label": "Ctrl + Win",
+     "hint": "微信 PC 端 4.1.8+ 的语音键（系统级）· 注入式 Win 组合受系统限制，"
+             "建议先用 tools/test_voice_hotkey.py 实测一次"},
+    {"id": "ctrl+win+shift", "keys": ["ctrl", "win", "shift"], "label": "Ctrl + Win + Shift",
+     "hint": "微信 PC 端 · 持续输入（按一次开始，不用一直按住）· 同上，建议实测"},
+    {"id": "ralt",           "keys": ["ralt"],                 "label": "右 Alt",
+     "hint": "豆包输入法默认 · 按住说话 · 全局干净可靠，推荐"},
+    {"id": "ralt+space",     "keys": ["ralt", "space"],        "label": "右 Alt + 空格",
+     "hint": "豆包输入法备选"},
+    {"id": "custom",         "keys": [],                       "label": "自定义…",
+     "hint": "自己录制一组组合键"},
+]
+
+
 # ── Button definitions (Chromecast Voice Remote) ─────────────────────────────
+# order 决定按键映射界面里的行序 —— 跟遥控器实机的物理布局对齐
+# （从上到下：电源/语音 → 方向/确认 → 返回/Home → 音视频 → 音量）。
 CHROMECAST_BUTTONS = {
-    "up":      {"usage": 0x03, "label": "方向上"},
-    "down":    {"usage": 0x04, "label": "方向下"},
-    "left":    {"usage": 0x05, "label": "方向左"},
-    "right":   {"usage": 0x06, "label": "方向右"},
-    "ok":      {"usage": 0x07, "label": "确认"},
-    "back":    {"usage": 0x0B, "label": "返回"},
-    "home":    {"usage": 0x0A, "label": "Home"},
-    "youtube": {"usage": 0x0E, "label": "YouTube"},
-    "netflix": {"usage": 0x0F, "label": "Netflix"},
-    "power":   {"usage": 0x01, "label": "电源"},
-    "input":   {"usage": 0x11, "label": "信源"},
-    "mute":    {"usage": 0x08, "label": "静音"},
-    "vol_up":  {"usage": 0x0C, "label": "音量＋"},
-    "vol_down":{"usage": 0x0D, "label": "音量－"},
-    "voice":   {"usage": "voice", "label": "语音"},
+    "up":      {"usage": 0x03, "label": "方向上", "order": 10},
+    "down":    {"usage": 0x04, "label": "方向下", "order": 11},
+    "left":    {"usage": 0x05, "label": "方向左", "order": 12},
+    "right":   {"usage": 0x06, "label": "方向右", "order": 13},
+    "ok":      {"usage": 0x07, "label": "确认",   "order": 14},
+    "back":    {"usage": 0x0B, "label": "返回",   "order": 20},
+    "home":    {"usage": 0x0A, "label": "Home",   "order": 21},
+    "mute":    {"usage": 0x08, "label": "静音",   "order": 30},
+    "vol_up":  {"usage": 0x0C, "label": "音量＋", "order": 31},
+    "vol_down":{"usage": 0x0D, "label": "音量－", "order": 32},
+    "voice":   {"usage": "voice", "label": "语音", "order": 5},
+    "youtube": {"usage": 0x0E, "label": "YouTube","order": 40},
+    "netflix": {"usage": 0x0F, "label": "Netflix","order": 41},
+    "power":   {"usage": 0x01, "label": "电源",   "order": 1},
+    "input":   {"usage": 0x11, "label": "信源",   "order": 2},
 }
 
+
+# ── 按键映射目标（对标 vRemoter 的 RemoteMappingTarget，语义换成 Windows）─────
+# 键 = 写进 config.json 的 keymap 值；值 = 界面上显示的中文名。
+# 空字符串 "" 是"禁用"，和 vRemoter 的 .disabled 对应。
+# "native" 是 Windows 特有的一个必要选项，见下方注释。
+MAPPING_TARGETS: dict[str, str] = {
+    "":            "禁用（不发送任何按键）",
+    "native":      "原样直通（遥控器自己的按键生效）",
+    "voice":       "语音输入（长按唤起输入法）",
+    "up":          "方向上  ↑",
+    "down":        "方向下  ↓",
+    "left":        "方向左  ←",
+    "right":       "方向右  →",
+    "enter":       "回车 / 确认  Enter",
+    "escape":      "返回 / 取消  Esc",
+    "backspace":   "退格删除  Backspace",
+    "delete":      "删除  Delete",
+    "tab":         "Tab",
+    "space":       "空格",
+    "pageup":      "Page Up",
+    "pagedown":    "Page Down",
+    "home":        "Home（行首）",
+    "end":         "End（行尾）",
+    "volumeup":    "系统音量＋",
+    "volumedown":  "系统音量－",
+    "mute":        "系统静音（按住＝连删）",
+    "playpause":   "播放 / 暂停",
+    "win":         "开始菜单  Win",
+    "win+d":       "显示桌面  Win+D",
+    "win+s":       "搜索  Win+S",
+    "win+shift+s": "截图  Win+Shift+S",
+    "win+e":       "文件资源管理器  Win+E",
+    "alt+tab":     "切换窗口  Alt+Tab",
+    "ctrl+c":      "复制  Ctrl+C",
+    "ctrl+v":      "粘贴  Ctrl+V",
+    "ctrl+z":      "撤销  Ctrl+Z",
+    "ctrl+a":      "全选  Ctrl+A",
+    "ctrl+shift+esc": "任务管理器  Ctrl+Shift+Esc",
+}
+
+# 「原样直通」的说明 —— 界面和文档共用同一份文案，避免两处说法不一致。
+NATIVE_TARGET_HINT = (
+    "遥控器走的是 HID 键盘通道，它自己的按键 Windows 本来就收得到。\n"
+    "选「原样直通」＝不做任何额外动作，直接让遥控器原生按键生效（不重复、不冲突）。\n"
+    "改成其它动作则会「原生键 + 映射键」一起发出 —— Windows 无法单独拦掉遥控器原生键，\n"
+    "要完全接管请在「设置」页打开「拦截遥控器原生按键」（代价：物理键盘的同名键也会被吞）。"
+)
+
+
 # Default keymap
+#
+# 方向键默认「原样直通」：遥控器的方向键本来就是标准方向键，再注入一次只会变成双份。
+# 确认/返回/Home/静音/音量沿用各自默认（Home 在原生的"浏览器主页"在桌面上没用，
+# 所以补一个 Win+D；音量/静音是遥控器原生的媒体键）。
 DEFAULT_KEYMAP = {
-    "up":      "up",
-    "down":    "down",
-    "left":    "left",
-    "right":   "right",
+    "up":      "native",
+    "down":    "native",
+    "left":    "native",
+    "right":   "native",
     "ok":      "enter",
     "back":    "escape",
     "home":    "win+d",
@@ -106,6 +193,24 @@ DEFAULT_KEYMAP = {
     "vol_down":"volumedown",
     "voice":   "voice",
 }
+
+
+def keymap_targets_with_custom(extra: str | None = None) -> dict[str, str]:
+    """给按键映射下拉框用：内置目标 + 当前值（若它是录制出来的自定义组合键）。
+
+    extra 是某个按键现有的自定义值（例如 "ctrl+alt+m"）。它不在 MAPPING_TARGETS
+    里，若不补进选项表，ttk.Combobox 会因为值不在列表里而显示空白 ——
+    用户会以为映射丢了。
+    """
+    out = dict(MAPPING_TARGETS)
+    if extra and extra not in out:
+        out[extra] = f"自定义：{extra}"
+    return out
+
+
+def ordered_buttons() -> list[tuple[str, dict]]:
+    """按键列表，按界面上希望的物理顺序排。"""
+    return sorted(CHROMECAST_BUTTONS.items(), key=lambda kv: kv[1].get("order", 99))
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -155,6 +260,20 @@ class Config:
     # 开启后物理键盘的 Enter/Esc/方向键也会被吞掉，故默认关闭。
     suppress_keys:    bool      = False
 
+    # ── 混音设置（系统麦克风 + 遥控器麦克风 → 混合输出）────────────────────
+    # 为什么需要：只把遥控器那一路播给 CABLE Input 的话，微信/豆包就**完全听不到
+    # 房间里的声音** —— 想一边用电脑麦克风说话、一边用遥控器语音输入，做不到。
+    # vRemoter 在 macOS 上靠一个自研 2ch 虚拟声卡做这件事；Windows 上不需要
+    # 额外驱动，直接在软件层把两路 PCM 相加即可，而且每路都能单独调增益/静音/独奏。
+    system_mic_enabled: bool  = True      # 电脑麦克风是否参与混音
+    remote_mic_enabled: bool  = True      # 遥控器麦克风是否参与混音
+    system_mic_device:  str   = ""        # 空 = 用系统默认输入设备
+    system_mic_gain:    float = 1.0       # 系统麦克风独立增益（1x–10x）
+
+    # 按键映射总开关（对应控制台「按键映射」页右上角的开关）。
+    # 关掉后遥控器按键一律不处理 —— 等于让遥控器恢复成一只普通 HID 遥控器。
+    mapping_enabled:    bool  = True
+
     def trigger_keys_windows(self) -> list[str]:
         """Return the Windows hotkey list for the configured input method."""
         if self.voice_hotkey:
@@ -179,7 +298,13 @@ class Config:
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 defaults = cls().to_dict()
+                # keymap 单独合并：旧版本写下的 config.json 里没有新增的按键，
+                # 直接整体覆盖会让这些键变成"未配置"，表现为按键失效。
+                km = dict(DEFAULT_KEYMAP)
+                if isinstance(data.get("keymap"), dict):
+                    km.update({k: v for k, v in data["keymap"].items() if isinstance(v, str)})
                 defaults.update(data)
+                defaults["keymap"] = km
                 return cls(**defaults)
             except Exception as e:
                 print(f"[CONFIG] Load error: {e}")

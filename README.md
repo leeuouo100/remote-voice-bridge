@@ -9,8 +9,14 @@
 
 启动后常驻系统托盘，图标颜色反映状态：灰=未连接，暖橙=已连接，橙红=语音中。
 
-托盘右键 → **打开控制台**，可以看到**实时语音波形**、电平、以及
-「本次收到多少帧 / 峰值 / 最后音频几秒前」等诊断指标 —— 出问题时先看这里。
+托盘右键 → **控制台**，是一个分页窗口（对标 vRemoter 的控制台）：
+
+| 页 | 内容 |
+|---|---|
+| **音频** | 实时语音波形、**分段电平表**、**三路音量（电脑麦克风 / 遥控器麦克风 / 混合输出）**、增益滑块、输出设备、输入法、**语音键自测** |
+| **按键映射** | 逐个遥控器按键挑目标动作（下拉选择，也可**录制任意组合键**），改动即时生效 |
+| **设置** | 上半：音频（增益、混合输出设备、电脑麦克风）· 语音（触发方式、触发键、拦截开关、开机启动）；下半：连接 · 关于（版本、配置目录） |
+| **日志** | 实时日志 —— 出问题时先看这里 |
 
 > 🚀 **第一次使用？请直接看 → [使用教程（分步图文）](使用教程.md)**
 > 装虚拟声卡 → 配对遥控器 → 设置麦克风 → 安装程序 → 开始说话，约 10 分钟。
@@ -74,6 +80,92 @@ v1.0.0 发布后在真机上跑，**遥控器这一侧完全正常**（配对、
 
 ---
 
+## v1.0.2：补齐界面（此前是「盲操」）+ 修掉持续 0 帧
+
+v1.0.1 装到 HP 笔记本上以后暴露了两件事：**语音依旧一帧都收不到**，
+以及**整个程序没有界面** —— 只能在托盘右键里点来点去，按键映射只能改 `config.json`
+文件，等于盲操。本版针对这两点。
+
+### 一、持续 0 帧的真正原因：MIC_OPEN 从来没发出去
+
+日志里一直是 `▶ Audio START` + `本次共收到 0 个音频帧`。对照上游客端源码后确认：
+
+| | Chromecast 遥控器实际行为 | 本程序原来的假设 |
+|---|---|---|
+| 按语音键时上报的 ATVV 控制事件 | 只有 `AUDIO_START (0x04)` | 期待 `START_SEARCH (0x08)` |
+| 结果 | 开麦命令 `MIC_OPEN` **一次都没发出去** | —— |
+
+`MIC_OPEN` 原本只挂在 `start_search` 分支上，而这个遥控器**从不发** `start_search`
+（上游客端 `BLEBridge.swift` 里也是同一个现象）。遥控器必须先收到 `MIC_OPEN`
+才会真正上传麦克风数据 —— 所以它一帧都不推。
+
+**修复**：`AUDIO_START` 到达时补发一次 `MIC_OPEN`（`SessionCoordinator.ensure_mic_open()`），
+幂等、不重复开麦；并修正了 `mic_open_sent` 标记的生命周期 —— 它原先在会话关闭时
+不复位，会导致**只有第一次能用、之后每次都 0 帧**。
+
+> 顺带修掉一个潜伏的自激隐患：遥控器走 HID 键盘通道，与物理键盘在 Windows 上
+> **无法区分**，键盘钩子既能看见用户按的键、也能看见程序自己注入的键。
+> 映射目标一旦落回同一个键名（确认键 → Enter 就是典型）就会无限递归注入。
+> 现在注入时会登记"这个键是我发的"，钩子识别到回声直接丢弃。
+
+### 二、补上控制台与按键映射界面
+
+对标 [vRemoter](https://github.com/VincentKingHsu/vRemoter) 的控制台：
+
+- **音频页** —— **三路实时波形 + 分段电平表**（电脑麦克风 / 遥控器麦克风 / 混合输出，
+  每路可静音、独奏、开关是否参与混合）、**增益滑块**（拖完立即生效，不用重启）、
+  **混合输出设备下拉框**（自动列出所有输出设备，VB-CABLE 排最前）、**电脑麦克风选择**、
+  输入法 / 触发方式（按住 / 点按）、**「测试语音键」按钮**（模拟长按 1 秒，
+  直接验证输入法认不认这组键）
+- **按键映射页** —— 每个遥控器按键一行，下拉框挑目标动作。目标集对齐 vRemoter 的
+  `RemoteMappingTarget` 并换成 Windows 语义：方向上/下/左/右、回车、Esc、退格、
+  Delete、Tab、空格、PgUp/PgDn、Home/End、系统音量±、静音、播放暂停、
+  显示桌面、搜索、截图、任务管理器、复制/粘贴/撤销/全选…… 也可以
+  **「录制任意按键…」** 自己按一个组合键进去。改动**即时保存、无需重启**。
+- **设置页** —— 上半：音频（两路增益、混合输出设备、电脑麦克风）与语音
+  （触发方式、触发键、拦截开关、开机启动）；下半：连接与关于（版本、配置目录）
+- **日志页** —— 实时日志
+
+> **关于「原样直通」**：遥控器走 HID 键盘通道，它自己的按键 Windows 本来就收得到。
+> 所以映射目标里有一项 **`原样直通`**（默认用于方向键）＝ 不做任何额外动作。
+> 改成其它动作时会「原生键 + 映射键」一起发出 —— Windows 无法单独拦掉遥控器原生键，
+> 要完全接管需在「设置」页打开「拦截遥控器原生按键」（代价：物理键盘的同名键也会被吞）。
+
+### 三、工程防呆
+
+- 版本号在 `config.py` 与 `installer.iss` 两处，新增 `tools/check_version.py` 做一致性校验；
+  CI 打 tag 时也会校验 tag 与 `APP_VERSION` 是否一致，不一致直接**构建失败**，
+  避免"tag 是 1.0.3、装出来还写着 1.0.2"这种只能靠重新发版来修的事故
+- 新增 `tools/smoke_console.py`：离屏把控制台真的建出来跑几轮刷新，
+  控件名写错 / 变量漏定义这类问题在 CI 阶段就被拦下，而不是等用户点开才炸
+- 新增 `tools/check_injection.py`：**真的把组合键按下去**，再用键盘钩子确认系统收到了。
+  这是唯一能拦住「SendInput 静默失效」和「组合键顺序错」的一关 ——
+  这两种故障的共同点是**日志里一切正常、输入法毫无反应**，肉眼查不出来。
+  下面那个 Win 键的坑就是它抓出来的
+- `tools/check_all.py` 一键跑完全部校验，输出 `ALL CHECKS PASSED` 即通过
+
+#### 顺带查清的一个系统级坑：注入 `Ctrl+Win` 时 Win 会被换成 `0xFC`
+
+排查「按住 `Ctrl+Win` 唤不起输入法」时发现，问题不在我们发得对不对，
+而在**系统收到之后把内容改了**：
+
+| 注入顺序 | 键盘钩子实际看到的事件 | 结果 |
+|---|---|---|
+| 先 Ctrl 再 Win | `vk=0xA2`、**`vk=0xFC`**（Win 被顶替掉了） | 输入法认不出 Win，组合键失效 |
+| **先 Win 再 Ctrl**（现在的做法） | **`vk=0x5B` / `scan=0x5B`**、`vk=0xA2` | 钩子收到货真价实的 Win ✅ |
+
+原因是 `Ctrl+Win` 属于 Windows 保留的**系统组合键**：Ctrl 已经按下时，
+系统会把后到的 Win 改写成 `0xFC`，而且 Ctrl 与 Win **不会同时**出现在
+`GetAsyncKeyState` 里。所以现在 `keys.py` 的按下顺序固定为 **Win 最先落下**
+（`order_press()` 按修饰键优先级排序），`check_injection.py` 对带 Win 的组合
+只认钩子事件、不拿 `GetAsyncKeyState` 当判据。
+
+> 结论：**右 Alt 那条路干净可靠、是推荐值**；`Ctrl+Win` 现在也能发出去了，
+> 但那已经是系统限制下能做到的最好结果 —— 输入法认不认，请按
+> [使用教程](使用教程.md) 第六步实测一次（控制台「音频」页也有「测试语音键」按钮）。
+
+---
+
 ## 安装前提
 
 1. 安装 [VB-CABLE](https://vb-audio.com/Cable/)
@@ -129,7 +221,15 @@ pyinstaller remote-voice-bridge.spec --noconfirm
 iscc installer.iss            :: 需安装 Inno Setup 6
 ```
 
-产物：`installer\RemoteVoiceBridge-Setup-1.0.1.exe`
+产物：`installer\RemoteVoiceBridge-Setup-1.0.2.exe`
+
+改版本号时记得**两个文件一起改**（`config.py` 的 `APP_VERSION` 和 `installer.iss`
+的 `MyAppVersion`），然后跑一次：
+
+```bat
+python tools\check_version.py     :: 应输出 OK 1.0.2
+python tools\smoke_console.py     :: 应输出 SMOKE OK
+```
 
 ### GitHub Actions 自动构建（推荐）
 
@@ -137,8 +237,13 @@ iscc installer.iss            :: 需安装 Inno Setup 6
 `Setup.exe` 挂到 Release：
 
 ```bash
-git tag v1.0.1 && git push origin v1.0.1
+git tag v1.0.2 && git push origin v1.0.2
 ```
+
+构建前会先校验 `tag` 与 `config.py` 的 `APP_VERSION` 是否一致，不一致会直接失败。
+
+> ⚠️ Actions 产出的 Release **默认是 Draft**，要对外可见需手动改：
+> `gh release edit v1.0.2 --draft=false`
 
 也可在 Actions 页面手动 `Run workflow`。
 
@@ -150,12 +255,25 @@ git tag v1.0.1 && git push origin v1.0.1
 adpcm.py        IMA-ADPCM 解码器（移植自 vRemoter）
 atvv.py         ATVV 协议栈 v0.4 / v1.0
 session.py      会话状态机 closed→opening→open→closing
-buttons.py      按键映射
-keys.py         合成键发送
-config.py       配置管理（输入法定向等）
-state.py        桥 ↔ UI 的共享状态
-tray_app.py     托盘 GUI 入口（打包入口）
+buttons.py      按键映射分发（查 config 的 keymap）
+keys.py         合成键发送（SendInput / 拦截回声 / 注入顺序）
+mixer.py        三路混音：电脑麦克风 × 遥控器麦克风 → 混合输出
+config.py       配置管理（输入法、映射目标表、增益等）
+state.py        桥 ↔ UI 的共享状态（含实时增益与电平）
+tray_app.py     托盘 GUI（打包入口）
 main.py         BLE 连接 + ATVV 握手 + VB-CABLE 音频管道
+console_server.py  控制台后端（本地 HTTP，只用标准库，仅监听 127.0.0.1）
+ui/                控制台前端（index.html / style.css / app.js）
+tools/
+  check_all.py        一键跑完全部校验
+  check_version.py    版本号一致性校验
+  check_keymap.py     按键映射表校验
+  check_injection.py  按键注入自检（真按下去 + 钩子确认收到）
+  check_ui.js         控制台截图与波形动画校验（Playwright，可选）
+  smoke_console.py    控制台离屏冒烟测试
+  test_recorder.py    录制器逻辑测试
+  test_voice_hotkey.py  语音快捷键实测工具（只用标准库，不用装依赖）
+  serve_console.py    单独起控制台（开发调试用）
 remote-voice-bridge.spec   PyInstaller 配置
 installer.iss              Inno Setup 脚本
 ```

@@ -11,3 +11,7 @@ build*/
 dist*/
 installer/
 *.spec.bak
+
+# 控制台验收截图（tools/check_ui.js 的产物）
+# 截图里会带本机真实路径（如 C:\Users\<用户名>\AppData\...），不入库
+_shot*.png

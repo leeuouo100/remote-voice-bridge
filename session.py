@@ -26,6 +26,9 @@ class SessionState:
     stream_id: int      = 0
     codec: int          = 0
     open_attempts: int  = 0
+    # 本次语音会话里 MIC_OPEN 是否已经真正发出去了。
+    # 用它而不是 open_attempts 做判断：attempts 在失败重试时也会自增。
+    mic_open_sent: bool = False
 
 
 class SessionCoordinator:
@@ -78,6 +81,39 @@ class SessionCoordinator:
             self._try_close()
         # toggle: close on next audio_stop
 
+    def ensure_mic_open(self) -> bool:
+        """确保本次语音会话已经发出过 MIC_OPEN（幂等，已发过就跳过）。
+
+        为什么单独加这个入口：真机实测发现 Chromecast 遥控器按语音键时，
+        ATVV 控制通道只会上报 AUDIO_START(0x04)，**从来没有 START_SEARCH(0x08)**。
+        而 openMicrophone() 原本只挂在 start_search 分支上 ——
+        于是 MIC_OPEN 一次都没发出去，遥控器不推流，
+        日志表现就是「Audio STOP（本次共收到 0 个音频帧）」连续 0 帧。
+
+        遥控器必须先收到 MIC_OPEN 才会真正上传麦克风数据，所以在 AUDIO_START
+        到达时补发一次是安全的：已发过则直接返回，不会重复开麦。
+
+        ⚠ 这里**刻意不走 `_try_open()`**：调用点就在 AUDIO_START 分支里，
+        而 `on_audio_start()` 已经把相位推到 OPEN，`_try_open()` 开头的
+        `if self.state.phase != Phase.CLOSED: return` 会把整件事吞掉，
+        mic_open_sent 永远是 False —— 那这个补发就等于没写。
+        本方法只认 `mic_open_sent` 这一个标记，与相位解耦。
+
+        返回 True 表示本次调用真的发出了 MIC_OPEN。
+        """
+        if self.state.mic_open_sent:
+            return False
+        try:
+            cmd = self._on_mic_open(self.state.stream_id)
+        except Exception as e:                      # noqa: BLE001
+            logger.error(f"ensure_mic_open failed: {e}")
+            return False
+        if not cmd:
+            return False
+        self.state.mic_open_sent = True
+        logger.info("📤 MIC_OPEN 补发（AUDIO_START 触发，遥控器此前从未收到开麦命令）")
+        return True
+
     def on_audio_start(self, codec: int, stream_id: int) -> None:
         self.state.codec      = codec
         self.state.stream_id  = stream_id
@@ -120,7 +156,8 @@ class SessionCoordinator:
         self._set(Phase.OPENING, "voice_key_down")
         cmd = self._on_mic_open(self.state.stream_id)
         if cmd:
-            logger.info(f"Sent MIC_OPEN (attempt {self.state.open_attempts+1})")
+            logger.info(f"📤 Sent MIC_OPEN (attempt {self.state.open_attempts+1})")
+            self.state.mic_open_sent = True
             self.state.open_attempts += 1
             loop = asyncio.get_event_loop()
             self._open_timer = loop.call_later(self.OPEN_TIMEOUT, self._open_timeout)
@@ -137,6 +174,11 @@ class SessionCoordinator:
 
     def _set(self, phase: Phase, reason: str) -> None:
         self.state.phase = phase
+        # 会话结束就清掉「本次已开麦」标记，否则第二次按语音键时
+        # ensure_mic_open() 会以为已经发过而直接返回 —— 第一次能用、
+        # 之后每次都 0 帧，是最难排查的那类"偶发"故障。
+        if phase == Phase.CLOSED:
+            self.state.mic_open_sent = False
         logger.debug(f"Phase → {phase.value}  ({reason})")
         if self._on_phase:
             self._on_phase(phase, reason)

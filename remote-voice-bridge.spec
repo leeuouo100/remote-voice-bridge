@@ -8,11 +8,16 @@ from PyInstaller.utils.hooks import collect_all
 # ModuleNotFoundError: winrt.windows.devices.bluetooth
 winrt_datas, winrt_binaries, winrt_hidden = collect_all('winrt')
 
+# 控制台的前端资源（HTML/CSS/JS）必须打进包里：
+# 打包后它们不在源码目录，console_server.ui_dir() 会去 sys._MEIPASS/ui 找。
+# 漏掉这一步的表现是"控制台打开一片白 + 404"。
+ui_datas = [('ui', 'ui')]
+
 a = Analysis(
     ['tray_app.py'],
     pathex=[],
     binaries=winrt_binaries,
-    datas=winrt_datas,
+    datas=winrt_datas + ui_datas,
     hiddenimports=winrt_hidden + [
         'winrt.runtime',
         'keyboard',

@@ -25,6 +25,40 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-build.txt
 
+      # 版本号只在 config.py 里写一次，tag 触发时校验两者一致。
+      # 不校验的话会出"tag 是 v1.0.3、装出来还显示 1.0.2"这种需要重新发版才能修的事故。
+      - name: Resolve & verify version
+        id: ver
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $tagVer = $ref.TrimStart('v')
+          $line = Select-String -Path config.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw "config.py 里找不到 APP_VERSION" }
+          $appVer = $line.Matches[0].Groups[1].Value
+          Write-Host "tag=$tagVer   config.APP_VERSION=$appVer"
+          if ($tagVer -ne $appVer) {
+            throw "版本号不一致：tag=$tagVer，但 config.py APP_VERSION=$appVer。请先把 config.py 改成 $tagVer 再打 tag。"
+          }
+          "version=$appVer" >> $env:GITHUB_OUTPUT
+
+      # config.py 与 installer.iss 的版本号必须一致（tag 只在上面那步校验了 config.py）
+      - name: Version consistency
+        run: python tools/check_version.py
+
+      # 映射目标表 / 遥控器按键名 / 录制键名三张表互相对得上吗 —— 纯静态校验，先拦住
+      # "下拉框里出现了后端不认识的取值"这类要等用户改完映射才暴露的问题。
+      # 注意：tools/check_injection.py（真的注入按键）故意不进 CI ——
+      # runner 没有交互桌面会话，在那里跑没有意义。
+      - name: Keymap table check
+        run: python tools/check_keymap.py
+
+      # 控制台是纯 GUI 代码，只有人点开才执行 —— 控件名写错、变量漏定义
+      # 这类问题不在这里拦下来，就要等用户装完点「控制台」才炸。
+      # 脚本在 Tk 起不来的环境里会自动跳过（返回 0），不会误报。
+      - name: Console smoke test
+        run: python tools/smoke_console.py
+
       - name: Build with PyInstaller
         run: pyinstaller remote-voice-bridge.spec --noconfirm
 
@@ -38,7 +72,7 @@ jobs:
             $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           }
           Write-Host "Using ISCC: $iscc"
-          & $iscc "installer.iss"
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "installer.iss"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
