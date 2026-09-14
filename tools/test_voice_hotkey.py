@@ -18,11 +18,12 @@
 **这是唯一能给出最终答案的办法。** 别在代码里猜输入法认哪个键 ——
 键盘钩子能看到的事件和输入法真正判定的条件不是一回事，只能实测。
 
-各家默认键（2026-09-14 核对）：
-  · 微信 PC 端 4.1.8+：按住 **Ctrl+Win**（系统级全局可用）；
-    想免按住就用 **Ctrl+Win+Shift** 切"持续输入"。
-  · 豆包输入法：**右 Alt**（也提供 右Alt+空格 / 左Ctrl+Win）。
-  · 注意是**右侧**那个 Alt —— 这里写 ralt 而不是 alt。
+各家默认键（2026-09-14，以输入法自己的设置面板为准）：
+  · **微信输入法**「设置 → 语音输入」里的「按住说话」= **Ctrl + Win** ← 本程序默认
+    （同一页那条「启动语音输入」= 左Win+左Ctrl+左Shift，是切换模式，不是我们用的）
+  · **豆包输入法** = **右 Alt**（也提供 右Alt+空格 / 左Ctrl+Win）。
+  · 右 Alt 注意是**右侧**那个 Alt —— 这里写 ralt 而不是 alt。
+  · ⚠ 面板里的键位是可以改的，所以**先打开面板看一眼，再决定这里试哪组**。
 
 ⚠ 关于 Ctrl+Win 的一条已知系统限制（实测，见 keys.py 的 hotkey_down 注释）：
   注入式按键里，**Ctrl 已经按下时再发 Win，系统会把 Win 的 vkCode 换成 0xFC**，
@@ -42,14 +43,19 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出，先钉住编码）
+
+_setup_utf8()
+
 from keys import hotkey_down, hotkey_up  # noqa: E402
 
-# 常见候选，按"最可能可用"排序：先试干净的右 Alt，再试受系统限制的 Win 组合
+# 常见候选，按"最可能可用"排序：默认对接的微信输入法用的就是 Ctrl+Win，先试它；
+# 再试不涉及 Win、注入路径最干净的右 Alt（豆包的键）。
 CANDIDATES = [
-    ["ralt"],
-    ["ralt", "space"],
     ["ctrl", "win"],
     ["ctrl", "win", "shift"],
+    ["ralt"],
+    ["ralt", "space"],
     ["ctrl", "shift"],
 ]
 

@@ -23,6 +23,10 @@ import tempfile
 import urllib.error
 import urllib.request
 
+from _utf8 import setup as _setup_utf8  # 下面是中文输出，先钉住编码（CI 是 cp1252）
+
+_setup_utf8()
+
 # ── 沙箱：必须在 import config 之前改 APPDATA ─────────────────────────────────
 _SANDBOX = tempfile.mkdtemp(prefix="rvb-smoke-")
 os.environ["APPDATA"] = _SANDBOX

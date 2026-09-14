@@ -32,6 +32,10 @@ import threading
 import time
 import urllib.request
 
+from _utf8 import setup as _setup_utf8  # 下面是中文输出，先钉住编码（CI 是 cp1252）
+
+_setup_utf8()
+
 _SANDBOX = tempfile.mkdtemp(prefix="rvb-rec-")
 os.environ["APPDATA"] = _SANDBOX
 os.environ["RVB_NO_AUTO_CONSOLE"] = "1"

@@ -41,6 +41,10 @@ from ctypes import wintypes
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出，先钉住编码）
+
+_setup_utf8()
+
 if not hasattr(ctypes, "WinDLL"):
     print("SKIPPED（非 Windows）")
     raise SystemExit(0)
@@ -90,7 +94,7 @@ CASES = [
     (["ctrl", "win"],          ["Ctrl", "Win"]),      # ← 坑 ② 的回归用例
     (["win", "ctrl"],          ["Ctrl", "Win"]),      # 顺序写反了也必须能成
     (["ctrl", "win", "shift"], ["Ctrl", "Win", "Shift"]),
-    (["ralt"],                 ["右 Alt"]),           # 微信输入法 / 豆包默认键
+    (["ralt"],                 ["右 Alt"]),           # 豆包输入法默认键
     (["lalt"],                 ["左 Alt"]),
     (["rwin"],                 ["右 Win"]),
     (["lwin"],                 ["Win"]),
@@ -327,6 +331,13 @@ def main() -> int:
         for f in fails:
             print(f"FAIL {f}")
         print(f"INJECTION FAILED（{len(fails)} 项）")
+        # 「钩子没收到」在机器忙的时候可能连着栽满所有轮次 —— 它和"组合键顺序错了"
+        # 长得一模一样，但一个是环境噪声、一个是真回归。给一句提示，
+        # 免得又有人（包括我们）顺着假 FAIL 去改本来没错的代码。
+        if all("钩子没收到" in f for f in fails):
+            print(f"提示：这类失败也可能是**机器忙**造成的（已自动重试 {_ATTEMPTS} 轮仍失败）。"
+                  "低级键盘钩子有超时机制，控制台服务 / 浏览器 / 视频渲染占着 CPU 时会漏事件。"
+                  "先关掉这些负载再重跑一次；仍然失败才当代码问题查。")
         return 1
     print("INJECTION OK")
     return 0

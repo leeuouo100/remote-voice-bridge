@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+# 这些自检脚本有中文输出（"OK 32 个目标动作 / ..."），而 windows-latest 上
+# Python 的 stdout 默认跟随系统代码页 cp1252 —— print 中文会直接抛
+# UnicodeEncodeError，把构建挂在一行和业务逻辑毫无关系的 print 上。
+# 脚本内部也各自钉了编码（tools/_utf8.py），这里是兜底。
+env:
+  PYTHONIOENCODING: utf-8
+
 jobs:
   build:
     runs-on: windows-latest

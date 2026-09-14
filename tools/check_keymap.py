@@ -25,6 +25,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出，先钉住编码）
+
+_setup_utf8()
+
 from config import CHROMECAST_BUTTONS, DEFAULT_KEYMAP, MAPPING_TARGETS  # noqa: E402
 from keys import _resolve_key, combo_bad_parts, normalize_combo_part  # noqa: E402
 

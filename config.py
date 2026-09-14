@@ -39,26 +39,30 @@ DEVICES: dict[str, DeviceSig] = {
 
 # ── Input method bindings ────────────────────────────────────────────────────
 #
-# ⚠ 更正（2026-09-14 实测 + 官方说明）：
-# 早前这里写的是「微信输入法默认长按右 Alt，Ctrl+Win 只在微信窗口内有效」——
-# **那是错的**。实际是：
-#   · 微信 PC 端 4.1.8+ 的语音输入 = 按住 **Ctrl+Win**（Mac 是 Fn），
-#     系统级全局可用（Word / WPS / 浏览器 / 记事本都行），不是只在微信窗口内；
-#     不想一直按住就用 **Ctrl+Win+Shift** 切换"持续输入"模式。
-#   · 微信输入法自己的「设置 → 语音输入」里也是 Ctrl+Win / Ctrl+Win+Shift。
-#   · **右 Alt 是豆包输入法**的默认（它给 右Alt / 右Alt+空格 / 左Ctrl+Win 三选一）。
+# ⚠ 键位更正（2026-09-14，以输入法自己的设置面板为准）：
+# 早前这里写的是「微信输入法默认长按右 Alt」——**那是不对的**。
+# 打开微信输入法「设置 → 语音输入」，面板上白纸黑字写着：
+#   · 按住说话（PTT）         = **Ctrl + Win**     ← 本程序用的就是这一条
+#   · 启动语音输入（切换模式）  = 左 Win + 左 Ctrl + 左 Shift
+# **右 Alt 是豆包输入法**的默认（它给 右Alt / 右Alt+空格 / 左Ctrl+Win 三选一）。
 #
-# 但这两家都允许用户改键，所以**不要把键位当真理写死** ——
-# 控制台里可以直接改、也可以录制任意组合键（voice_hotkey 覆盖内置值）。
+# 另：微信 PC 客户端 4.1.8+ 的语音输入绑的也是 Ctrl+Win（持续输入用 Ctrl+Win+Shift），
+# 且是系统级可用 —— 早前文档里那句"只在微信窗口内有效"同样是错的。
+#
+# 但各家都允许用户改键，所以**不要把键位当真理写死**：
+# 拿不准就去输入法设置面板看一眼上面写的到底是哪几个键，
+# 或者用 tools/test_voice_hotkey.py 实测一组。控制台里也能直接改/录制。
 INPUT_METHODS = {
     "wechat": {
         "macos_keys":    [],
         "windows_keys":  ["ctrl", "win"],
         "bundle_macos":  "com.tencent.xinshurufa",
-        "desc": "微信（按住 Ctrl+Win）",
+        "desc": "微信输入法（按住说话 Ctrl+Win）",
     },
     "wechat_hold_mode": {
         # 「持续输入」模式：按一次开始，再按一次（或回车）结束，不用一直按着。
+        # 微信 PC 客户端用 Ctrl+Win+Shift；微信输入法面板里这条叫「启动语音输入」，
+        # 显示的是 左Win+左Ctrl+左Shift —— 两家不一样，这里给的是客户端那一套。
         "macos_keys":    [],
         "windows_keys":  ["ctrl", "win", "shift"],
         "desc": "微信 · 持续输入（Ctrl+Win+Shift）",
@@ -88,14 +92,15 @@ VOICE_HOTKEY_PRESETS: list[dict] = [
     # 哪个输入法用它、有什么限制，全部放 hint（悬浮提示），
     # 否则下拉框会被一整句话撑得又宽又长，反而看不清按的是哪个键。
     {"id": "ctrl+win",       "keys": ["ctrl", "win"],          "label": "Ctrl + Win",
-     "hint": "微信 PC 端 4.1.8+ 的语音键（系统级）· 注入式 Win 组合受系统限制，"
-             "建议先用 tools/test_voice_hotkey.py 实测一次"},
+     "hint": "微信输入法「按住说话」就是这一组（设置 → 语音输入里写的）· "
+             "注入式 Win 组合受系统限制，建议先用 tools/test_voice_hotkey.py 实测一次"},
     {"id": "ctrl+win+shift", "keys": ["ctrl", "win", "shift"], "label": "Ctrl + Win + Shift",
-     "hint": "微信 PC 端 · 持续输入（按一次开始，不用一直按住）· 同上，建议实测"},
+     "hint": "微信 PC 客户端 · 持续输入（按一次开始，不用一直按住）· "
+             "微信输入法里那条切换键是「左Win+左Ctrl+左Shift」，和这组不一样"},
     {"id": "ralt",           "keys": ["ralt"],                 "label": "右 Alt",
-     "hint": "豆包输入法默认 · 按住说话 · 全局干净可靠，推荐"},
+     "hint": "豆包输入法默认 · 按住说话 · 不涉及 Win，注入路径最干净"},
     {"id": "ralt+space",     "keys": ["ralt", "space"],        "label": "右 Alt + 空格",
-     "hint": "豆包输入法备选"},
+     "hint": "豆包输入法备选 · 按住说话"},
     {"id": "custom",         "keys": [],                       "label": "自定义…",
      "hint": "自己录制一组组合键"},
 ]
@@ -280,7 +285,9 @@ class Config:
             return list(self.voice_hotkey)
         im = INPUT_METHODS.get(self.input_method, INPUT_METHODS["wechat"])
         if self.input_method == "custom":
-            return self.custom_keys if self.custom_keys else ["ralt"]
+            # 自定义但还没录制任何键时的兜底 —— 跟默认输入法（微信输入法）保持一致，
+            # 别退回右 Alt：那是豆包的键，在这里属于"猜错比不猜更糟"。
+            return self.custom_keys if self.custom_keys else ["ctrl", "win"]
         return im["windows_keys"]
 
     def trigger_keys_macos(self) -> list[str]:

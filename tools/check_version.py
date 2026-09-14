@@ -16,6 +16,10 @@ import os
 import re
 import sys
 
+from _utf8 import setup as _setup_utf8  # 下面是中文输出，先钉住编码（CI 是 cp1252）
+
+_setup_utf8()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

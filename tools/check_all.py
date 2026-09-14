@@ -8,6 +8,10 @@ import os
 import subprocess
 import sys
 
+from _utf8 import setup as _setup_utf8  # 下面是中文输出，先钉住编码（CI 是 cp1252）
+
+_setup_utf8()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 
@@ -15,6 +19,7 @@ STEPS = [
     ("编译全部模块", [PY, "-m", "py_compile",
                   "config.py", "state.py", "keys.py", "session.py", "buttons.py",
                   "mixer.py", "main.py", "console_server.py", "tray_app.py",
+                  "tools/_utf8.py",
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
