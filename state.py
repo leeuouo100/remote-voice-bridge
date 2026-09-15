@@ -263,6 +263,9 @@ def clear_audio() -> None:
         _state.audio_peak    = 0
         _state.audio_last_at = 0.0
         _state.level         = 0
+        # 遥控器电平也归零：新一次会话从"还没声音"开始画，
+        # 否则上一段留下的读数会让「遥控器麦克风」一开始就是"有声音"。
+        _state.remote_level_db = -96.0
 
 
 def reset() -> None:

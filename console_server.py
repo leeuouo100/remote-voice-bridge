@@ -375,6 +375,11 @@ def _supported_devices(cfg: Config, s) -> list[dict]:
     return items
 
 
+# 遥控器电平的过期门限（秒）：超过这么久没收到音频帧，就把「遥控器麦克风」
+# 当成没声音。正常推流约每 20ms 一帧，0.7s 有两个数量级的余量。
+_REMOTE_LEVEL_TTL = 0.7
+
+
 def build_live() -> dict:
     """只含"每次刷新都在变"的部分 —— 供高频轮询（波形要画得流畅）。
 
@@ -382,6 +387,18 @@ def build_live() -> dict:
     放进 150ms 一次的轮询里纯属浪费。完整快照见 build_state()。
     """
     s = state.get()
+    # ── 遥控器电平的"过期保护" ─────────────────────────────────────────────
+    # 遥控器那一路的电平是**按音频帧喂**的（有帧才有读数），遥控器一旦停止推流
+    # 就再没有人来把它刷回去 —— 读数会冻在最后一帧上，界面就一直显示"有声音"、
+    # 电平条一直亮着，看着像"卡住了"。
+    # 另外两路不需要这么处理：电脑麦克风与混音输出都有常驻回调在持续写，
+    # 没声音时它们自己会写 -96。
+    # 判据用"最后一次收到音频帧的时间"，超过 _REMOTE_LEVEL_TTL 就当成没声音；
+    # 这个门限比一帧的间隔（约 20ms）宽两个数量级，不会误伤正常语音里的停顿。
+    now = time.time()
+    remote_db = s.remote_level_db
+    if s.audio_last_at and (now - s.audio_last_at) > _REMOTE_LEVEL_TTL:
+        remote_db = -96.0
     return {
         "status": {
             "connected": bool(s.connected),
@@ -391,7 +408,7 @@ def build_live() -> dict:
         },
         "levels": {
             "sys": round(s.sys_level_db, 1),
-            "remote": round(s.remote_level_db, 1),
+            "remote": round(remote_db, 1),
             "mix": round(s.mix_level_db, 1),
         },
         # 三路波形（各 128 点，int16 量纲），前端归一化后画曲线。
@@ -448,11 +465,12 @@ def build_state(force_devices: bool = False) -> dict:
         "version": APP_VERSION,
         "config_dir": str(CONFIG_DIR),
         "repo": REPO_URL,
-        "levels": {
-            "sys": round(s.sys_level_db, 1),
-            "remote": round(s.remote_level_db, 1),
-            "mix": round(s.mix_level_db, 1),
-        },
+        # ⚠ 这里**不要**再写一遍 levels。
+        #   之前 build_state 在展开 build_live() 之后又覆盖了一次 levels，
+        #   等于把 build_live 里刚做的"遥控器电平过期保护"当场抹掉 ——
+        #   同一份数据有两个来源，改了一个另一个悄悄赢，是最难查的那种 bug。
+        #   电平/波形的唯一出处就是 build_live()。
+        "waves": state.waves_payload(),
         # 三路波形（各 128 点，int16 量纲），前端按满量程归一化后画曲线。
         # 光有电平条看不出"声音长什么样"——波形才能一眼认出是人在说话还是底噪。
         "waves": state.waves_payload(),

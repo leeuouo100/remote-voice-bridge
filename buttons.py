@@ -64,6 +64,15 @@ def resolve_button(
     # 不像 ATVV 只能从 audio_start/audio_stop 两个沿去推断。
     if mapped == "voice_ptt":
         keys = Config.load().voice_ptt_keys or ["ctrl", "win"]
+        # ⚠ 这条日志必须和「语音键」那条**分开**。
+        #   两条路径最后都落到 hotkey_down()/hotkey_up()，打出来的是同一行
+        #   "🎤 voice hotkey DOWN (hold)…" —— 于是「静音键到底上报了没有」
+        #   在日志里完全看不出来（只能靠"有没有紧跟一条语音会话开始"去反推，
+        #   那是猜）。补一条带按键名的，一眼就能对上。
+        logger.info(
+            f"🎤 按键「{button_id}」→ 按住说话 PTT（{'+'.join(keys)}）："
+            + ("按下" if event_type == "down" else "松开")
+        )
         if event_type == "down":
             hotkey_down(keys)
         else:

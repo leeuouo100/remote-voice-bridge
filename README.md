@@ -67,7 +67,28 @@ Copyright © 2026 Sima Qingfeng）。原项目为本仓库提供了协议与会�
 
 完整历史见 **[CHANGELOG.md](CHANGELOG.md)**。下面是最近一版的要点：
 
-### v1.0.7（当前）
+### v1.0.8（当前）
+
+**修控制台「遥控器麦克风」一直显示「等待语音」** —— 不是音频坏了，是没人喂它。
+
+- 那格读数（`remote_level_db`）**整个项目里没有任何一处产品代码写过它**，
+  所以真机上它永远是初始值 −96 dBFS：波形在动、状态却死死卡在「等待语音」、
+  电平条一格都不亮 —— 看着就像"这一路完全没反应"。
+  这正是 2026-09-15 报上来的现象（只有那个假数据演示服务器写过它）。
+- 顺带修掉一个会把它再抹掉的坑：`build_state()` 在展开 `build_live()` 之后
+  又覆盖了一遍 `levels`，等于把刚做的判断当场作废。电平/波形现在只有一个出处。
+- 新增过期保护：遥控器停止推流超过 0.7 秒，电平自动落回"没声音"，
+  不会再冻在最后一帧上让界面一直亮着。
+- **「某个键没反应」的盲区补上了**：以前认不出的按键名 / 蓝牙控制指令是
+  **静默丢弃**的，日志里一个字都没有 —— 根本无法区分"遥控器没发这个键"
+  还是"发了但键名不认识"。现在各自按名字去重报一次，静音键按一下就能在
+  日志里看到答案。
+- 「静音键 / 按住说话」那条日志和「语音键」那条现在是分开的
+  （以前两条打出来长得一模一样，只能靠数配对去反推）。
+- `check_all` 新增「电平生产者一致性」：界面上的每一格读数都必须有人在喂它，
+  谁把生产者删了都会当场变红（带反例自检）。
+
+### v1.0.7
 
 **修掉「按一下语音键立刻被关 + 全程 0 帧」** —— 真机日志定位到的真根因。
 
@@ -198,13 +219,13 @@ pyinstaller remote-voice-bridge.spec --noconfirm
 iscc installer.iss            :: 需安装 Inno Setup 6
 ```
 
-产物：`installer\RemoteVoiceBridge-Setup-1.0.7.exe`
+产物：`installer\RemoteVoiceBridge-Setup-1.0.8.exe`
 
 改版本号时记得**两个文件一起改**（`config.py` 的 `APP_VERSION` 和 `installer.iss`
 的 `MyAppVersion`），然后跑一次：
 
 ```bat
-python tools\check_version.py     :: 应输出 OK 1.0.7
+python tools\check_version.py     :: 应输出 OK 1.0.8
 python tools\smoke_console.py     :: 应输出 SMOKE OK
 ```
 
@@ -214,13 +235,13 @@ python tools\smoke_console.py     :: 应输出 SMOKE OK
 `Setup.exe` 挂到 Release：
 
 ```bash
-git tag v1.0.7 && git push origin v1.0.7
+git tag v1.0.8 && git push origin v1.0.8
 ```
 
 构建前会先校验 `tag` 与 `config.py` 的 `APP_VERSION` 是否一致，不一致会直接失败。
 
 > ⚠️ Actions 产出的 Release **默认是 Draft**，要对外可见需手动改：
-> `gh release edit v1.0.7 --draft=false`
+> `gh release edit v1.0.8 --draft=false`
 
 也可在 Actions 页面手动 `Run workflow`。
 

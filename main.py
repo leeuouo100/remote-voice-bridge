@@ -416,6 +416,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     ctl_token = aud_token = None
     stream    = None
     sysmic    = None
+    # 认不出来的控制指令 / 键名，各自只报一次（去重集合）。
+    # 见 on_control 与 _on_key 里的注释：这两个洞让"按键没反应"永远查不出结论。
+    _unknown_ops: set[int] = set()
 
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
@@ -429,6 +432,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
             event = atvv.parse_control(data)
             if event is None:
+                # ⚠ 认不出来的控制指令原先**只在 DEBUG 打一行、然后静默 return**，
+                #   而正式版日志级别是 INFO —— 等于遥控器发来的任何"我们还没实现"
+                #   的指令，在日志里是一片空白。
+                #   武哥报的「静音键按了没反应」正好卡死在这里：日志既不能证明
+                #   遥控器发了它，也不能证明没发，只能靠猜。
+                #   现在按 **opcode 去重** 报一次（同一个 opcode 只吵一次，不刷屏），
+                #   按一下键就能在日志/控制台日志页里看到答案。
+                if op not in _unknown_ops:
+                    _unknown_ops.add(op)
+                    logger.info(
+                        f"🔘 收到未处理的控制指令 0x{op:02X}（len={len(data)}）"
+                        f" 原始={data.hex(' ')}"
+                    )
                 return
 
             if event["type"] == "capabilities":
@@ -567,6 +583,21 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             # 喂给 UI：波形点 + 诊断指标（帧数/峰值/采样率）
             state.push_audio(_downsample(samples, 4), level, _audio_frames, _audio_peak,
                              atvv.state.sample_rate, len(raw))
+
+            # ⚠⚠ 遥控器那一路的**电平**必须在这里生产，不能指望别人。
+            #
+            # 控制台「遥控器麦克风」卡片读的是 state.remote_level_db，而它只由
+            # state.push_levels(remote_db=…) 写入 —— 全项目里此前**没有任何一处
+            # 产品代码传过 remote_db**（只有 tools/serve_console.py 那个假数据
+            # 演示服务器传过）。于是真机上它永远是初始值 -96 dBFS：
+            #   波形在动（走 push_audio 的 _wave），状态却死死卡在「等待语音」、
+            #   电平条一格都不亮 —— 看着就像"这一路完全没反应"。
+            # 2026-09-15 武哥报的正是这个：混音正常、能说话，就是遥控麦克风那张卡
+            # 一直是「等待语音」。根因是"只有消费者、没有生产者"，不是音频本身。
+            #
+            # 这里用**原始解码峰值**算 dBFS，而不是上面那个 0-100 的 level ——
+            # UI 显示的是 dB，用 int16 满量程折算才和另外两路同一把尺子。
+            state.push_levels(remote_db=state.db_from_peak(peak))
             if _audio_frames == 1:
                 logger.info(f"🔊 收到第一个音频帧：{len(raw)}B → {len(samples)} 采样")
             elif _audio_frames % 100 == 0:
@@ -675,6 +706,8 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     _cfg_cache: dict = {}
     _cfg_mtime: float = -1.0
     _keymap_warned: set[tuple[str, str]] = set()
+    # 认不出的键名只报一次，见 _on_key 末尾那个分支。
+    _unknown_keys: set[str] = set()
 
     def _warn_bad_keymap(keymap: dict) -> None:
         """开机/热重载时检查一遍：映射值里的键名是不是真的能发出去。
@@ -799,6 +832,20 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             )
             if handled:
                 return False
+        elif not btn_id and e.event_type == "down" and e.name:
+            # ⚠ 认不出的键名是**静默丢弃**的：映射表里没有它，程序什么都不做、
+            #   也不留痕。用户看到的现象就是「这个按键没反应」，而日志里一个字
+            #   都没有 —— 到底是遥控器根本没发这个键，还是发了但键名对不上号，
+            #   无法区分。武哥的「静音键没反应」就卡在这个盲区里。
+            # 每个新名字只报一次（去重），所以物理键盘最多吵几十行就安静了。
+            name = str(e.name)
+            if name not in _unknown_keys:
+                _unknown_keys.add(name)
+                logger.info(
+                    f"🔘 收到未映射的按键 {name!r}"
+                    f"（scan={getattr(e, 'scan_code', None)}）"
+                    f" —— 若是遥控器上的键，请到控制台「按键映射」页给它指定动作"
+                )
 
         return True
 

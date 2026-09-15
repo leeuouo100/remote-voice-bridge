@@ -25,12 +25,17 @@ STEPS = [
                   "tools/smoke_console.py", "tools/test_recorder.py",
                   "tools/check_ble_callback_thread.py",
                   "tools/diag_remote.py", "tools/check_packaging.py",
+                  "tools/check_levels.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
     # v1.0.5 就是漏了这一步 —— 工具写好了、也发了版，但安装版用户拿不到
     # （机器上没 Python，仓库里的 .bat 跑不起来）。纯静态，几毫秒。
     ("打包入口一致性", [PY, "tools/check_packaging.py"]),
+    # 三路电平/波形"有消费者、没有生产者"的洞：v1.0.7 真机上「遥控器麦克风」
+    # 波形在动、状态却永远卡在「等待语音」，根因就是**没有任何产品代码喂**
+    # state.remote_level_db。纯静态 + 几行真跑 state 模块，带反例自检。
+    ("电平生产者一致性", [PY, "tools/check_levels.py"]),
     ("按键映射表", [PY, "tools/check_keymap.py"]),
     ("控制台冒烟", [PY, "tools/smoke_console.py"]),
     ("录制器逻辑", [PY, "tools/test_recorder.py"]),
