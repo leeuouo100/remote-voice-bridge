@@ -12,6 +12,12 @@
   ③ COLLECT 真的收了诊断 EXE —— 少一行的话 exe 不会被放进 dist/
   ④ installer.iss 里定义的名字与 spec 一致、并且开始菜单真的引用了它
      （名字对不上，装了也点不开）
+  ⑤ 蓝牙配对修复（--fix-pairing → pairing.py）确实进了包：
+     模块被 hiddenimports 收、winrt 收进来（真机验收要用）、
+     开始菜单有入口、.bat 存在且被 [Files] 拷进安装目录
+
+第 ⑤ 条是 v1.0.10 补的：它治的是「换 USB 口之后程序**完全连不上**」，
+那正是用户最需要工具的时候 —— 这种能力要是只在源码树里，等于没做。
 
 用法： python tools/check_packaging.py
 """
@@ -78,6 +84,37 @@ def main() -> int:
     icons = _section(iss, "Icons")
     checks.append(("{#MyDiagExeName}" in icons,
                    "开始菜单里真的有诊断入口（{#MyDiagExeName}）"))
+
+    # ⑤ 蓝牙配对修复能力进包（v1.0.10 加的闸）
+    # 为什么单列：它解决的是「换 USB 口之后**程序完全连不上**」——
+    # 那正是用户最需要工具的时候。这个能力如果只在源码树里，等于没做。
+    pair_mod = os.path.isfile(os.path.join(ROOT, "pairing.py"))
+    checks.append((pair_mod, "仓库根目录有 pairing.py（修复逻辑本体）"))
+
+    # 取 diag 那个 Analysis 的正文（变量名叫 diag，不是 name='diag' ——
+    # 第一版就是照 name='diag' 去找的，结果三条断言全 FAIL，白跑一轮）
+    m = re.search(r"^\s*diag\s*=\s*Analysis\(([\s\S]*?)\n\)", spec, re.M)
+    diag_block = m.group(1) if m else ""
+    checks.append((bool(diag_block), "spec 里能定位到 diag 那个 Analysis 块"))
+
+    checks.append(("'pairing'" in diag_block,
+                   "诊断 EXE 的 hiddenimports 里有 pairing（否则 --fix-pairing 直接崩）"))
+    checks.append(("winrt" in diag_block.split("hiddenimports")[0]
+                   and "winrt" in diag_block,
+                   "诊断 EXE 收进了 winrt（真机验收要用它把 BLE 设备打开一次）"))
+
+    checks.append(("--fix-pairing" in _read("tools/diag_remote.py"),
+                   "diag_remote.py 把 --fix-pairing 转给了 pairing"))
+    checks.append(("--fix-pairing" in icons,
+                   "开始菜单有「修复蓝牙配对」入口（Parameters: --fix-pairing）"))
+
+    m = re.search(r"#define\s+MyFixBatName\s+\"([^\"]+)\"", iss)
+    bat_name = m.group(1) if m else ""
+    bat_ok = bool(bat_name) and os.path.isfile(os.path.join(ROOT, bat_name))
+    checks.append((bat_ok, f".bat 入口存在且名字对得上（{bat_name or '没找到'}）"))
+    # iss 里引用的是宏，不是字面文件名 —— 所以比的是 {#MyFixBatName}
+    checks.append(("{#MyFixBatName}" in _section(iss, "Files"),
+                   "[Files] 里真的把它拷进安装目录"))
 
     bad = [msg for ok, msg in checks if not ok]
     for ok, msg in checks:

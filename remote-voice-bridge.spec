@@ -69,16 +69,25 @@ exe = EXE(
 )
 
 # ── 第二个入口：遥控器诊断工具 ──────────────────────────────────────────
+# 它也承担「蓝牙配对自检 / 修复」（--fix-pairing → pairing.py）。
+# 用户机器上没有 Python，所以修复能力必须跟着这个 exe 一起进包，
+# 否则「换 USB 口连不上」的用户拿不到救命的那个工具（v1.0.5 的教训）。
 diag = Analysis(
     ['tools/diag_remote.py'],
     pathex=[SPEC_DIR],
-    binaries=[],
-    datas=[],
+    binaries=winrt_binaries,
+    datas=winrt_datas,
     # hidinfo / hidwatch 显式列出来：它们在 diag_remote 里是**包在
     # try/except ImportError 里** import 的（为了打包漏模块时老功能还能用）。
     # PyInstaller 对 try/except 里的 import 只给警告、有时会漏收，
     # 漏了的表现就是"报告里没有 HID 那两段" —— 正好把最关键的结论弄丢。
-    hiddenimports=['keyboard', 'hidinfo', 'hidwatch'],
+    #
+    # pairing / winrt：同理显式加。pairing 是 --fix-pairing 的实现；
+    # winrt 是它做真机验收（真的把 BLE 设备打开一次）用的 ——
+    # 缺了 winrt 不会崩（pairing 会老实报 SKIPPED），但验收就退化成
+    # "只验地址对不对"，所以还是带上。
+    hiddenimports=['keyboard', 'hidinfo', 'hidwatch', 'pairing']
+                  + winrt_hidden + ['winrt.runtime'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

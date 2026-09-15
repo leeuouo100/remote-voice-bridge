@@ -22,6 +22,9 @@
        · **不用按键、只查硬件**： python tools/diag_remote.py --hid
          （2 秒出结果，**不需要退出桥接程序**。遥控器"连上了但按键没反应"
            先跑这个，能一眼分清是"Windows 没认成键盘"还是"程序这层的事"）
+       · **蓝牙配对自检 / 修复**： python tools/diag_remote.py --fix-pairing
+         （换过 USB 口之后"程序说没连接、Windows 说已配对"就跑这个；
+           不加 --fix-pairing 时本参数只诊断。详见 pairing.py 的开头注释）
        · 只验报告生成器、不采集： python tools/diag_remote.py --selftest
 中断： 随时按 Ctrl+C
 
@@ -509,6 +512,22 @@ def _pause_if_frozen() -> None:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
+
+    # ── 蓝牙配对自检 / 修复（pairing.py）──────────────────────────────────
+    # 走**同一个 exe**：安装版用户机器上没有 Python，另发一个脚本等于没发
+    #（v1.0.5 的教训 —— 「CI 绿」不等于「包里真的有」）。
+    #
+    # 这两个参数刻意放在下面「必须先退出桥接程序」那道闸**之前**：
+    # 它们不监听按键，而且**恰恰要在连不上、程序在那儿空转的时候**才跑。
+    if "--fix-pairing" in sys.argv or "--pairing-probe-addr" in sys.argv:
+        import pairing                      # 仓库根目录，非打包时已加进 sys.path
+        rc = pairing.main()
+        if "--pairing-probe-addr" not in sys.argv:
+            # 提权那一次也要停：那是唯一能看到完整修复过程（备份了哪些键、
+            # 动了什么、验收结果）的窗口，一闪而过等于没有。
+            _pause_if_frozen()
+        raise SystemExit(rc)
+
     _rc = main()
     _pause_if_frozen()
     raise SystemExit(_rc)

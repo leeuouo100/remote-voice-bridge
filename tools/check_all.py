@@ -20,7 +20,7 @@ STEPS = [
     ("编译全部模块", [PY, "-m", "py_compile",
                   "config.py", "state.py", "keys.py", "session.py", "buttons.py",
                   "mixer.py", "main.py", "console_server.py", "tray_app.py",
-                  "hidinfo.py", "hidwatch.py",
+                  "hidinfo.py", "hidwatch.py", "pairing.py",
                   "tools/_utf8.py",
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
@@ -28,7 +28,7 @@ STEPS = [
                   "tools/diag_remote.py", "tools/check_packaging.py",
                   "tools/check_levels.py", "tools/check_mix_persist.py",
                   "tools/watch_reports.py", "tools/check_hidinfo.py",
-                  "tools/check_failure_visibility.py",
+                  "tools/check_failure_visibility.py", "tools/check_pairing.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -65,6 +65,14 @@ STEPS = [
     # 托盘还写着「按遥控器任意键唤醒」，把 OSError: E_INVALIDARG 捂了两小时。
     # 纯静态 + 反例，不需要真机。
     ("故障可见性", [PY, "tools/check_failure_visibility.py"]),
+    # 蓝牙配对判定链（pairing.py）。
+    # v1.0.10 加的这一关，治的是「换 USB 口 → 本地蓝牙地址变 → 配对记录作废」：
+    # 程序显示「未连接」、Windows 显示「已配对」、设置里还删不掉。
+    # 判定逻辑读的是真机注册表，CI 里没有蓝牙棒 —— 所以抽成纯函数 + 假数据，
+    # 把真机形态（记录绑旧地址、AEP 节点也是旧地址）钉成 STALE_ADDR，
+    # 再拿反例锁住两处最容易退化的地方（PnP 实例 ID 的 USB\ 前缀、
+    # 搬家时保留注册表值类型）。
+    ("蓝牙配对判定", [PY, "tools/check_pairing.py"]),
     # 注入自检会真的发按键，无桌面会话里自己会 SKIPPED（不算失败）。
     # 它是唯一能拦住"SendInput 静默失效"和"组合键顺序错"的一关。
     #

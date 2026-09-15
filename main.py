@@ -142,6 +142,30 @@ async def find_remote(device_type: str | None = None, name_hint: str | None = No
     selector = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
     devices = await DeviceInformation.find_all_async_aqs_filter(selector)
 
+    # ── 先把作废的配对记录挑出去 ──
+    # AQS 按"配对状态"筛，只看记录**在不在**，不看记录还**对不对**。
+    # 换过 USB 口之后，那张记录绑的本地地址已经不存在了，
+    # 但它照样会被枚举出来 —— 再拿它去 from_id_async 只会
+    # E_INVALIDARG，且每轮重连都要再抛一次（日志刷屏、一句有用的话都没有）。
+    # 这里直接不选它，然后把「为什么」和「点哪」说清楚。
+    now_addr = await _live_adapter_addr()
+    devices, stale = _pick_live_devices(devices, now_addr)
+    if stale and not devices:
+        d0, local0 = stale[0]
+        logger.error(
+            "❌ 枚举到「%s」，但它的配对记录已经作废 —— 连不上就是这个原因。\n"
+            "     记录绑定的本地蓝牙地址 : %s\n"
+            "     当前生效的无线电地址   : %s\n"
+            "   常见起因：蓝牙棒换过 USB 口 / 换过蓝牙模块 / 换过机器。\n"
+            "   配对记录是按**本地地址**存的，地址一变，记录就跟着作废；\n"
+            "   而 Windows 设置里仍然写着「已配对」（甚至能报电量），所以很难看出来。\n"
+            "   处置（不用重新配对，也不用删设备）：%s",
+            d0.name, _fmt_bt_addr(local0),
+            _fmt_bt_addr(now_addr) if now_addr else "(读不到)", _repair_hint(),
+        )
+        state.update(last_event="配对记录已失效 → 跑「修复蓝牙配对」")
+        return None, None
+
     # Try VID/PID first
     if device_type and device_type in DEVICES:
         sig = DEVICES[device_type]
@@ -189,6 +213,48 @@ def _addr_from_ble_id(device_id: str):
     return int(m.group(1).replace(":", ""), 16), int(m.group(2).replace(":", ""), 16)
 
 
+def _repair_hint() -> str:
+    """告诉用户"下一步该点哪" —— 光说"配对失效了"没用。
+
+    安装版：开始菜单 →「修复蓝牙配对」，或双击安装目录里的 .bat。
+    源码版：python pairing.py --fix-pairing
+    """
+    if getattr(sys, "frozen", False):
+        return ("开始菜单 →「修复蓝牙配对」"
+                "（或双击安装目录里的『修复蓝牙配对.bat』）")
+    return "python pairing.py --fix-pairing"
+
+
+async def _live_adapter_addr():
+    """当前真正生效的无线电地址（读不到返回 None）。"""
+    try:
+        from winrt.windows.devices.bluetooth import BluetoothAdapter
+        ad = await BluetoothAdapter.get_default_async()
+        return getattr(ad, "bluetooth_address", None) if ad is not None else None
+    except Exception:                           # noqa: BLE001
+        return None
+
+
+def _pick_live_devices(devices, now_addr):
+    """把"设备 ID 里带的本地地址 ≠ 当前无线电地址"的那些挑出去。
+
+    为什么必须挑出去：那张配对记录已经作废了，但 Windows **依然会把它枚举出来**
+    （AQS 是按"配对状态"筛的，它只看记录在不在，不看记录还对不对）。
+    于是每轮重连都会拿一个打不开的 ID 去 from_id_async → 抛异常 → 重连 →
+    再抛一次，日志刷屏却一句有用的话都没有。
+
+    返回 (可用的, [(过期设备, 它的本地地址)])。
+    """
+    good, stale = [], []
+    for d in devices:
+        local, _remote = _addr_from_ble_id(getattr(d, "id", "") or "")
+        if local is None or now_addr is None or local == now_addr:
+            good.append(d)
+        else:
+            stale.append((d, local))
+    return good, stale
+
+
 async def _open_ble_device(dev_info):
     """拿到一个可用的 BluetoothLEDevice；拿不到就把**原因和处置**写清楚再返回 None。
 
@@ -228,12 +294,7 @@ async def _open_ble_device(dev_info):
             logger.warning("⚠️  按远端地址也失败：%s", e2)
 
     # 两条路都不通 —— 把"为什么"和"怎么办"一起写进日志
-    now_addr = None
-    try:
-        ad = await BluetoothAdapter.get_default_async()
-        now_addr = getattr(ad, "bluetooth_address", None) if ad is not None else None
-    except Exception:  # noqa: BLE001
-        pass
+    now_addr = await _live_adapter_addr()
 
     name = dev_info.name or "该设备"
     if local_addr is not None and now_addr and local_addr != now_addr:
@@ -244,12 +305,12 @@ async def _open_ble_device(dev_info):
             "     当前生效的无线电地址   : %s\n"
             "   设备能被枚举到、Windows 设置里也显示「已配对」，所以看着一切正常；\n"
             "   但蓝牙栈造不出可用的设备对象（E_INVALIDARG），怎么重试都一样。\n"
-            "   处置：设置 → 蓝牙和其他设备 → 删掉「%s」→ 让遥控器进入配对模式"
-            "（长按 Home+返回 约 3 秒）→ 重新添加。\n"
-            "   机器上有两块蓝牙的话：把用不上的那块在设备管理器里禁用，免得以后又漂过去。",
-            _fmt_bt_addr(local_addr), _fmt_bt_addr(now_addr), name,
+            "   处置（v1.0.10 起**不用**再删设备/重新配对了）：%s\n"
+            "   它会把配对记录迁到当前地址下（改注册表前自动备份）。",
+            _fmt_bt_addr(local_addr), _fmt_bt_addr(now_addr),
+            _repair_hint(),
         )
-        state.update(last_event="配对记录已失效，请删除设备后重新配对")
+        state.update(last_event="配对记录已失效 → 跑「修复蓝牙配对」")
     else:
         logger.error(
             "❌ 连接失败（%s）—— 设备枚举到了，但蓝牙栈给不出可用的设备对象。\n"

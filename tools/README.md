@@ -34,6 +34,7 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `check_levels.py` | 三路电平/波形是否"有消费者、也有生产者" | v1.0.7 真机：「遥控器麦克风」波形在动、状态却永远卡在「等待语音」—— 根因是**没有任何产品代码喂** `state.remote_level_db`（只有演示脚本喂过） |
 | `check_mix_persist.py` | 音频页的开关**落盘**了没有 | 「界面上关了、后端还在用」：`/api/mix` 只改内存不写 `config.json`，设置页一动就被悄悄回滚。沙箱 APPDATA，不碰真配置 |
 | `check_hidinfo.py` | 遥控器的 HID 判定链：厂商自定义页（`0xFF00+`）Windows 不处理、键盘页会被处理、设备路径与 `cbSize` 偏移无关 | v1.0.8 查到：遥控器暴露**两个厂商自定义集合**（`0xFF01`/`0xFF80`，各 21 字节输入报告），Windows 对它们不做任何事。按键若发在那里，改映射表**永远没用** —— 判定改错，报告就会把用户指向错误的修法 |
+| `check_pairing.py` | 蓝牙配对判定链：6 种状态（真机形态必须判成 `STALE_ADDR`、`migrate` 之后的形态必须是 `NODE_PHANTOM`）；分支顺序（`STALE_ADDR` 要排在 `NODE_PHANTOM` 前面）；「幽灵」口径；PnP 实例 ID 带 `USB\` 前缀；搬家保留注册表值类型；「删不动」只在管理员下下结论；ACL 接管开一组特权 + 循环到不动点；提权带全部开关。含**行为级反例**（把 `classify` 改坏 exec 起来必须判错） | v1.0.10 的真机事故：「换过 USB 口就连不上」—— 程序显示未连接、Windows 显示已配对、设置里还删不掉。判定读的是真机注册表，CI 里没有蓝牙棒，所以抽成纯函数 + 假数据锁死 |
 | `check_failure_visibility.py` | 故障必须「看得见、说人话」：桥线程异常走 logging（不是 `print`）、连接失败必须给出原因+处置且不只试一条路、托盘必须能说出具体原因、`_open_ble_device` 必须真被 `run_bridge` 调用 | v1.0.9 真机：桥每 3 秒崩一次却**一行报错都没有** —— 因为 `tray_app` 用 `print` 报异常，而主 exe 是 `console=False`（输出流向是空的）；托盘还一直写着「按遥控器任意键唤醒」，把 `OSError: E_INVALIDARG` 捂了两小时。这类「静默 + 误导」是这个项目最反复的一类 bug，所以用反例锁死 |
 | `check_ui.js` | 控制台截图 + 波形动画（需 Playwright，可选） | 前端改挂了不至于没人发现 |
 
@@ -51,6 +52,7 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `serve_console.py` | 单独起控制台做前端调试 | `python tools\serve_console.py` |
 | `diag_remote.py` | **遥控器/按键出任何问题，先跑它**。让程序把现象测出来，而不是靠人描述 | **安装版**从开始菜单打开**「遥控器诊断」**（就是安装目录里的 `RemoteVoiceBridgeDiag.exe`）；**源码版**双击仓库根目录的 **`diag-remote.bat`**（或 `python tools\diag_remote.py`）。会分 7 段引导你按遥控器和物理键盘，约 90 秒，产出 `%APPDATA%\remote-voice-bridge\remote-diag.txt`。报告开头是【结论 0】硬件身份（**不用按键**）、末尾是【结论 4】按键落点（各 HID 集合收到了多少条原始报告） |
 | `diag_remote.py --hid` | 「蓝牙显示连好了，但按键没反应」—— 先跑这个，**2 秒出结果** | `python tools\diag_remote.py --hid`（安装版：`RemoteVoiceBridgeDiag.exe --hid`）。**不用按任何键、也不用先退出桥接程序**。直接报出遥控器的 5 个 HID 集合各自"是什么、Windows 会不会理它"，以及键位映射配置的关键项 |
+| `pairing.py` | 「换过 USB 口之后程序显示未连接，Windows 却显示已配对」——**先跑这个** | **安装版**开始菜单 → **「修复蓝牙配对」**（等价于安装目录里的 `修复蓝牙配对.bat`，也等价于 `RemoteVoiceBridgeDiag.exe --fix-pairing`）；**源码版**双击 `修复蓝牙配对.bat` 或 `python pairing.py --fix-pairing`。⚠ **不带 `--fix-pairing` 就是纯只读诊断**（不需要管理员）。修复会弹一次 UAC，动注册表前自动备份到 `%APPDATA%\remote-voice-bridge\backup\`。可用 `--method restore\|migrate\|purge` 指定方案，`purge` 需 `--yes`。报告：`pairing-fix.txt` |
 | `watch_reports.py` | 想知道**某个键的报告到底落在哪一路**（键盘 / 鼠标 / 厂商自定义页） | `python tools\watch_reports.py`（默认听 40 秒，`--seconds 60` 改时长，`--all` 连非 Google 的集合一起看）。⚠ **跑之前先退出桥接程序**（托盘右键 → 退出），否则它会把遥控器原生按键吞掉、报告显示"一条都没收到"。产出 `%APPDATA%\remote-voice-bridge\remote-hidwatch.txt` |
 
 > `diag_remote.py` 的**真机部分**必须有人按键，没法自动化；但它的「报告生成器」
