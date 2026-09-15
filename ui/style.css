@@ -237,6 +237,13 @@ main { padding: 18px 22px 40px; max-width: 1180px; margin: 0 auto; }
 .chan-title { font-size: 15px; font-weight: 600; letter-spacing: .2px; }
 .chan-sub   { font-size: 11.5px; color: var(--text-3); }
 
+/* 这一路没参与混音：整张卡片压暗。
+   为什么需要它：麦克风一直在采集，电平条和波形照旧在动 ——
+   用户看到「明明关掉了它还在动」，就会以为"关了还在输出"。
+   压暗 + 状态词改写成『未参与混音』，两处一起把这件事说清。 */
+.chan.is-excluded { opacity: .55; }
+.chan.is-excluded .chan-title { color: var(--text-3); }
+
 .lvl-state { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); }
 .lvl-db { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-3); }
 

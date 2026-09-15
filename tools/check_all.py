@@ -20,12 +20,14 @@ STEPS = [
     ("编译全部模块", [PY, "-m", "py_compile",
                   "config.py", "state.py", "keys.py", "session.py", "buttons.py",
                   "mixer.py", "main.py", "console_server.py", "tray_app.py",
+                  "hidinfo.py", "hidwatch.py",
                   "tools/_utf8.py",
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
                   "tools/check_ble_callback_thread.py",
                   "tools/diag_remote.py", "tools/check_packaging.py",
-                  "tools/check_levels.py",
+                  "tools/check_levels.py", "tools/check_mix_persist.py",
+                  "tools/watch_reports.py", "tools/check_hidinfo.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -36,6 +38,10 @@ STEPS = [
     # 波形在动、状态却永远卡在「等待语音」，根因就是**没有任何产品代码喂**
     # state.remote_level_db。纯静态 + 几行真跑 state 模块，带反例自检。
     ("电平生产者一致性", [PY, "tools/check_levels.py"]),
+    # 「界面上关了、后端还在用」—— 音频页的开关以前只改内存、不落盘，
+    # 设置页一动或重连就被 config.json 悄悄回滚。这是最难查的一类 bug：
+    # 一点声音都没有，用户只会说"它自己不听话"。沙箱 APPDATA，不碰真配置。
+    ("混音开关落盘", [PY, "tools/check_mix_persist.py"]),
     ("按键映射表", [PY, "tools/check_keymap.py"]),
     ("控制台冒烟", [PY, "tools/smoke_console.py"]),
     ("录制器逻辑", [PY, "tools/test_recorder.py"]),
@@ -46,6 +52,12 @@ STEPS = [
     # 用假数据把两条分支（能区分 / 不能区分）都验一遍 —— 不然那段代码
     # 第一次运行就是在用户机器上。不需要 keyboard 库。
     ("遥控器诊断报告", [PY, "tools/diag_remote.py", "--selftest"]),
+    # 遥控器的 HID 判定链。v1.0.8 查「除语音键外所有按键都没反应」时，
+    # 真机挖出一条以前没人写下来的硬事实：遥控器暴露了**两个厂商自定义
+    # 用法页**（0xFF01/0xFF80，各 21 字节输入报告），Windows 对它们
+    # 不做任何处理。这条事实直接决定"该修什么"，所以判定表 + 报告判读
+    # 分支都用反例锁住。纯静态 + 假数据，CI 里可跑。
+    ("HID 判定链", [PY, "tools/check_hidinfo.py"]),
     # 注入自检会真的发按键，无桌面会话里自己会 SKIPPED（不算失败）。
     # 它是唯一能拦住"SendInput 静默失效"和"组合键顺序错"的一关。
     #

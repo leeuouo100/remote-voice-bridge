@@ -706,8 +706,8 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     _cfg_cache: dict = {}
     _cfg_mtime: float = -1.0
     _keymap_warned: set[tuple[str, str]] = set()
-    # 认不出的键名只报一次，见 _on_key 末尾那个分支。
-    _unknown_keys: set[str] = set()
+    # 首次见到的键名只报一次，见 _on_key 里那两处。
+    _seen_keys: set[str] = set()
 
     def _warn_bad_keymap(keymap: dict) -> None:
         """开机/热重载时检查一遍：映射值里的键名是不是真的能发出去。
@@ -783,6 +783,24 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         if was_self_injected(e.name):
             return True
 
+        # ⚠ 第二个盲区：**键名本身为空**。
+        #   `keyboard` 库遇到它解析不出来的键，会把 e.name 报成 None/空串。
+        #   这种事件在下面每一个分支里都是 falsy，会**一路静默滑到最后**：
+        #   不映射、不记日志、不报错，用户看到的就是"这个按键没反应"。
+        #   比下面那个"键名认得出但表里没有"的盲区更靠前、更难查
+        #   （连"它报了什么名字"都拿不到）。
+        #   这里补一条带 scan/vk 的日志：至少能看出"确实收到过一个键"。
+        if e.event_type == "down" and not e.name:
+            if "<无名>" not in _seen_keys:
+                _seen_keys.add("<无名>")
+                logger.info(
+                    "🔘 HID 按键【无名】—— keyboard 库没能解析出键名"
+                    f"（scan={getattr(e, 'scan_code', None)}、"
+                    f"vk={getattr(e, 'vk', None)}）→ 无法映射，已忽略。"
+                    " 若这是遥控器上的键，请把这一行发出来。"
+                )
+            return True
+
         # Map key name → button_id
         btn_id = KEY_MAP.get(e.name, "")
         if not btn_id and e.name:
@@ -825,6 +843,20 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             cached = _get_cfg()
             if not cached.get("mapping_enabled", True):
                 return True                  # 映射总开关关掉 → 遥控器当普通遥控器用
+            # ⚠ 每个**首次出现**的键名都在这里报一次（之后静默）。
+            #   这是"某个按键没反应"唯一能靠一次按键就查清的办法：
+            #     · 日志里有这一行  → 键已经进了 Windows，问题在我们这层或下游
+            #     · 日志里没有这一行 → 键根本没进 Windows，得从蓝牙/HID 那一层查
+            #   2026-09-15「遥控器除了语音键其他键全没反应」就卡在这个盲区里：
+            #   当时日志对 HID 按键**一个字都不写**，无法区分上面两种情形。
+            #   去重是必须的：物理键盘敲字母也走这里，不去重会瞬间刷屏。
+            if e.event_type == "down" and e.name and e.name not in _seen_keys:
+                _seen_keys.add(e.name)
+                logger.info(
+                    f"🔘 HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
+                    f" → 按钮「{btn_id}」→ 动作 "
+                    f"{(cached.get('keymap') or {}).get(btn_id, '')!r}"
+                )
             handled = resolve_button(
                 btn_id, event_type=e.event_type,
                 keymap=cached.get("keymap") or {},
@@ -832,20 +864,18 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             )
             if handled:
                 return False
-        elif not btn_id and e.event_type == "down" and e.name:
+        elif e.event_type == "down" and e.name and e.name not in _seen_keys:
             # ⚠ 认不出的键名是**静默丢弃**的：映射表里没有它，程序什么都不做、
             #   也不留痕。用户看到的现象就是「这个按键没反应」，而日志里一个字
             #   都没有 —— 到底是遥控器根本没发这个键，还是发了但键名对不上号，
             #   无法区分。武哥的「静音键没反应」就卡在这个盲区里。
-            # 每个新名字只报一次（去重），所以物理键盘最多吵几十行就安静了。
-            name = str(e.name)
-            if name not in _unknown_keys:
-                _unknown_keys.add(name)
-                logger.info(
-                    f"🔘 收到未映射的按键 {name!r}"
-                    f"（scan={getattr(e, 'scan_code', None)}）"
-                    f" —— 若是遥控器上的键，请到控制台「按键映射」页给它指定动作"
-                )
+            # 同样只报一次（去重），物理键盘最多吵几十行就安静了。
+            _seen_keys.add(e.name)
+            logger.info(
+                f"🔘 HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
+                f" → 没有对应按钮，已忽略"
+                f"（若这是遥控器上的键，请到控制台「按键映射」页给它指定动作）"
+            )
 
         return True
 

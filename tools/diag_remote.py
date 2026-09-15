@@ -19,8 +19,22 @@
 用法： · 安装版：开始菜单 →「遥控器诊断」（等价于安装目录里的
          RemoteVoiceBridgeDiag.exe）
        · 源码版： python tools/diag_remote.py ，或双击仓库根目录的 diag-remote.bat
+       · **不用按键、只查硬件**： python tools/diag_remote.py --hid
+         （2 秒出结果，**不需要退出桥接程序**。遥控器"连上了但按键没反应"
+           先跑这个，能一眼分清是"Windows 没认成键盘"还是"程序这层的事"）
        · 只验报告生成器、不采集： python tools/diag_remote.py --selftest
 中断： 随时按 Ctrl+C
+
+## 报告里的四段（结论 0 最关键）
+
+【结论 0】HID 硬件身份 —— 不用按任何键。看遥控器的 5 个 HID 集合里，
+          键盘那一路有没有被 Windows 绑上（Service=kbdhid）。
+          没绑上 / 根本没键盘集合 → 改映射表没有任何用，先修驱动/配对。
+【结论 1/2】遥控器与物理键盘的扫描码是否可区分（决定能不能只拦遥控器）
+【结论 3】各键实际发出的键盘事件（"按了没反应"若在这一段是空的，看结论 4）
+【结论 4】按键落点 —— 各 HID 集合的**原始报告**计数。遥控器有两个
+          **厂商自定义集合**（0x01FF01 / 0x01FF80），Windows 对它们不做任何事。
+          若按键报告只落在那里，任何映射都够不到它 —— 必须自己读那一路。
 """
 
 from __future__ import annotations
@@ -45,6 +59,19 @@ import ctypes  # noqa: E402
 import subprocess  # noqa: E402
 
 from config import APP_VERSION, CONFIG_DIR  # noqa: E402
+
+# ── HID 硬件身份 + 集合报告监听 ────────────────────────────────────────────
+# 2026-09-15 加的。起因：武哥报「遥控器除了语音键，其他所有按键都没有作用」。
+# 只记键盘事件答不了这一问 —— 因为**按键可能压根没变成键盘事件**：
+# 遥控器还暴露了两个厂商自定义集合（0x01FF01 / 0x01FF80），Windows 对它们
+# 不做任何事。报告里必须同时有"设备长什么样"和"按键落在哪一路"。
+# 用 try/except 包住：打包时万一漏了模块，老功能（7 段按键采集）仍要能用。
+try:
+    import hidinfo      # noqa: E402
+    import hidwatch     # noqa: E402
+except ImportError:                                     # noqa: BLE001
+    hidinfo = None                                      # type: ignore[assignment]
+    hidwatch = None                                     # type: ignore[assignment]
 
 # ⚠ `keyboard` 只在真正要监听时才 import —— `--selftest` 只验报告生成器，
 #   不需要键盘库，这样它在 CI / 没装依赖的机器上也能跑。
@@ -123,6 +150,16 @@ def main() -> int:
     if not hasattr(ctypes, "WinDLL"):
         print("SKIPPED（非 Windows）")
         return 0
+
+    # --hid：只出"不用按任何键"的硬件身份报告，立刻返回。
+    # 特意放在下面那道"必须先退出桥接程序"的闸**之前** ——
+    # 它不监听按键，桥接程序开着也不影响结论，用户不用先去关程序。
+    if "--hid" in sys.argv:
+        if hidinfo is None:
+            print("⚠ 本版本没带上 hidinfo 模块，无法探测 HID 设备。")
+            return 1
+        print(hidinfo.format_report(hidinfo.probe(with_descriptor_len=True), indent=""))
+        return 0
     try:
         import keyboard as _kb_mod
     except ImportError:
@@ -160,6 +197,24 @@ def main() -> int:
     print()
     input("  准备好了按【回车】开始…")
 
+    # ── 先出硬件身份（不用按键）──
+    snap = hidinfo.probe() if hidinfo is not None else None
+    if snap is not None:
+        print()
+        print(hidinfo.format_report(snap))
+        print()
+
+    # ── 同时开一路"HID 集合原始报告"监听 ──
+    # with_hooks=False：本脚本自己的 on_key 已经在记键盘事件了，再挂一个
+    # 会把同一个按键记两遍。这里只要"哪一路集合收到了原始报告"这半边。
+    watch = hidwatch.ReportWatcher(only_google=True) if hidwatch is not None else None
+    if watch is not None:
+        n_open = watch.start(with_hooks=False)
+        print(f"  ℹ 已同时开始读 HID 集合的原始报告（打开 {n_open} 路）。")
+        print("     若按键报告落在『厂商自定义』那一路，说明 Windows 根本看不见它 ——")
+        print("     那种情况下改映射表没有任何用，报告末尾会直接给出判读。")
+        print()
+
     rec: list[tuple[float, int, str, int, bool]] = []
     seen_in_stage = 0
     stage_idx = 0
@@ -196,8 +251,10 @@ def main() -> int:
             _kb.unhook(hook)
         except Exception:  # noqa: BLE001
             pass
+        if watch is not None:
+            watch.stop()
 
-    return _write_report(rec)
+    return _write_report(rec, snap=snap, watcher=watch)
 
 
 def _stage_lines(rec, i: int) -> list[str]:
@@ -210,7 +267,8 @@ def _pairs(rec, i: int) -> set[tuple[str, int]]:
     return {(n, s) for (_t, si, n, s, _k) in rec if si == i}
 
 
-def _write_report(rec, quiet: bool = False) -> int:
+def _write_report(rec, quiet: bool = False, snap: dict | None = None,
+                  watcher=None) -> int:
     lines: list[str] = []
     A = lines.append
 
@@ -220,6 +278,15 @@ def _write_report(rec, quiet: bool = False) -> int:
     A(f" 程序版本：v{APP_VERSION}")
     A(f" 记录到按键总数：{len(rec)}")
     A("=" * 66)
+
+    # ── 结论 0：不用按任何键就能拿到的硬件身份 ──
+    # 放最前面是因为它能一票否决后面所有分析：若 Windows 压根没把遥控器的
+    # 键盘集合绑上、或按键发在厂商自定义页，那"按了没反应"与映射表无关，
+    # 后面那 7 段按键记录只会是空的 —— 先看这里能省掉一整轮返工。
+    A("")
+    if snap is not None and hidinfo is not None:
+        A(hidinfo.format_report(snap, indent=""))
+        A("")
 
     fp_enter = _pairs(rec, 0)
     rm_ok = _pairs(rec, 1)
@@ -275,6 +342,14 @@ def _write_report(rec, quiet: bool = False) -> int:
         A("  " + _pad(title, 22) + _pad(str(cnt), 6)
           + (str(ps) if ps else "—（一次都没有：这个键不发键盘事件）"))
 
+    # ── 结论 4：按键落点（HID 集合原始报告）──
+    # 结论 3 只看得到"变成了键盘事件"的按键。落在厂商自定义页 / 鼠标集合上的
+    # 按键，在结论 3 里一律表现为"一次都没有"，看不出原因。这一段补上另一半。
+    if watcher is not None:
+        A("")
+        for ln in watcher.summary_lines():
+            A(ln)
+
     A("")
     A("【全部记录明细】")
     A("")
@@ -316,7 +391,48 @@ def _selftest() -> int:
     global REPORT
     now = time.time()
 
-    def run(*, ok_scan: int, rm_scan: int) -> tuple[int, str]:
+    # 假造一份 HID 快照 + 一份监听结果。
+    # 为什么要造假：真机上"键盘集合绑定"和"厂商页收到报告"这两种状态
+    # 都**必须真的插上遥控器才会出现**，CI 里永远复现不了。而这两段文字
+    # 恰恰是整份报告最关键的判读 —— 不验就等于第一次运行在用户机器上。
+    fake_snap = {
+        "cols": [
+            {"hwid": "{00001812-…}_Dev_VID&0218d1_PID&9450_REV&011b_f196a263671c&Col01",
+             "instance": "a&1&0&0000", "col": "COL01", "hogp": True,
+             "service": "kbdhid", "desc": "HID Keyboard Device", "config_flags": 0,
+             "guid": "{4d36e96b-…}", "bt_addr": "F1:96:A2:63:67:1C",
+             "is_keyboard": True, "is_mouse": False, "enabled": True},
+            {"hwid": "{00001812-…}_Dev_VID&0218d1_PID&9450_REV&011b_f196a263671c&Col04",
+             "instance": "a&1&0&0003", "col": "COL04", "hogp": True,
+             "service": "", "desc": "HID-compliant vendor-defined device",
+             "config_flags": 0, "guid": "{745a17a0-…}", "bt_addr": "F1:96:A2:63:67:1C",
+             "is_keyboard": False, "is_mouse": False, "enabled": True},
+        ],
+        "live": [
+            {"path": r"\\?\hid#…col01#a&1&0&0000", "vid": 0x18D1, "pid": 0x9450,
+             "usage_page": 0x01, "usage": 0x06, "in_len": 9, "is_google": True},
+            {"path": r"\\?\hid#…col04#a&1&0&0003", "vid": 0x18D1, "pid": 0x9450,
+             "usage_page": 0xFF01, "usage": 0x01, "in_len": 21, "is_google": True},
+        ],
+        "ble": [{"kind": "低功耗 BLE", "key": "…", "friendly": "Chromecast Remote",
+                 "desc": "", "enabled": True}],
+    }
+
+    def _fake_watch(kb_n: int, vendor_n: int):
+        """假监听器：只填计数，不碰真实句柄。"""
+        if hidwatch is None:
+            return None
+        w = hidwatch.ReportWatcher()
+        w.key_events = [(now, "keyboard", "enter", 0x1C)] * kb_n
+        c = hidwatch.HidCollection(r"\\?\hid#…col04#a&1&0&0003",
+                                   0x18D1, 0x9450, 0xFF01, 0x01, 21)
+        c.opened = True
+        c.reports = [(now, bytes([0x01, 0x00, 0x00] + [0] * 18))] * vendor_n
+        w.collections = [c]
+        return w
+
+    def run(*, ok_scan: int, rm_scan: int,
+            kb_n: int = 1, vendor_n: int = 0) -> tuple[int, str]:
         """同一批数据、只换扫描码，分别走「无法区分」和「可以区分」两条分支。"""
         fake = [
             # 阶段 0：物理键盘 Enter
@@ -333,13 +449,18 @@ def _selftest() -> int:
             (now, 5, "up", 0x48, True),
             (now, 6, "media play pause", 0x22, False),
         ]
-        rc = _write_report(fake, quiet=True)
+        rc = _write_report(fake, quiet=True, snap=fake_snap,
+                           watcher=_fake_watch(kb_n, vendor_n))
         return rc, REPORT.read_text(encoding="utf-8")
 
     old, REPORT = REPORT, Path(os.environ.get("TEMP", ".")) / "_rvb_diag_selftest.txt"
     try:
         rc_same, text_same = run(ok_scan=0x1C, rm_scan=0x1C)
         rc_diff, text_diff = run(ok_scan=0x1C, rm_scan=0x2C)
+        # 键盘有事件 → 判读应落到"按键能到达 Windows"
+        _rc_k, text_kbd = run(ok_scan=0x1C, rm_scan=0x1C, kb_n=2, vendor_n=0)
+        # 键盘 0 事件、厂商页有报告 → 判读应落到"Windows 看不见它"
+        _rc_v, text_vendor = run(ok_scan=0x1C, rm_scan=0x1C, kb_n=0, vendor_n=1)
     finally:
         REPORT.unlink(missing_ok=True)
         REPORT = old
@@ -351,6 +472,15 @@ def _selftest() -> int:
         ("一次都没有" in text_same, "空阶段有提示"),
         ("media play pause" in text_same, "非预期键名照样进总表"),
         ("0x48" in text_same and "keypad=True" in text_same, "扫描码/小键盘标志有输出"),
+        # 新增：HID 硬件身份（结论 0）与按键落点（结论 4）
+        ("结论 0" in text_same and "HID Keyboard Device" in text_same,
+         "报告含 HID 硬件身份（结论 0）"),
+        ("厂商自定义" in text_same, "厂商自定义集合被点名（Windows 不处理）"),
+        ("按键落点" in text_same, "报告含按键落点（结论 4）"),
+        ("键盘事件收到了" in text_kbd,
+         "键盘有事件 → 判读指向程序层"),
+        ("只出现在厂商自定义页" in text_vendor,
+         "只有厂商页有报告 → 判读指向「要自己解报告」（关键分支）"),
     ]
     bad = [msg for ok, msg in checks if not ok]
     for ok, msg in checks:

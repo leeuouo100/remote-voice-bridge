@@ -179,9 +179,22 @@ function renderChannels() {
     $(dot).className = 'dot ' + (active(db) ? 'ok' : '');
     txt.textContent = active(db) ? onWord : offWord;
   };
-  setState('#sys-dot',  $('#sys-state'),  lv.sys,    '有声音', '无声音');
+  // ⚠ 参与混音的状态必须**写在卡片上**，不能只靠那个不起眼的勾选框。
+  //   原因：麦克风一直在采集，没参与混音时电平条和波形照样在动 ——
+  //   用户看到就以为"我明明关掉它了还在输出"。把这一路的状态词直接换成
+  //   「未参与混音」/「已静音」、并把整张卡压暗，"它没有送出去"才一目了然。
+  //   2026-09-15 武哥问的正是这句："我明明不让系统麦克风参与说话了，它还是在输出"。
+  const soloAny = mx.sys_solo || mx.remote_solo;
+  const live = (solo, muted, enabled) => !!(solo || (!soloAny && !muted && enabled));
+  const sysLive = live(mx.sys_solo, mx.sys_muted, mx.sys_enabled);
+  const remoteLive = live(mx.remote_solo, mx.remote_muted, mx.remote_enabled);
+
+  setState('#sys-dot',  $('#sys-state'),  sysLive ? lv.sys : DB_FLOOR,
+          '有声音', mx.sys_muted ? '已静音' : '未参与混音');
   setState('#remote-dot', $('#remote-state'), lv.remote, '有声音', '等待语音');
   setState('#mix-dot',  $('#mix-state'),  lv.mix,   '正在输出', '等待录音');
+  document.querySelector('[data-chan="sys"]')?.classList.toggle('is-excluded', !sysLive);
+  document.querySelector('[data-chan="remote"]')?.classList.toggle('is-excluded', !remoteLive);
 
   const devEl = $('#sys-dev');
   if (devEl) devEl.textContent = state.devices.system_mic || '未找到电脑麦克风';
@@ -192,14 +205,12 @@ function renderChannels() {
   // 混合输出卡上那行小结：说清"现在到底混进了哪几路"
   const sum = $('#mix-summary');
   if (sum) {
-    const audible = [];
-    const soloAny = mx.sys_solo || mx.remote_solo;
-    const on = (name, solo, muted, enabled) =>
-      (solo || (!soloAny && !muted && enabled)) ? name : null;
-    audible.push(on('电脑麦克风', mx.sys_solo, mx.sys_muted, mx.sys_enabled));
-    audible.push(on('遥控器', mx.remote_solo, mx.remote_muted, mx.remote_enabled));
-    const list = audible.filter(Boolean);
-    sum.textContent = list.length ? `正在混合：${list.join(' + ')}` : '两路都被静音了';
+    const list = [];
+    if (sysLive)    list.push('电脑麦克风');
+    if (remoteLive) list.push('遥控器');
+    sum.textContent = list.length
+      ? `正在混合：${list.join(' + ')}`
+      : '两路都没送出去（被静音或没参与）';
   }
 
   // 静音 / 独奏 / 参与混音

@@ -74,7 +74,11 @@ diag = Analysis(
     pathex=[SPEC_DIR],
     binaries=[],
     datas=[],
-    hiddenimports=['keyboard'],
+    # hidinfo / hidwatch 显式列出来：它们在 diag_remote 里是**包在
+    # try/except ImportError 里** import 的（为了打包漏模块时老功能还能用）。
+    # PyInstaller 对 try/except 里的 import 只给警告、有时会漏收，
+    # 漏了的表现就是"报告里没有 HID 那两段" —— 正好把最关键的结论弄丢。
+    hiddenimports=['keyboard', 'hidinfo', 'hidwatch'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

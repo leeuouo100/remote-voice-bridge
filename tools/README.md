@@ -31,6 +31,9 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `smoke_console.py` | 离屏把控制台真的建出来跑几轮刷新 | 控件名写错、变量漏定义，在 CI 阶段就被拦下，而不是等用户点开才炸 |
 | `check_ble_callback_thread.py` | 在没有 asyncio 事件循环的 `Dummy-XXXX` 线程里跑完整语音链路 | v1.0.3 的真机事故：BLE 回调线程里 `get_event_loop()` 直接抛异常，`MIC_OPEN` 一次都没发出去，日志还假报成功。纯标准库、不需要真机，所以放进 CI 当回归闸 |
 | `check_packaging.py` | `remote-voice-bridge.spec` 里有诊断 EXE 入口、`installer.iss` 里名字与它一致并挂进了开始菜单 | v1.0.5 漏了这一步：诊断工具写好了、版也发了，却没打进 `Setup.exe` —— 安装版用户机器上没有 Python，仓库里那个 `.bat` 对他们等于不存在 |
+| `check_levels.py` | 三路电平/波形是否"有消费者、也有生产者" | v1.0.7 真机：「遥控器麦克风」波形在动、状态却永远卡在「等待语音」—— 根因是**没有任何产品代码喂** `state.remote_level_db`（只有演示脚本喂过） |
+| `check_mix_persist.py` | 音频页的开关**落盘**了没有 | 「界面上关了、后端还在用」：`/api/mix` 只改内存不写 `config.json`，设置页一动就被悄悄回滚。沙箱 APPDATA，不碰真配置 |
+| `check_hidinfo.py` | 遥控器的 HID 判定链：厂商自定义页（`0xFF00+`）Windows 不处理、键盘页会被处理、设备路径与 `cbSize` 偏移无关 | v1.0.8 查到：遥控器暴露**两个厂商自定义集合**（`0xFF01`/`0xFF80`，各 21 字节输入报告），Windows 对它们不做任何事。按键若发在那里，改映射表**永远没用** —— 判定改错，报告就会把用户指向错误的修法 |
 | `check_ui.js` | 控制台截图 + 波形动画（需 Playwright，可选） | 前端改挂了不至于没人发现 |
 
 > `check_keymap.py` 会跳过 `config.VIRTUAL_TARGETS` 里的虚拟目标
@@ -45,7 +48,9 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `test_recorder.py` | 改了按键录制逻辑之后 | `python tools\test_recorder.py` |
 | `apply_voice_mode.py` | 想一键配好语音（或退回按住模式） | `python tools\apply_voice_mode.py`（推荐配置）/ `--show`（只看）/ `--hold`（退回按住说话） |
 | `serve_console.py` | 单独起控制台做前端调试 | `python tools\serve_console.py` |
-| `diag_remote.py` | **遥控器/按键出任何问题，先跑它**。让程序把现象测出来，而不是靠人描述 | **安装版**从开始菜单打开**「遥控器诊断」**（就是安装目录里的 `RemoteVoiceBridgeDiag.exe`）；**源码版**双击仓库根目录的 **`diag-remote.bat`**（或 `python tools\diag_remote.py`）。会分 7 段引导你按遥控器和物理键盘，约 90 秒，产出 `%APPDATA%\remote-voice-bridge\remote-diag.txt` |
+| `diag_remote.py` | **遥控器/按键出任何问题，先跑它**。让程序把现象测出来，而不是靠人描述 | **安装版**从开始菜单打开**「遥控器诊断」**（就是安装目录里的 `RemoteVoiceBridgeDiag.exe`）；**源码版**双击仓库根目录的 **`diag-remote.bat`**（或 `python tools\diag_remote.py`）。会分 7 段引导你按遥控器和物理键盘，约 90 秒，产出 `%APPDATA%\remote-voice-bridge\remote-diag.txt`。报告开头是【结论 0】硬件身份（**不用按键**）、末尾是【结论 4】按键落点（各 HID 集合收到了多少条原始报告） |
+| `diag_remote.py --hid` | 「蓝牙显示连好了，但按键没反应」—— 先跑这个，**2 秒出结果** | `python tools\diag_remote.py --hid`（安装版：`RemoteVoiceBridgeDiag.exe --hid`）。**不用按任何键、也不用先退出桥接程序**。直接报出遥控器的 5 个 HID 集合各自"是什么、Windows 会不会理它"，以及键位映射配置的关键项 |
+| `watch_reports.py` | 想知道**某个键的报告到底落在哪一路**（键盘 / 鼠标 / 厂商自定义页） | `python tools\watch_reports.py`（默认听 40 秒，`--seconds 60` 改时长，`--all` 连非 Google 的集合一起看）。⚠ **跑之前先退出桥接程序**（托盘右键 → 退出），否则它会把遥控器原生按键吞掉、报告显示"一条都没收到"。产出 `%APPDATA%\remote-voice-bridge\remote-hidwatch.txt` |
 
 > `diag_remote.py` 的**真机部分**必须有人按键，没法自动化；但它的「报告生成器」
 > 是纯函数式的，`check_all` 会用假数据把两条分支（能区分设备 / 不能区分）都跑一遍 ——

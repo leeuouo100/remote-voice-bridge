@@ -162,7 +162,14 @@ MAPPING_TARGETS: dict[str, str] = {
     "down":        "方向下  ↓",
     "left":        "方向左  ←",
     "right":       "方向右  →",
-    "enter":       "回车 / 确认  Enter",
+    "enter":       "回车 / 换行 / 确认  Enter",
+    # 「换行」单独列出来，是因为它**不是**一个键，而是随输入框而变的一件事：
+    #   · 多行输入框（评论区、富文本、代码框）：Enter 本身就是换行
+    #   · 微信/QQ 这类"Enter 发送"的聊天框：Shift+Enter（或 Ctrl+Enter）才是换行
+    # 以前表里只有 Enter 一项、还只叫"回车/确认"，用户按"换行"去找根本找不到，
+    # 只能拿 Enter 硬试 —— 试对了是运气，试错了就把没写完的消息发出去。
+    "shift+enter": "换行（Shift+Enter）",
+    "ctrl+enter":  "换行（Ctrl+Enter）",
     "escape":      "返回 / 取消  Esc",
     "backspace":   "退格删除  Backspace",
     "delete":      "删除  Delete",

@@ -306,7 +306,12 @@ def _checklist(cfg: Config, s) -> list[dict]:
     keys = cfg.trigger_keys_windows()
     return [
         {"name": "遥控器连接",
-         "value": ("BLE · HID 已就绪" if s.connected else "未连接（按遥控器任意键唤醒）"),
+         # ⚠ 只说"蓝牙已连接"，**不要**替 HID 按键打包票。
+         #   蓝牙连上 ≠ 遥控器的按键就能变成 Windows 按键 —— 这两件事在
+         #   2026-09-15 的真机上正好是分开的（语音键好使、其他键全没反应）。
+         #   写"BLE · HID 已就绪"会把人往错方向带，所以顺手把排查入口指出来。
+         "value": ("蓝牙已连接（若按键无反应，请跑一次「遥控器诊断」）" if s.connected
+                   else "未连接（按遥控器任意键唤醒）"),
          "ok": bool(s.connected), "mono": False},
         {"name": "音频驱动",
          "value": (f"{cfg.audio_output} 可用" if out_dev_ok else f"未找到 {cfg.audio_output}"),
@@ -601,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/config":
                 return self._json(self._patch_config(body))
             if path == "/api/mix":
-                return self._json({"mix": state.set_mix(**body)})
+                return self._json(self._patch_mix(body))
             if path == "/api/mapping":
                 return self._json(self._patch_mapping(body))
             if path == "/api/mapping/reset":
@@ -655,6 +660,41 @@ class Handler(BaseHTTPRequestHandler):
             logger.exception("POST %s 失败", path)
             return self._err(str(e), 500)
 
+    # 内存参数名 → config.json 字段名。只有这几项在配置里有家；
+    # 静音/独奏（*_muted / *_solo）是**临时**操作，故意不落盘。
+    _MIX_TO_CFG = (
+        ("sys_enabled",    "system_mic_enabled"),
+        ("remote_enabled", "remote_mic_enabled"),
+        ("sys_gain",       "system_mic_gain"),
+        ("remote_gain",    "gain"),
+    )
+
+    def _patch_mix(self, body: dict) -> dict:
+        """改混音参数 —— 并且把**在 config.json 里有对应项**的那几个落盘。
+
+        ⚠ 为什么必须落盘（v1.0.8 的真机反馈）：
+          音频页的「参与混合 / 增益」原来只改内存里的 state._mix，config.json
+          一个字没动。于是下面任何一件事发生，用户的勾选就被**悄悄回滚**：
+            · 在设置页改了任何一项 —— _patch_config 结尾会拿 cfg 重新灌一遍 set_mix
+            · 重连 / 重启 —— run_bridge 启动时同样用 cfg 灌 set_mix
+          用户看到的就是「我明明不让系统麦克风参与说话了，它还是在输出」。
+          界面上既然给了开关，就得让它留得住。
+        """
+        mix = state.set_mix(**body)
+
+        cfg = Config.load()
+        changed = False
+        for mix_key, cfg_key in self._MIX_TO_CFG:
+            if mix_key not in body or not hasattr(cfg, cfg_key):
+                continue
+            new = mix.get(mix_key)
+            if new is not None and getattr(cfg, cfg_key) != new:
+                setattr(cfg, cfg_key, new)
+                changed = True
+        if changed:
+            cfg.save()
+        return {"mix": mix, "saved": changed}
+
     def _patch_config(self, body: dict) -> dict:
         cfg = Config.load()
         allowed = {
@@ -662,14 +702,25 @@ class Handler(BaseHTTPRequestHandler):
             "system_mic_gain": float, "hotkey_mode": str, "suppress_keys": bool,
             "input_method": str, "device": str, "voice_mode": str,
             "mapping_enabled": bool, "swallow_ok_during_voice": bool,
+            # ⚠ 这两个原先漏在白名单外：前端一发过来就被**静默丢掉**，
+            #   界面显示"已关闭"、后端仍按旧配置把这一路混进去 ——
+            #   「我明明不让系统麦克风参与说话了，它还是在输出」有一半出在这里。
+            "system_mic_enabled": bool, "remote_mic_enabled": bool,
         }
+        ignored: list[str] = []
         for k, v in body.items():
             if k not in allowed or not hasattr(cfg, k):
+                ignored.append(k)
                 continue
             try:
                 setattr(cfg, k, allowed[k](v))
             except (TypeError, ValueError):
+                ignored.append(k)
                 continue
+        if ignored:
+            # 静默忽略是不可调试的：前端以为改成功了，后端当没听见。
+            # 留一条日志 + 在返回值里说明，下次"设了没用"能立刻对上号。
+            logger.warning("⚠ /api/config 忽略了这些字段（不在白名单或类型不符）：%s", ignored)
         cfg.save()
         # 增益是"热"参数：面板一改立即生效，不用重连。
         # 注意要同时更新两处 —— state.set_gain 是给诊断/显示用的，
@@ -680,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                       sys_gain=cfg.system_mic_gain,
                       sys_enabled=cfg.system_mic_enabled,
                       remote_enabled=cfg.remote_mic_enabled)
-        return {"ok": True, "config": body}
+        return {"ok": True, "config": body, "ignored": ignored}
 
     def _patch_mapping(self, body: dict) -> dict:
         btn = str(body.get("button") or "")
