@@ -66,8 +66,48 @@ jobs:
       - name: Console smoke test
         run: python tools/smoke_console.py
 
+      # 遥控器的 HID 判定链：厂商自定义页（0xFF00+）Windows 不处理、键盘页会被处理。
+      # 这条判定改错，诊断报告就会把用户指向**错误的修法**（去改映射表，
+      # 而真正该做的是自己解厂商页的报告）。纯静态 + 假数据，runner 上可跑。
+      - name: HID judgement check
+        run: python tools/check_hidinfo.py
+
+      # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
+      # 以前只在本地 check_all 里跑，挪进 CI —— 它是"用户能不能拿到"的唯一守门人。
+      - name: Packaging entry check
+        run: python tools/check_packaging.py
+
       - name: Build with PyInstaller
         run: pyinstaller remote-voice-bridge.spec --noconfirm
+
+      # ── 构建后真验证：这个包**里面**到底有什么 ──────────────────────────
+      # 为什么必须真跑一次：PyInstaller 在 INFO 级别**只记录入口脚本**
+      # （日志里有 `Analyzing …\tray_app.py` / `…\tools\diag_remote.py`），
+      # 普通被 import 的模块在日志里一个字都没有 —— 光看日志分不清
+      # "打进去了"和"漏了"。而漏掉的表现全在**用户侧**：
+      # 诊断报告里少掉【结论 0】，或直接提示"本版本没带上 hidinfo 模块"。
+      # v1.0.5 就栽在这个盲区：诊断工具压根没进安装包，CI 却全绿。
+      # 所以这里把打好的 exe 真的跑起来，用它自己的输出当证据。
+      - name: Verify packaged bundle
+        shell: pwsh
+        run: |
+          $diag = "dist\RemoteVoiceBridge\RemoteVoiceBridgeDiag.exe"
+          $main = "dist\RemoteVoiceBridge\RemoteVoiceBridge.exe"
+          if (-not (Test-Path $diag)) { throw "诊断 EXE 没打出来：$diag" }
+          if (-not (Test-Path $main)) { throw "主程序没打出来：$main" }
+
+          # --hid 不按任何键、也不依赖插着真遥控器，适合 CI。
+          # 退出码 1 表示"本机没查到 HID 集合"，在 runner 上可能发生 ——
+          # 我们要验的是**代码在不在包里**，所以看输出内容，不看退出码。
+          $out = & $diag --hid 2>&1 | Out-String
+          Write-Host $out
+          # 必须显式清零：GitHub Actions 的 pwsh 会在步骤末尾 exit $LASTEXITCODE，
+          # 不清的话上面那个"退出码 1"会把整个构建判失败。
+          $global:LASTEXITCODE = 0
+
+          if ($out -match '本版本没带上') { throw "包里的诊断工具缺少 hidinfo 模块" }
+          if ($out -notmatch '结论 0')     { throw "诊断工具没输出【结论 0】（hidinfo 没跑起来）" }
+          Write-Host '✅ 打包产物已验证：hidinfo 在包里、--hid 能跑'
 
       - name: Build installer with Inno Setup
         shell: pwsh
