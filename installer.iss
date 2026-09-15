@@ -8,13 +8,16 @@
 ;     tag 就是唯一真源 —— 避免"tag 打的是 1.0.3、装出来的还是 1.0.2"这种事故。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.5"
+  #define MyAppVersion "1.0.6"
 #endif
 
 #define MyAppName "Remote Voice Bridge"
 #define MyAppPublisher "remote-voice-bridge"
 #define MyAppURL "https://github.com/leeuouo100/remote-voice-bridge"
 #define MyAppExeName "RemoteVoiceBridge.exe"
+; 诊断工具（spec 里打出来的第二个 exe）。
+; 它必须随包装上：用户机器上没有 Python，仓库里的 diag-remote.bat 跑不起来。
+#define MyDiagExeName "RemoteVoiceBridgeDiag.exe"
 
 [Setup]
 AppId={{A7E3C1D4-5B82-4F60-9E1A-2C8D7B6F4A31}
@@ -54,6 +57,7 @@ Source: "dist\RemoteVoiceBridge\*"; DestDir: "{app}"; Flags: ignoreversion recur
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\遥控器诊断（按键没反应时跑这个）"; Filename: "{app}\{#MyDiagExeName}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 

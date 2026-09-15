@@ -24,9 +24,13 @@ STEPS = [
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
                   "tools/check_ble_callback_thread.py",
-                  "tools/diag_remote.py",
+                  "tools/diag_remote.py", "tools/check_packaging.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
+    # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
+    # v1.0.5 就是漏了这一步 —— 工具写好了、也发了版，但安装版用户拿不到
+    # （机器上没 Python，仓库里的 .bat 跑不起来）。纯静态，几毫秒。
+    ("打包入口一致性", [PY, "tools/check_packaging.py"]),
     ("按键映射表", [PY, "tools/check_keymap.py"]),
     ("控制台冒烟", [PY, "tools/smoke_console.py"]),
     ("录制器逻辑", [PY, "tools/test_recorder.py"]),

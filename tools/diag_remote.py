@@ -16,8 +16,10 @@
 ⚠ 跑之前**先把桥接程序退干净**（托盘右键 → 退出）：
    它还开着的话，它注入的按键也会被本脚本记进去，报告就脏了。
 
-用法： python tools/diag_remote.py
-       python tools/diag_remote.py --selftest   # 不出报告文件，只验报告生成器
+用法： · 安装版：开始菜单 →「遥控器诊断」（等价于安装目录里的
+         RemoteVoiceBridgeDiag.exe）
+       · 源码版： python tools/diag_remote.py ，或双击仓库根目录的 diag-remote.bat
+       · 只验报告生成器、不采集： python tools/diag_remote.py --selftest
 中断： 随时按 Ctrl+C
 """
 
@@ -29,7 +31,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if not getattr(sys, "frozen", False):
+    # 源码环境下要能从仓库根 import config / _utf8。
+    # 打包后（PyInstaller）__file__ 指向包里那个不存在的路径，插入只会添乱，
+    # 而 config / _utf8 已经在包内可直接 import。
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出，先钉住编码）
 
@@ -314,7 +320,23 @@ def _selftest() -> int:
     return 0
 
 
+def _pause_if_frozen() -> None:
+    """打包版双击运行：报告打完窗口会立刻关掉，用户根本来不及看。
+
+    源码环境下不暂停 —— diag-remote.bat 末尾已经有 pause 了，
+    这里再来一次只会让人多按一次回车。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        input("\n按【回车】键关闭本窗口…")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
-    raise SystemExit(main())
+    _rc = main()
+    _pause_if_frozen()
+    raise SystemExit(_rc)
