@@ -117,7 +117,13 @@ _SETTLE = 0.30
 # （比如同时跑着控制台服务和浏览器）很容易撞上，表现成随机的假 FAIL。
 # 而真正的回归（比如组合键顺序被改回 Ctrl 在前）是**每一轮都挂**的，
 # 所以重试不会掩盖真问题，只会滤掉"机器忙"这种噪声。
-_ATTEMPTS = 3
+#
+# 为什么是 6 而不是 3：这个脚本会**真的往系统里注入按键**，读的是系统实时状态，
+# 是整套自检里唯一受机器负载影响的一关。实测同一份代码连跑两次，
+# 一次报 2 项 FAIL、一次全过。多给 3 轮（每轮约 0.5 秒）就能把
+# "机器忙"和"代码坏了"分开；反过来，一个随机的假 FAIL 会让人去改
+# 本来没错的代码，那个代价大得多。
+_ATTEMPTS_HOOK = 6
 
 # 顺序错了就一定挂 —— 光靠 CASES 只能测"结果对不对"，
 # 这条直接盯住 order_press 这个函数本身，改坏了立刻红。
@@ -276,10 +282,15 @@ def main() -> int:
         failure = None
         seen: set[str] = set()
         down: set[str] = set()
-        for attempt in range(_ATTEMPTS):
+        attempt = 0            # 记录用了几轮（下面是 1-based）
+        for attempt in range(1, _ATTEMPTS_HOOK + 1):
             _pump(_SETTLE)
             _hook_seen.clear()
             _raw.clear()
+            # ⚠ 先记下"这一轮开始前就已经按着的键"。
+            #   卡键判定要减掉它们 —— 否则上一轮残留（或用户自己按着的 Ctrl）
+            #   会被算成"我们没释放"，报出一个根本不存在的卡键假 FAIL。
+            pre_case = _pressed()
             keys.hotkey_down(combo)        # ← 走生产路径（含排序 + 校验补发）
             _pump(0.18)
             down = _pressed()
@@ -299,7 +310,8 @@ def main() -> int:
                         miss_state.append(e)
                 elif not has_win and e not in down:
                     miss_state.append(e)               # 不带 Win 时必须两样都成立
-            stuck = sorted(after & set(expect))
+            # 减掉"本轮开始前就按着的键"，只追究这一次注入留下的残留
+            stuck = sorted((after & set(expect)) - pre_case)
 
             if miss_hook:
                 failure = f"{label}：钩子没收到 {miss_hook} 的按下事件（输入法会认不到）"
@@ -309,16 +321,16 @@ def main() -> int:
                 failure = f"{label}：{stuck} 释放后仍处于按下状态（卡键）"
             else:
                 failure = None
-            # 卡键是确定性的，别浪费轮次；其余失败就再试 ——
+            # 卡键是确定性的，别浪费轮次；其余失败继续重试 ——
             # 低级键盘钩子有超时机制，机器一忙就会漏事件，
-            # 而真正的回归（比如顺序被改回去）是每次都挂的。
+            # 而真正的回归（顺序被改回去 / SendInput 静默失效）是每一轮都挂的。
             if failure is None or stuck:
                 break
         if failure:
             fails.append(failure)
         else:
             extra = "  （带 Win：状态位不作判据，见文件头）" if has_win else ""
-            retry = f"  [第{attempt + 1}次才过]" if attempt else ""
+            retry = f"  [第{attempt}次才过]" if attempt > 1 else ""
             print(f"OK   {label:22s} → 钩子{sorted(seen)} 状态{sorted(down & set(expect))}{extra}{retry}")
         if _RAW:
             print(f"       raw: {list(_raw)}")
@@ -335,7 +347,7 @@ def main() -> int:
         # 长得一模一样，但一个是环境噪声、一个是真回归。给一句提示，
         # 免得又有人（包括我们）顺着假 FAIL 去改本来没错的代码。
         if all("钩子没收到" in f for f in fails):
-            print(f"提示：这类失败也可能是**机器忙**造成的（已自动重试 {_ATTEMPTS} 轮仍失败）。"
+            print(f"提示：这类失败也可能是**机器忙**造成的（已自动重试 {_ATTEMPTS_HOOK} 轮仍失败）。"
                   "低级键盘钩子有超时机制，控制台服务 / 浏览器 / 视频渲染占着 CPU 时会漏事件。"
                   "先关掉这些负载再重跑一次；仍然失败才当代码问题查。")
         return 1

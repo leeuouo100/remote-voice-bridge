@@ -67,12 +67,27 @@ Copyright © 2026 Sima Qingfeng）。原项目为本仓库提供了协议与会�
 
 完整历史见 **[CHANGELOG.md](CHANGELOG.md)**。下面是最近一版的要点：
 
-### v1.0.4（当前）
+### v1.0.5（当前）
+
+v1.0.4 修掉了主线故障（断流 / 卡顿 / 静音键），v1.0.5 把剩下的同类小缺陷扫干净，
+并加了一个**遥控器诊断工具**——以后「某个按键没反应」不用靠嘴描述，跑一下就有报告。
+
+- 多虚拟声卡选择**再修一处**（在控制台里换输出设备时同样会选错，v1.0.4 只修了启动时的路径）
+- 配置里按键映射被写成非法值（比如数字）时，现在会在日志里**明确报警**，
+  而不是默默让那个按键没反应
+- 新增 **`diag-remote.bat`**：插着遥控器跑一遍，自动生成 `remote-diag.txt`，
+  逐条说明每个按键有没有真的到达电脑、以及能不能和物理键盘区分开
+- `check_all.py` 增加两项回归闸（BLE 回调线程、诊断报告生成器）；
+  按键注入自检遇到机器忙不再误报失败
+
+#### 遥控器按键行为（v1.0.4 起未变）
 
 | | 遥控器按键 | 行为 | 转发给输入法的键 |
 |---|---|---|---|
 | 🎙️ | **语音键**（麦克风图标） | **按一下就开始，松手也一直听**；再按一下 / 按确认键结束；10 分钟自动收尾 | 左Ctrl+左Win+左Shift（微信输入法「启动语音输入」） |
 | 🔇 | **静音键** | **按住**说话，松手结束（对讲机式） | Ctrl+Win（微信输入法「按住说话」） |
+
+### v1.0.4：修掉「松手就断流 / 转文字逐字卡顿」
 
 - 🔴 **修掉 v1.0.3 的断流 bug**：Windows 蓝牙回调跑在没有事件循环的线程池线程上，
   导致 `MIC_OPEN` / `MIC_CLOSE` **一次都没真正发出去**（日志还假报"已重新开麦"）。
@@ -144,13 +159,13 @@ pyinstaller remote-voice-bridge.spec --noconfirm
 iscc installer.iss            :: 需安装 Inno Setup 6
 ```
 
-产物：`installer\RemoteVoiceBridge-Setup-1.0.4.exe`
+产物：`installer\RemoteVoiceBridge-Setup-1.0.5.exe`
 
 改版本号时记得**两个文件一起改**（`config.py` 的 `APP_VERSION` 和 `installer.iss`
 的 `MyAppVersion`），然后跑一次：
 
 ```bat
-python tools\check_version.py     :: 应输出 OK 1.0.4
+python tools\check_version.py     :: 应输出 OK 1.0.5
 python tools\smoke_console.py     :: 应输出 SMOKE OK
 ```
 
@@ -160,13 +175,13 @@ python tools\smoke_console.py     :: 应输出 SMOKE OK
 `Setup.exe` 挂到 Release：
 
 ```bash
-git tag v1.0.4 && git push origin v1.0.4
+git tag v1.0.5 && git push origin v1.0.5
 ```
 
 构建前会先校验 `tag` 与 `config.py` 的 `APP_VERSION` 是否一致，不一致会直接失败。
 
 > ⚠️ Actions 产出的 Release **默认是 Draft**，要对外可见需手动改：
-> `gh release edit v1.0.4 --draft=false`
+> `gh release edit v1.0.5 --draft=false`
 
 也可在 Actions 页面手动 `Run workflow`。
 

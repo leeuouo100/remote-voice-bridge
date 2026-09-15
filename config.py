@@ -14,7 +14,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
@@ -373,7 +373,19 @@ class Config:
                 # 直接整体覆盖会让这些键变成"未配置"，表现为按键失效。
                 km = dict(DEFAULT_KEYMAP)
                 if isinstance(data.get("keymap"), dict):
-                    km.update({k: v for k, v in data["keymap"].items() if isinstance(v, str)})
+                    # ⚠ 原来这里是 `if isinstance(v, str)` 一句话过滤掉非字符串，
+                    # 被丢掉的条目**一声不响** —— 用户手改 config.json 写错了值
+                    # （或旧版本留下了别的类型），那个按键就永远没反应，
+                    # 而且日志里一个字都没有。这里补一条告警，别让它继续静默。
+                    dropped = [
+                        f"{k}={v!r}" for k, v in data["keymap"].items()
+                        if not isinstance(v, str)
+                    ]
+                    if dropped:
+                        print("[CONFIG] ⚠ keymap 里有非字符串的值，已忽略（该按键会没反应）："
+                              + "、".join(dropped))
+                    km.update({k: v for k, v in data["keymap"].items()
+                               if isinstance(v, str)})
                 defaults.update(data)
                 defaults["keymap"] = km
                 cfg = cls(**defaults)

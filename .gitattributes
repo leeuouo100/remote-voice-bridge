@@ -1,0 +1,3 @@
+# 行尾规范：Windows 批处理必须是 CRLF，否则 cmd.exe 解析不稳定
+*.bat    text eol=crlf
+*.cmd    text eol=crlf

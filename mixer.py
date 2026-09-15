@@ -167,16 +167,27 @@ def find_input_device(name: str) -> int | None:
             except Exception:  # noqa: BLE001
                 return None
     target = name.strip().lower()
-    best = None
+    # 三级匹配：全名相等 → 前缀 → 子串；同一级里取**最短名**。
+    #
+    # ⚠ 别改成"谁先枚举到就用谁"：同一只声卡会在 MME / DirectSound / WASAPI /
+    #   WDM-KS 四套驱动下各出现一次（MME 还会把名字截断到 31 字符），
+    #   枚举顺序由驱动决定、不保证稳定。取最短名天然偏向没被截断、
+    #   后缀修饰最少的那一条，也就是用户在下拉框里看到的那个名字。
+    exact, prefix, contains = [], [], []
     for i, d in enumerate(sd.query_devices()):
         if d.get("max_input_channels", 0) <= 0:
             continue
         dn = (d.get("name") or "").lower()
         if dn == target:
-            return i
-        if target in dn and best is None:
-            best = i
-    return best
+            exact.append((len(dn), i))
+        elif dn.startswith(target):
+            prefix.append((len(dn), i))
+        elif target in dn:
+            contains.append((len(dn), i))
+    for bucket in (exact, prefix, contains):
+        if bucket:
+            return min(bucket)[1]
+    return None
 
 
 # ── 电脑麦克风采集 ────────────────────────────────────────────────────────────

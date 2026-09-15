@@ -353,10 +353,15 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 logger.error(f"{tag} write failed: {e}")
                 return False
 
+        coro = _write()
         try:
-            asyncio.run_coroutine_threadsafe(_write(), _bridge_loop)
+            asyncio.run_coroutine_threadsafe(coro, _bridge_loop)
             return True
         except Exception as e:
+            # 先把没被接管的协程关掉：否则解释器会在 GC 时甩一条
+            # "coroutine was never awaited" RuntimeWarning，
+            # 让真正的错误信息（下面那行 logger.error）被噪声淹没。
+            coro.close()
             logger.error(f"{tag} schedule failed: {e}")
             return False
 
@@ -657,6 +662,37 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 用 mtime 判断是否被控制台/手改过 —— 改了立即生效，不用重启。
     _cfg_cache: dict = {}
     _cfg_mtime: float = -1.0
+    _keymap_warned: set[tuple[str, str]] = set()
+
+    def _warn_bad_keymap(keymap: dict) -> None:
+        """开机/热重载时检查一遍：映射值里的键名是不是真的能发出去。
+
+        为什么要它：`send_key` 遇到解析不出来的键名会**静默跳过** ——
+        用户看到的是「这个按键没反应」，而日志里一个字都没有。
+        手改过 config.json、或从旧版本带过来的配置很容易踩到。
+
+        `check_keymap.py` 只在 CI 里校验**默认表**，管不到用户实际在用的那份；
+        这里补上运行时的那半边。虚拟目标（原生直通 / 语音 / 按住说话）不是组合键，
+        按 VIRTUAL_TARGETS 跳过。
+        """
+        from config import VIRTUAL_TARGETS
+        from keys import combo_bad_parts
+        for btn, target in (keymap or {}).items():
+            t = str(target or "").strip()
+            if not t or t in VIRTUAL_TARGETS:
+                continue
+            bad = combo_bad_parts(t)
+            if not bad:
+                continue
+            # 同一个坏值只吵一次，别在热重载后每按一次键刷一屏
+            sig = (str(btn), t)
+            if sig in _keymap_warned:
+                continue
+            _keymap_warned.add(sig)
+            logger.warning(
+                f"⚠ 按键映射「{btn}」→ {t!r} 里有发不出去的键名 {bad}，"
+                f"这个键按下去不会有任何反应。请到控制台「按键映射」页改掉。"
+            )
 
     def _get_cfg() -> dict:
         nonlocal _cfg_cache, _cfg_mtime
@@ -675,6 +711,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     # 物理键盘与遥控器在钩子层不可区分，所以这个开关是必要的逃生口）
                     "swallow_ok": bool(getattr(new, "swallow_ok_during_voice", True)),
                 }
+                _warn_bad_keymap(_cfg_cache["keymap"])
                 logger.debug(f"config reloaded (mtime={mt})")
             except Exception as e:
                 logger.error(f"config reload failed: {e}")
@@ -684,7 +721,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         nonlocal last_key_activity, last_ble_activity, voice_active, voice_started_at
         if e.event_type == "down":
             last_key_activity = time.time()
-            # 遥控器按键 = 它还活着。也算一次"活动"，避免被 watchdog 误判掉线。
+            # ⚠ 这里**分不出遥控器和物理键盘**（低级钩子看不到来源设备，
+            #    两者都没有 LLKHF_INJECTED 标志），所以注释不能说成"遥控器按键"。
+            #    敲物理键盘同样会刷新它 —— 这是**刻意接受的保守偏差**：
+            #    watchdog 的判断是"ATVV 静默 180 秒 + GATT 读也失败 → 重连"，
+            #    重连一次遥控器要哑 4 秒左右。宁可偶尔漏判一次失联，
+            #    也不要因为"你在敲键盘"就误判掉线。
+            #    （换个角度：遥控器的按键走 HID 通道、不产生 ATVV 通知，
+            #      不把 HID 活动算进来，就会出现"明明在按遥控器却被判失联"。）
             last_ble_activity = time.time()
 
         # ⚠ 丢掉自己的回声。
@@ -758,6 +802,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     #   这就是"不开启拦截遥控器原生按键就会输入失败"的真正原因。
     _kb.hook(_on_key, suppress=bool(cfg.suppress_keys))
     logger.info(f"✅ Keyboard hooks active (suppress={cfg.suppress_keys})")
+
+    # 开机就把配置读一遍：既预热缓存，也顺手把"写了但发不出去"的映射值报出来。
+    # 不这么做的话，第一次按键才发现问题，而"没反应"的用户一般不会去翻日志。
+    _get_cfg()
 
     # ── Health check ──
     async def check_health(force: bool = False) -> bool:

@@ -64,10 +64,12 @@ def _send_tx(loop, cmd: bytes, tag: str) -> bool:
         print(f"    [loop={threading.current_thread().name}] 真正写入 {tag}  {cmd.hex(' ')}")
         return True
 
+    coro = _write()
     try:
-        asyncio.run_coroutine_threadsafe(_write(), loop)
+        asyncio.run_coroutine_threadsafe(coro, loop)
         return True
     except Exception as e:
+        coro.close()        # 与 main.py 一致：别留 "never awaited" 噪声
         print(f"    ❌ {tag} schedule failed: {e}")
         return False
 

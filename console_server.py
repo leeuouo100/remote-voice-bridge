@@ -232,11 +232,22 @@ def _resolve_out_device(cfg: Config, out_list: list[str]) -> str:
     want = (cfg.audio_output or "").strip().lower()
     if not want:
         return ""
-    if any(n.lower() == want for n in out_list):
-        return next(n for n in out_list if n.lower() == want)
-    for n in out_list:                      # 子串命中优先取最短的，避免撞上 16ch 之类的长名
-        if want in n.lower():
-            return n
+    # 三级匹配 + 同级别取最短名。
+    #
+    # ⚠ 原来注释写着"子串命中优先取最短的"，但代码其实是 `return` 第一个命中的
+    #   —— 注释和实现不一致，而设备顺序由驱动枚举决定，不保证谁在前。
+    #   装了 VB-CABLE + CABLE 2 时，`CABLE Input` 会先撞上 `CABLE 2 Input`，
+    #   下拉框显示的和实际用的就不是一只声卡了。
+    #   取最短名则天然偏向"最贴近用户填的那个词"的那个设备。
+    exact = [n for n in out_list if n.lower() == want]
+    if exact:
+        return min(exact, key=len)
+    prefix = [n for n in out_list if n.lower().startswith(want)]
+    if prefix:
+        return min(prefix, key=len)
+    sub = [n for n in out_list if want in n.lower()]
+    if sub:
+        return min(sub, key=len)
     return cfg.audio_output
 
 

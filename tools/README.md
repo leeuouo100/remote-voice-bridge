@@ -15,6 +15,12 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 
 改完代码、发版前跑它。
 
+> **看到 `[.... ] xxx：疑似机器忙，重跑一次…` 是正常的，不用管。**
+> 只有 `check_injection.py` 会真的往系统里注入按键、读系统实时状态，是唯一受
+> 机器负载影响的一关。`check_all` 会先等 2 秒再跑它，失败且原因是
+> 「钩子没收到」时整步重跑一次。**这一条不要"优化"掉** ——
+> 换成固定 sleep 会有假红，去掉重试又会让真回归藏进噪声里。
+
 ## 自动化自检（CI 也跑）
 
 | 脚本 | 检查什么 | 为什么要它 |
@@ -38,6 +44,11 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `test_recorder.py` | 改了按键录制逻辑之后 | `python tools\test_recorder.py` |
 | `apply_voice_mode.py` | 想一键配好语音（或退回按住模式） | `python tools\apply_voice_mode.py`（推荐配置）/ `--show`（只看）/ `--hold`（退回按住说话） |
 | `serve_console.py` | 单独起控制台做前端调试 | `python tools\serve_console.py` |
+| `diag_remote.py` | **遥控器/按键出任何问题，先跑它**。让程序把现象测出来，而不是靠人描述 | 双击仓库根目录的 **`diag-remote.bat`**（或 `python tools\diag_remote.py`）。会分 7 段引导你按遥控器和物理键盘，约 90 秒，产出 `%APPDATA%\remote-voice-bridge\remote-diag.txt` |
+
+> `diag_remote.py` 的**真机部分**必须有人按键，没法自动化；但它的「报告生成器」
+> 是纯函数式的，`check_all` 会用假数据把两条分支（能区分设备 / 不能区分）都跑一遍 ——
+> 否则那段代码第一次运行就是在用户机器上。跑法：`python tools\diag_remote.py --selftest`。
 
 ## 公共小工具
 
