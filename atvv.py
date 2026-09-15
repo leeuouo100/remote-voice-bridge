@@ -165,6 +165,15 @@ class ATVVProtocol:
         if caps.version == (0, 4):
             # Per-frame sync: [seq_hi, seq_lo, ?, pred_hi, pred_lo, step_idx, ...adpcm...]
             if len(data) < 6 or len(data) != caps.frame_size:
+                # 静默丢帧是最难查的一类故障：日志上只有"收到 N 帧"，
+                # 看不出有帧被吞。这里补一行 debug，排查时能一眼定位。
+                #
+                # ⚠ 刻意**不放宽**成 abs(...) <= 1 之类的容差：v0.4 每帧自带
+                #   预测器/步长（data[3:5] / data[5]），长度对不上就是协议对不上，
+                #   硬解只会把噪声当语音喂给输入法。宁可丢帧也不要喂错。
+                logger.debug(
+                    f"v0.4 帧长不符，丢弃：收到 {len(data)} 字节，协商 {caps.frame_size}"
+                )
                 return None
             pred = int.from_bytes(data[3:5], 'big', signed=True)
             self.state.decoder.reset(predictor=pred, step_index=data[5])

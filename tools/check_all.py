@@ -22,11 +22,15 @@ STEPS = [
                   "tools/_utf8.py",
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
+                  "tools/check_ble_callback_thread.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     ("按键映射表", [PY, "tools/check_keymap.py"]),
     ("控制台冒烟", [PY, "tools/smoke_console.py"]),
     ("录制器逻辑", [PY, "tools/test_recorder.py"]),
+    # BLE 回调线程没有事件循环 —— v1.0.3 事故的回归闸。
+    # 纯标准库、不需要真机，所以放 CI 里跑。
+    ("BLE 回调线程", [PY, "tools/check_ble_callback_thread.py"]),
     # 注入自检会真的发按键，无桌面会话里自己会 SKIPPED（不算失败）。
     # 它是唯一能拦住"SendInput 静默失效"和"组合键顺序错"的一关。
     ("按键注入自检", [PY, "tools/check_injection.py"]),

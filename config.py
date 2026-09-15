@@ -14,7 +14,12 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
+
+# 配置**结构**版本号（和 APP_VERSION 是两回事）。
+# 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
+# 旧版写下的 config.json 里没有这个字段 → 视为 0。
+CONFIG_VERSION = 1
 
 
 # ── Device signatures ────────────────────────────────────────────────────────
@@ -292,6 +297,18 @@ class Config:
     #            配合上面的「启动语音输入」，遥控语音键按一下就能长输，松手不断。
     #   "hold" = 按住（「按住说话」PTT：长按说话、松开结束识别）
     hotkey_mode:      str       = "tap"
+    # 语音会话进行中按「确认键」时，要不要把这一下 Enter 吞掉。
+    #
+    # 为什么需要吞：遥控器按语音键 → 输入法进入语音输入；此时按确认键，
+    # 用户要的是「这段说完了」，不想顺手在聊天框里发出一个回车。
+    #
+    # ⚠ 为什么给开关：Windows 的低级键盘钩子**分不出遥控器和物理键盘**
+    #   （两者走同一套 HID 输入管道，都没有 LLKHF_INJECTED 标志），
+    #   所以开着的时候，**物理键盘的 Enter 也会一起被吞**。
+    #   需要一边说话一边敲键盘的人，把这个关掉即可 ——
+    #   关掉后确认键仍会结束语音会话，只是额外多打一个回车。
+    swallow_ok_during_voice: bool = True
+
     # 非空则覆盖 INPUT_METHODS 内置组合。
     # 键名支持：ralt(右Alt) / lalt / alt / ctrl / win / shift / 字母 / f1-f24 / space …
     # 例如 ["ralt"] 或 ["ctrl","win"] 或 ["ralt","space"]
@@ -319,6 +336,10 @@ class Config:
     # 关掉后遥控器按键一律不处理 —— 等于让遥控器恢复成一只普通 HID 遥控器。
     mapping_enabled:    bool  = True
 
+    # 配置结构版本。旧版 config.json 里没有这个字段（= 0），
+    # load() 会据此跑一次性迁移 —— 见 _migrate()。
+    config_version:     int   = CONFIG_VERSION
+
     def trigger_keys_windows(self) -> list[str]:
         """Return the Windows hotkey list for the configured input method."""
         if self.voice_hotkey:
@@ -344,6 +365,9 @@ class Config:
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                # 旧版写下的 config.json 没有这个字段 → 0，据此判断要不要迁移。
+                # ⚠ 必须读**原始 data**，不能用 defaults：defaults 里它已经是当前版本了。
+                saved_version = int(data.get("config_version") or 0)
                 defaults = cls().to_dict()
                 # keymap 单独合并：旧版本写下的 config.json 里没有新增的按键，
                 # 直接整体覆盖会让这些键变成"未配置"，表现为按键失效。
@@ -352,7 +376,13 @@ class Config:
                     km.update({k: v for k, v in data["keymap"].items() if isinstance(v, str)})
                 defaults.update(data)
                 defaults["keymap"] = km
-                return cls(**defaults)
+                cfg = cls(**defaults)
+                if saved_version < CONFIG_VERSION:
+                    # 升级用户的旧配置不会被新默认值覆盖（否则等于偷偷改用户的设置），
+                    # 但**默认值本身变了**的那几项必须搬过去 —— 不然新装的用户有
+                    # 「静音键按住说话」，老用户永远看不到，还以为是坏了。
+                    cfg = _migrate(cfg, saved_version)
+                return cfg
             except Exception as e:
                 print(f"[CONFIG] Load error: {e}")
         return cls()
@@ -363,6 +393,55 @@ class Config:
             json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+
+def _migrate(cfg: "Config", from_version: int) -> "Config":
+    """旧配置一次性迁移。
+
+    为什么需要：配置是「读旧的、补新的」（见 Config.load），**旧文件里已经写死的值
+    不会被新默认值覆盖** —— 这是对的，不能偷偷改用户的设置。但默认值**本身**变了
+    的那几项就麻烦了：新装用户有「静音键 = 按住说话」，升级用户永远看不到，
+    只会觉得「静音键不起作用」（v1.0.4 真实反馈）。
+
+    所以这里只搬**默认值改过**的那几项，且只在用户没动过的时候搬。
+    """
+    changed = []
+
+    if from_version < 1:
+        # v1.0.3 起静音键默认改成了「按住说话」（voice_ptt）。
+        # 旧版默认是「系统静音」（mute），用户若是自己改的就不动。
+        if cfg.keymap.get("mute") == "mute":
+            cfg.keymap["mute"] = "voice_ptt"
+            changed.append("静音键 → 按住说话（voice_ptt）")
+
+        # 旧的语音默认（wechat + hold + 未自定义覆盖键）是 v1.0.2 那套
+        # 「必须一直按住」；v1.0.3 起改成「按一下就开始、松手也一直听」。
+        # 只有**完全没动过**这几项才升级，改过任何一个都尊重用户。
+        untouched_voice = (
+            cfg.input_method == "wechat"
+            and cfg.voice_mode == "hold"
+            and cfg.hotkey_mode == "hold"
+            and not cfg.voice_hotkey
+        )
+        if untouched_voice:
+            cfg.input_method = "wechat_hold_mode"
+            cfg.voice_mode   = "toggle"
+            cfg.hotkey_mode  = "tap"
+            changed.append("语音键 → 按一下开始 / 再按一下结束（松手也在听）")
+
+    cfg.config_version = CONFIG_VERSION
+
+    if changed:
+        print(f"[CONFIG] 已自动升级旧版配置（config_version {from_version} → {CONFIG_VERSION}）：")
+        for c in changed:
+            print(f"         · {c}")
+        print("[CONFIG] 不想要？控制台「按键映射」页或「设置 → 语音」里改回来即可。")
+        try:
+            cfg.save()
+        except Exception as e:                      # noqa: BLE001
+            print(f"[CONFIG] 迁移结果保存失败（不影响本次启动）：{e}")
+
+    return cfg
 
 
 def apply_recommended() -> "Config":

@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 from config import (
     APP_VERSION, CHROMECAST_BUTTONS, CONFIG_DIR, DEFAULT_KEYMAP, INPUT_METHODS,
     MAPPING_TARGETS, NATIVE_TARGET_HINT, VOICE_HOTKEY_PRESETS, Config,
-    hotkey_label, ordered_buttons,
+    apply_recommended, hotkey_label, ordered_buttons,
 )
 import state
 
@@ -457,6 +457,7 @@ def build_state(force_devices: bool = False) -> dict:
             "suppress_keys": cfg.suppress_keys,
             "input_method": cfg.input_method,
             "mapping_enabled": bool(getattr(cfg, "mapping_enabled", True)),
+            "swallow_ok": bool(getattr(cfg, "swallow_ok_during_voice", True)),
         },
         "devices": {
             "system_mic": s.sys_mic_name or "",
@@ -631,7 +632,7 @@ class Handler(BaseHTTPRequestHandler):
             "gain": float, "audio_output": str, "system_mic_device": str,
             "system_mic_gain": float, "hotkey_mode": str, "suppress_keys": bool,
             "input_method": str, "device": str, "voice_mode": str,
-            "mapping_enabled": bool,
+            "mapping_enabled": bool, "swallow_ok_during_voice": bool,
         }
         for k, v in body.items():
             if k not in allowed or not hasattr(cfg, k):

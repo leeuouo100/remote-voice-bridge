@@ -97,9 +97,27 @@ def _downsample(samples: list[int], n: int = 4) -> list[int]:
 
 
 def _find_cable(device_name: str = "CABLE Input"):
+    """按名字找输出设备，返回 sounddevice 的设备序号。
+
+    ⚠ 必须先**精确匹配**再退回子串匹配。
+    装了多只虚拟声卡（VB-CABLE + CABLE 2 + Voicemeeter）时，
+    `CABLE Input` 是 `CABLE 2 Input` 的子串，而 PortAudio 的设备顺序由驱动
+    枚举顺序决定、不保证谁在前 —— 子串优先会挑中 `CABLE 2 Input`，
+    用户那边微信选的却是 `CABLE Output`，于是「一点声音都没有」，
+    而且从日志上完全看不出选错了设备。
+    """
     import sounddevice as sd
-    for i, d in enumerate(sd.query_devices()):
-        if device_name.lower() in d["name"].lower() and d["max_output_channels"] > 0:
+    low = device_name.lower()
+    outs = [(i, d) for i, d in enumerate(sd.query_devices())
+            if d["max_output_channels"] > 0]
+    for i, d in outs:                       # ① 全名相等
+        if d["name"].lower() == low:
+            return i
+    for i, d in outs:                       # ② 前缀（"CABLE Input (VB-Audio Virtual Cable)"）
+        if d["name"].lower().startswith(low):
+            return i
+    for i, d in outs:                       # ③ 兜底子串
+        if low in d["name"].lower():
             return i
     return None
 
@@ -650,8 +668,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             _cfg_mtime = mt
             try:
                 new = Config.load()
-                _cfg_cache = {"keymap": new.keymap,
-                              "mapping_enabled": bool(getattr(new, "mapping_enabled", True))}
+                _cfg_cache = {
+                    "keymap": new.keymap,
+                    "mapping_enabled": bool(getattr(new, "mapping_enabled", True)),
+                    # 语音会话中要不要吞掉确认键的 Enter（见 config 里的长注释：
+                    # 物理键盘与遥控器在钩子层不可区分，所以这个开关是必要的逃生口）
+                    "swallow_ok": bool(getattr(new, "swallow_ok_during_voice", True)),
+                }
                 logger.debug(f"config reloaded (mtime={mt})")
             except Exception as e:
                 logger.error(f"config reload failed: {e}")
@@ -691,13 +714,23 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         # ⚠ 这个判断只能靠程序自己记的 voice_active：输入法分不清用户这一下
         #   是想"确认输入文字"还是"结束这段语音"，它只看到来了一个键。
         #   由程序拍板：语音开着的时候，确认键就专管收尾，不再当 Enter 往外发。
+        #
+        # ⚠⚠ 已知代价：Windows 低级钩子**分不出遥控器和物理键盘**，
+        #    所以"吞掉"会把物理键盘的 Enter 一起吞掉。
+        #    suppress_keys=False 时 return False 本来就是空操作（keyboard 库只在
+        #    suppress=True 时把回调挂进 blocking_hooks），所以这里必须看配置。
+        #    给用户的逃生口：config.json 里 swallow_ok_during_voice=false。
         if voice_active and btn_id == "ok" and e.event_type == "down":
+            swallow = bool(_get_cfg().get("swallow_ok", True))
             voice_hotkey_up()
             voice_active     = False
             voice_started_at = 0.0
             state.update(streaming=False, level=0, last_event="语音结束（确认键）")
-            logger.info("🎙️ 语音会话【结束】（确认键）")
-            return False                     # 吞掉这一下，不让它再当 Enter 发出去
+            logger.info(
+                "🎙️ 语音会话【结束】（确认键）"
+                + ("；这一下不再当 Enter 发出" if swallow else "；Enter 照常放行")
+            )
+            return not swallow               # 吞掉这一下，不让它再当 Enter 发出去
 
         if btn_id and btn_id != "voice":
             cached = _get_cfg()
@@ -715,6 +748,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     # suppress=True 会连物理键盘的 Enter/Esc/方向键一起吞掉（遥控器 HID 事件
     # 与物理键盘不可区分），默认关闭；确需拦截请在 config.json 设 suppress_keys:true
+    #
+    # ⚠ 关键机制（读 keyboard 库源码确认，别凭印象）：
+    #   keyboard.hook(cb, suppress=False) 把 cb 挂到 `handlers`，
+    #   而真正决定"拦不拦"的 direct_callback 只看 `blocking_hooks`：
+    #       if not all(hook(event) for hook in self.blocking_hooks): return False
+    #   也就是说 —— **suppress=False 时，回调里 return False 是空操作**，
+    #   一个键都拦不住。遥控器的原生按键会照旧生效，和我们的注入叠加成"按一下出两个动作"。
+    #   这就是"不开启拦截遥控器原生按键就会输入失败"的真正原因。
     _kb.hook(_on_key, suppress=bool(cfg.suppress_keys))
     logger.info(f"✅ Keyboard hooks active (suppress={cfg.suppress_keys})")
 
@@ -737,6 +778,24 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
         if not force and now - last_health_check < cfg.heartbeat_cooldown:
             return True
+
+        # ⚠ 语音会话进行中**绝不做 GATT 读**。
+        #
+        # 为什么：CTL 特征既承载控制事件（audio_start / audio_stop），又被拿来当
+        # 健康检查用。Windows 的 GATT 栈同一时刻只允许一个 ATT 事务在跑，
+        # 读操作占着通道期间到达的通知会被压后、极端情况下直接丢。
+        # 一旦丢掉 audio_stop，voice_active 就永远回不到 False ——
+        # 下一次按语音键被当成"第二次按下"直接收尾，用户看到的是
+        # 「说着说着自己断了，还得再按一下」。触发条件极日常：
+        # 按过任意键后 3 秒内（key_check_window）就会来一次读。
+        #
+        # 语音期间本来就有音频帧在按 ~50Hz 刷新 last_ble_activity，
+        # 链路活没活一眼就知道，这个读纯属多余。
+        # force=True（watchdog 判定 ATVV 静默超时）时照读不误 —— 那才是真需要确认。
+        if not force and state.get().streaming:
+            last_health_check = now
+            return ble.connection_status == BluetoothConnectionStatus.CONNECTED
+
         last_health_check = now
         try:
             result = await asyncio.wait_for(

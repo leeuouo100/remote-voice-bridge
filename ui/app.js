@@ -381,6 +381,7 @@ function renderSettings() {
   }
   $('#set-hotkey-mode').value = c.hotkey_mode;
   $('#set-suppress').checked  = !!c.suppress_keys;
+  $('#set-swallow-ok').checked = c.swallow_ok !== false;
   $('#set-autostart').checked = !!state.autostart;
 
   $('#set-device').textContent     = state.status.device || '未连接';
@@ -588,6 +589,9 @@ function initEvents() {
     api('/api/config', { suppress_keys: e.target.checked });
     toast('需重新连接生效');
   });
+  // 立刻生效（映射表按 mtime 热重载），不用重连
+  $('#set-swallow-ok').addEventListener('change', e =>
+    api('/api/config', { swallow_ok_during_voice: e.target.checked }));
   $('#set-autostart').addEventListener('change', e => api('/api/autostart', { enabled: e.target.checked }));
 
   $('#btn-reload-dev').addEventListener('click', async () => {

@@ -7,6 +7,150 @@
 
 ---
 
+## v1.0.4：修掉「松手就断流 / 转文字逐字卡顿」——MIC_OPEN 其实从未发出
+
+> 🔴 这是 v1.0.3 的真机事故修复版。**v1.0.3 建议直接跳过，装这个。**
+
+### 症状（真机）
+
+1. 按下语音键能说话，但**一松手**，混音输出立刻变成「等待录音」，再也收不到声音
+2. 即便勉强在跑，**语音转文字一个字一个字往外冒** —— 说了近 40 秒，文字慢慢爬
+3. 静音键的「按住说话」完全没反应
+
+### 根因：Windows 蓝牙回调线程里没有事件循环
+
+Windows 的 BLE 通知回调（ATVV / HID）不是跑在主线程上，而是跑在 COM 的线程池线程上
+——线程名长这样：`Dummy-3240`。这些线程**没有 asyncio 事件循环**。
+
+而 v1.0.3 的 `_send_tx()` 是这么写的：
+
+```python
+asyncio.get_event_loop().create_task(_write())   # ❌ 在 Dummy 线程上直接抛异常
+```
+
+结果：**每一条 `MIC_OPEN` / `MIC_CLOSE` 都在投递阶段就失败**，日志里能看到：
+
+```
+MIC_OPEN schedule failed: There is no current event loop in thread 'Dummy-3240'
+```
+
+但紧接着又打了一句 `🎤 松手后自动重新开麦` —— **这是假成功**（只要命令"构造出来了"
+就算成功，根本没管有没有发出去）。于是：
+
+- 遥控器从来没收到过「我要常开麦」的指令 → 硬件只在你**按住的那一瞬**推流
+- 松手 → `audio_stop` → 遥控器停止推流 → 混音显示「等待录音」
+- 反复的 start/stop 把音频切得七零八落 → 识别端一直在等"这句话说完了吗" → 逐字往外冒
+
+`session.py` 里还有 4 处同样的 `asyncio.get_event_loop()`（开麦/闭麦的延时定时器），
+**一模一样的坑**，一并修掉。
+
+### 修法
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `main.py` 的 `_send_tx()` | `get_event_loop().create_task()` | `asyncio.run_coroutine_threadsafe(coro, _bridge_loop)` 回投主循环 |
+| `main.py` 的 `_on_mic_open/close` | 无脑返回命令 | 发不出去就返回 `None`，不让 `mic_open_sent` 被置位 |
+| `main.py` 的 `audio_stop` 分支 | 假成功日志 | 真没发出去就打 `❌ MIC_OPEN 未能发出` 的 ERROR |
+| `session.py` 的 4 处定时器 | `asyncio.get_event_loop().call_later()` | `threading.Timer(daemon=True)` |
+
+同时在 `run_bridge` 开头存一份主循环引用：
+
+```python
+_bridge_loop = asyncio.get_running_loop()
+```
+
+### 顺带修的
+
+- `on_mic_open_result` 排新定时器前先取消旧的（原来会留一个僵尸定时器）
+- `config.py` 新增 `VIRTUAL_TARGETS` 单一真源 —— `voice_ptt` 是虚拟目标不是键位组合，
+  之前两个自检脚本各写死一份，导致 `check_keymap` 误报 FAIL（会挂 CI）
+- `tools/smoke_console.py` 的默认触发键断言过期（默认已改成 `ctrl+win+shift`），同步更新
+
+### 第二轮：外部代码审查中发现并确认的缺陷
+
+拿到一份逐文件审查报告（8 条）。逐条读源码核实，**6 条成立、2 条站不住**，
+成立的都修了：
+
+#### 🔴 语音会话进行中不再做 GATT 读
+
+CTL 特征既承载 `audio_start` / `audio_stop`，又被当成健康检查的读目标。
+Windows 的 GATT 栈同一时刻只允许一个 ATT 事务，**读占着通道期间到达的通知会被压后甚至丢**。
+一旦丢掉 `audio_stop`，`voice_active` 永远回不到 False → 下一次按语音键被当成
+"第二次按下"直接收尾，用户看到的是「说着说着自己断了」。
+触发条件极日常：按过任意键后 3 秒内就会来一次读（`key_check_window`）。
+
+现在 `check_health()` 在 `streaming=True` 时直接跳过读、只查连接状态。
+语音期间本来就有音频帧按 ~50Hz 刷新 `last_ble_activity`，这个读纯属多余。
+`force=True`（watchdog 判定静默超时）时照读不误。
+
+#### 🔴 确认键吞 Enter 的行为改为可关闭
+
+`_on_key` 里 `return False` 会吞掉「语音会话进行中按下的确认键」。
+但 Windows 低级键盘钩子**分不出遥控器和物理键盘**，所以物理键盘的 Enter 也被一起吞
+—— 会话没结束前键盘回车是死的。
+
+同时核实了 `keyboard` 库的真实机制（读源码，不是猜）：
+`hook(cb, suppress=False)` 把回调挂进 `handlers`，而 `direct_callback` 只检查
+`blocking_hooks` —— **suppress=False 时 `return False` 是空操作，一个键都拦不住**。
+这就是"不开启拦截遥控器原生按键就会输入失败"的真正原因。
+
+因为设备层无法区分，只能给逃生口：新增配置
+`swallow_ok_during_voice`（默认 `true` = 维持原行为），控制台「设置 → 语音」可勾选。
+关掉后确认键仍会结束语音会话，只是额外多打一个回车。
+
+#### 🟠 `_find_cable` 多虚拟声卡时选错设备
+
+原来是"第一个子串匹配"。装了 VB-CABLE + CABLE 2 + Voicemeeter 时，
+`CABLE Input` 是 `CABLE 2 Input` 的子串，而 PortAudio 的设备顺序由驱动枚举决定，
+可能挑中 `CABLE 2 Input` —— 微信那边选的却是 `CABLE Output`，表现为
+「一点声音都没有」，日志上完全看不出选错了设备。
+
+改为：全名相等 → 前缀 → 子串，三级优先。
+
+#### 🟠 `_mute_loop` 异常时 BACKSPACE 可能卡在按下状态
+
+原来 down/up 一起包在 try 里、异常直接 `pass`。若 `send_key_up` 抛错
+（Interception 驱动被拔、权限被收回），异常被吞、循环继续 `send_key_down`；
+用户在此时松手，循环会在"已按下未释放"的状态下退出 ——
+之后每碰一下键盘都在连续删除。
+
+改为：释放失败立刻 `break`，并在 `finally` 里补一次幂等释放。
+
+#### 🟡 `tray_app._bridge_worker()` 丢掉 traceback
+
+只 `print(f"[bridge] {e}")`，现场只剩一行光秃秃的消息，不知道哪一行炸的。
+改为补 `traceback.print_exc()` —— 桥会自动重连，这条记录是事后唯一线索。
+
+#### 🟡 v0.4 帧长不符时静默丢帧
+
+`len(data) != caps.frame_size` 直接 `return None`，日志上看不出有帧被吞。
+补了一行 `logger.debug`。
+
+> ⚠ **刻意没有**采纳报告建议的 `abs(len - frame_size) <= 1` 容差：
+> v0.4 每帧自带预测器/步长（`data[3:5]` / `data[5]`），长度对不上就是协议对不上，
+> 硬解只会把噪声当语音喂给输入法。宁可丢帧也不要喂错。
+
+#### 核实后判定**不成立**的两条
+
+| 报告 | 实际 |
+|---|---|
+| `last_key_activity` 只在下键刷新，长按会误判掉线 | Windows 的按键自动重复本身就会持续产生 `down` 事件，一直刷新。且 watchdog 只多一次读，无实际影响 |
+| `Config.load()` 缺配置迁移提示 | 本版已经加了 `CONFIG_VERSION` + `_migrate()`（见上节）。报告猜的"keymap 用数字 ID"从未存在过 |
+
+### 验证
+
+模拟一个 `Dummy-7777` 线程跑完整链路（能力协商 → 开麦 → 收流 → 闭麦 → 松手后补开麦）：
+
+```
+正常路径：sent == ['open', 'open']            ✅ PASS
+故障路径（主循环已关）：sent == []，
+  mic_open_sent 保持 False → main.py 打 ERROR  ✅ PASS
+```
+
+已固化为 `tools/check_ble_callback_thread.py`，随 `check_all.py` 进 CI。
+
+---
+
 ## v1.0.3：语音键「按一下长输」+ 静音键「按住说话」+ 呆瓜化默认
 
 ### 背景：两种输入法语音方式，全部走输入法**原生**能力

@@ -67,17 +67,24 @@ Copyright © 2026 Sima Qingfeng）。原项目为本仓库提供了协议与会�
 
 完整历史见 **[CHANGELOG.md](CHANGELOG.md)**。下面是最近一版的要点：
 
-### v1.0.3（当前）
+### v1.0.4（当前）
 
 | | 遥控器按键 | 行为 | 转发给输入法的键 |
 |---|---|---|---|
 | 🎙️ | **语音键**（麦克风图标） | **按一下就开始，松手也一直听**；再按一下 / 按确认键结束；10 分钟自动收尾 | 左Ctrl+左Win+左Shift（微信输入法「启动语音输入」） |
 | 🔇 | **静音键** | **按住**说话，松手结束（对讲机式） | Ctrl+Win（微信输入法「按住说话」） |
 
-- 两种输入法原生语音方式**全部适配**（不另造轮子），**语音会话的开始/结束由本程序管**
-- 松手后自动重新开麦，遥控器麦克风持续收音；1.5 秒宽限期防"自动重开被误判成第二次按下"
-- **呆瓜化**：`python tools\apply_voice_mode.py` 一键配好整套，新装默认就是它
-- 修掉按键匹配误伤：`Page Up`→方向上、`Left Windows`→方向左、`Backspace`→Esc
+- 🔴 **修掉 v1.0.3 的断流 bug**：Windows 蓝牙回调跑在没有事件循环的线程池线程上，
+  导致 `MIC_OPEN` / `MIC_CLOSE` **一次都没真正发出去**（日志还假报"已重新开麦"）。
+  表现就是松手后混音显示"等待录音"、转文字一个字一个字往外冒
+- 现在改用线程安全的方式回投给主事件循环，并且**发不出去就报错**，不再假成功
+- 顺带把重开麦的定时器也换成线程安全实现（同一个坑）
+- 语音会话进行中**不再做 GATT 读**（读会占住通道，把 `audio_stop` 通知挤丢，
+  表现为「说着说着自己断了」）
+- 多虚拟声卡时不再选错输出设备（`CABLE Input` 曾可能匹配到 `CABLE 2 Input`）
+- 静音键连按在驱动异常时不再把 BACKSPACE 卡在按下状态
+- 「确认键吞 Enter」改成可关闭：Windows 分不出遥控器和物理键盘，
+  想一边说话一边敲键盘的，去「设置 → 语音」取消勾选
 
 ---
 
@@ -137,13 +144,13 @@ pyinstaller remote-voice-bridge.spec --noconfirm
 iscc installer.iss            :: 需安装 Inno Setup 6
 ```
 
-产物：`installer\RemoteVoiceBridge-Setup-1.0.3.exe`
+产物：`installer\RemoteVoiceBridge-Setup-1.0.4.exe`
 
 改版本号时记得**两个文件一起改**（`config.py` 的 `APP_VERSION` 和 `installer.iss`
 的 `MyAppVersion`），然后跑一次：
 
 ```bat
-python tools\check_version.py     :: 应输出 OK 1.0.3
+python tools\check_version.py     :: 应输出 OK 1.0.4
 python tools\smoke_console.py     :: 应输出 SMOKE OK
 ```
 
@@ -153,13 +160,13 @@ python tools\smoke_console.py     :: 应输出 SMOKE OK
 `Setup.exe` 挂到 Release：
 
 ```bash
-git tag v1.0.3 && git push origin v1.0.3
+git tag v1.0.4 && git push origin v1.0.4
 ```
 
 构建前会先校验 `tag` 与 `config.py` 的 `APP_VERSION` 是否一致，不一致会直接失败。
 
 > ⚠️ Actions 产出的 Release **默认是 Draft**，要对外可见需手动改：
-> `gh release edit v1.0.3 --draft=false`
+> `gh release edit v1.0.4 --draft=false`
 
 也可在 Actions 页面手动 `Run workflow`。
 

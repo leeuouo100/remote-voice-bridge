@@ -679,17 +679,35 @@ _mute_thread: Optional[threading.Thread] = None
 
 
 def _mute_loop():
+    """按住静音键 = 连续退格。
+
+    ⚠ 退出时必须保证 BACKSPACE 处于"已释放"状态。
+    原来的写法把整个 down/up 一起包在 try 里、异常直接 pass：
+    一旦 `send_key_up` 抛错（Interception 驱动被拔、权限被收回等），
+    异常被吞掉、循环继续；下一轮又 send_key_down —— 若此时用户正好松手，
+    循环在"已按下、未释放"的状态下退出，系统层面 BACKSPACE 就一直按着，
+    之后用户每碰一下键盘都在连续删除。属于必须堵掉的脏状态。
+    """
     global _mute_held
-    while _mute_held:
-        if not ensure_ip():
-            break
-        try:
+    try:
+        while _mute_held:
+            if not ensure_ip():
+                break
             ip.send_key_down(0x0E)   # BACKSPACE
             time.sleep(0.02)
+            try:
+                ip.send_key_up(0x0E)
+            except Exception as e:  # noqa: BLE001
+                # 释放失败 → 立刻停手，绝不能带着"按下未释放"继续 down 下一轮
+                logger.error(f"BACKSPACE 释放失败，已停止连按以免键状态卡住：{e}")
+                break
+            time.sleep(0.05)
+    finally:
+        # 无论怎么退出，都把键补一次释放（幂等，重复 release 无害）
+        try:
             ip.send_key_up(0x0E)
         except Exception:
             pass
-        time.sleep(0.05)
 
 
 def handle_mute_hold(down: bool) -> None:

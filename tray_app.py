@@ -225,7 +225,13 @@ def _bridge_worker():
         try:
             asyncio.run(run_bridge())
         except Exception as e:  # noqa: BLE001
+            # ⚠ 必须带 traceback。只打一行 str(e) 的话，现场只有一个
+            # "KeyError: 'x'" 之类的光秃秃消息，完全不知道是哪一行炸的，
+            # 用户发过来的日志也就没法定位。桥断了会自动重连，
+            # 所以这条记录是事后唯一的线索。
+            import traceback
             print(f"[bridge] {e}", flush=True)
+            traceback.print_exc()
         if _stop.is_set():
             break
         time.sleep(3)

@@ -350,6 +350,11 @@
         <div class="tiny-note">遥控器走 HID 键盘通道，Windows 无法把它和物理键盘区分开。开启后，物理键盘的 Enter / Esc / 方向键也会一起被吞掉。不勾选时遥控器原生按键直接生效。</div>
       </div>
 
+      <div class="set-row col">
+        <label class="chk"><input type="checkbox" id="set-swallow-ok"><span>语音进行中，确认键只结束语音（吞掉这一次 Enter）</span></label>
+        <div class="tiny-note">不勾选时确认键仍会结束语音，但会额外打出一个回车。Windows 分不出遥控器和物理键盘，所以勾上后<strong>物理键盘的 Enter 也会一起被吞</strong> —— 想一边说话一边敲键盘就取消勾选。</div>
+      </div>
+
       <div class="set-row">
         <label>开机自动启动</label>
         <label class="chk"><input type="checkbox" id="set-autostart"><span>随系统启动</span></label>

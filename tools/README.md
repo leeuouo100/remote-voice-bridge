@@ -23,6 +23,7 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `check_keymap.py` | 每个映射目标里的键名都真的能解析成扫描码 | 选项能选、按下去没反应，而且全程不报错 —— 这类故障肉眼查不出来 |
 | `check_injection.py` | **真的把组合键按下去**，再用键盘钩子确认系统收到了 | 唯一能拦住「SendInput 静默失效」和「组合键顺序错」的一关 |
 | `smoke_console.py` | 离屏把控制台真的建出来跑几轮刷新 | 控件名写错、变量漏定义，在 CI 阶段就被拦下，而不是等用户点开才炸 |
+| `check_ble_callback_thread.py` | 在没有 asyncio 事件循环的 `Dummy-XXXX` 线程里跑完整语音链路 | v1.0.3 的真机事故：BLE 回调线程里 `get_event_loop()` 直接抛异常，`MIC_OPEN` 一次都没发出去，日志还假报成功。纯标准库、不需要真机，所以放进 CI 当回归闸 |
 | `check_ui.js` | 控制台截图 + 波形动画（需 Playwright，可选） | 前端改挂了不至于没人发现 |
 
 > `check_keymap.py` 会跳过 `config.VIRTUAL_TARGETS` 里的虚拟目标
