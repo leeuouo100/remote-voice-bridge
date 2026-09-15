@@ -287,7 +287,20 @@ RemoteVoiceBridgeDiag.exe              :: 安装版：直接跑就是只读诊�
 ```bat
 %APPDATA%\remote-voice-bridge\bridge.log        :: 为什么连不上（含两个地址的对比）
 %APPDATA%\remote-voice-bridge\pairing-fix.txt   :: 完整体检报告
+%APPDATA%\remote-voice-bridge\pairing-fix.log   :: 修复过程日志
 ```
+
+想判断「**等它重建就行**」还是「**必须重新配对**」：
+
+```bat
+RemoteVoiceBridgeDiag.exe --keys    :: 提权只读，列出链路密钥树
+```
+
+> 链路密钥是**按本地地址**存的，而 `Parameters\Keys` 与 `Properties` 一样是
+> SYSTEM-only ACL（提权也读不到，连 `READ_CONTROL` 都 `rc=5`）。
+> 所以换口之后**密钥很可能没跟过去** —— 那种情况等遥控器醒来是白等，必须重新配对：
+> `--fix-pairing --method purge --yes --take-ownership`。
+> `--keys` 会明确告诉你属于哪一种（"真的空"和"被 ACL 拒"结论相反，它会分开说）。
 
 **根治建议**：这颗蓝牙棒**固定插一个口别换**；机器上还有别的蓝牙（本机的英特尔板载
 就是个幽灵：注册表里有、PnP 里根本不存在）就在设备管理器里禁掉，免得它抢。

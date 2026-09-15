@@ -154,6 +154,7 @@ python pairing.py --fix --method purge  --yes --take-ownership   # 兜底，要�
 | 修完等它重建 | **按一下遥控器任意键**（最多等 60 秒）；超时也没事，遥控器下次一醒会自动重建 |
 | 报「关联节点删不动」 | 加 `--take-ownership`（见上） |
 | 想知道"谁挡着不让删" | `python pairing.py --acl-dump`（提权，只读，列出所有者 + 每条 ACE） |
+| 想知道"等重建就行"还是"必须重配" | `python pairing.py --keys`（提权，只读，列链路密钥树） |
 | 只想看看、不动任何东西 | `python pairing.py`（只读）；`--acl-probe` 只探"节点删不删得动" |
 | 只想验"方案选得对不对" | `python pairing.py --fix --dry-run`（不提权、什么都不改） |
 | 修完还是不行 | 报告在 `%APPDATA%\remote-voice-bridge\pairing-fix.txt`，发出来 |

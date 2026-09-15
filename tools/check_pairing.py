@@ -258,13 +258,26 @@ def main() -> int:
     A("def _keypath" in src,
       "_keypath 把「路径 ← 原因」拆回干净路径（报告要好看，操作要干净）")
 
+    # ── 密钥树：决定"等重建"还是"必须重配"（2026-09-15 真机）───────────────
+    # `Parameters\Keys` 与 `Properties` 同病：提权后连 READ_CONTROL 都 rc=5。
+    # 所以"读不到"是有歧义的 —— 真的空 vs 被 ACL 拒，结论**完全相反**。
+    # 必须把权限探测 + ACE 一起打出来，别让调用方去猜。
+    keys_src = src.split('has("--keys")')[1].split('has("--acl-probe")')[0] \
+        if 'has("--keys")' in src else ""
+    A(bool(keys_src), "有 --keys（提权只读，列链路密钥树）")
+    A("dump_acl(" in keys_src,
+      "★ 「读不到密钥树」时必须同时给权限探测 + ACL —— 「空」和「被拒」结论相反")
+    A("purge" in keys_src and "take-ownership" in keys_src,
+      "结论里直接给出「必须重新配对」那条命令（不是让用户自己拼）")
+    A("Keys" in src and "BTHPORT_KEYS" in src, "密钥树路径有常量")
+
     # ── 提权必须把**所有**开关带过去 ─────────────────────────────────────────
     # 2026-09-15 实测：只传 "--acl-probe"，`--take-ownership` 在提权那一刻丢掉，
     # 子进程静悄悄少做一步 —— 而症状和"接管不生效"长得一模一样。
     A('child = [a for a in argv if a != "--dry-run"] + ["--elevated"]' in src,
       "★ 提权时把所有开关原样带给子进程（漏一个就少做一步，症状还一样）")
-    A(src.count('child = [a for a in argv if a != "--dry-run"]') >= 2,
-      "acl-probe 与 acl-dump 两条路都这么传（不是只改了一条）")
+    A(src.count('child = [a for a in argv if a != "--dry-run"]') >= 3,
+      "acl-probe / acl-dump / keys 三条路都这么传（不是只改了一两条）")
 
     # ── 判定文案：准确 > 笼统 ────────────────────────────────────────────────
     diag2 = src.split("def diagnose")[1].split("def STATUS_TEXT")[0]

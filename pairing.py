@@ -62,6 +62,7 @@ Windows 的蓝牙配对记录是**按本地无线电的地址**存的：
     python pairing.py --acl-probe        # 提权后只探"关联节点删不删得动"，不删东西
     python pairing.py --acl-dump         # 提权后把该键的所有者 + 每条 ACE 打出来
                                          #   （rc=5 只知道"被拒"，不知道"被谁拒"）
+    python pairing.py --keys             # 提权后列出链路密钥树 —— 判断"等重建"还是"必须重配"
 
 删不动的时候（ACL 只放 SYSTEM）：
     python pairing.py --fix --method purge --yes --take-ownership
@@ -1719,6 +1720,80 @@ def main(argv: list[str] | None = None) -> int:
                     A(line)
             if not blocked:
                 A("  （整棵树都删得动）")
+        txt = "\n".join(L)
+        print(txt)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            REPORT_TXT.write_text(txt, encoding="utf-8")
+            print(f"\n报告：{REPORT_TXT}")
+        except Exception as e:                  # noqa: BLE001
+            print(f"（报告落盘失败：{e.__class__.__name__}）")
+        return 0
+
+    # 提权只读：把 `Parameters\Keys` 整棵树打出来。
+    # 回答一个决定性的问题：**当前地址下到底有没有这台设备的链路密钥**。
+    # 没有 → 等遥控器醒来也握不上手，只能重新配对（purge）。
+    if has("--keys"):
+        if not is_admin() and not has("--dry-run"):
+            child = [a for a in argv if a != "--dry-run"] + ["--elevated"]
+            rc = elevate_and_wait(child)
+            try:
+                print("\n" + REPORT_TXT.read_text(encoding="utf-8"))
+            except Exception:                   # noqa: BLE001
+                print("（读不到子进程的报告）")
+            return rc
+
+        import winreg
+        L: list[str] = []
+        A = L.append
+        d = diagnose(verify=False)
+        target = d["records"][0]["remote"] if d["records"] else ""
+        top = BTHPORT_KEYS
+        A("=" * 72)
+        A(f" 链路密钥树（{top}）  管理员={is_admin()}  {d['time']}")
+        A("=" * 72)
+        A(f"当前生效的无线电地址：{pretty(d['live_addr'])}")
+        A(f"目标设备（远端）：{pretty(target) or '（没有配对记录）'}")
+        A("")
+        locals_ = _subkeys(top)
+        if not locals_:
+            # "读不到"有歧义：可能是真的空，也可能是被 ACL 拒 ——
+            # 这两者的结论完全相反（空=没配过；被拒=我判断不了）。
+            # 所以把权限探测和 ACE 一起打出来，别让调用方去猜。
+            A("⚠ 读不到任何本地地址子键 —— 下面对这个键做一次权限探测 + ACL 明细：")
+            for line in dump_acl(top):
+                A(line)
+            A("")
+        for loc in locals_:
+            A(f"■ 本地 {pretty(loc)}"
+              + ("   ← 当前地址 ✅" if hex12(loc) == hex12(d["live_addr"]) else "   ← 旧地址"))
+            vals = _values(f"{top}\\{loc}")
+            subs = _subkeys(f"{top}\\{loc}")
+            if vals:
+                for name, v in vals:
+                    hit = "  ★ 就是本设备" if hex12(name) == hex12(target) else ""
+                    A(f"    · 值 {pretty(name) or name} = "
+                      f"{'(二进制 ' + str(len(v)) + ' 字节)' if isinstance(v, bytes) else v}{hit}")
+            for sub in subs:
+                subvals = _values(f"{top}\\{loc}\\{sub}")
+                hit = "  ★ 就是本设备" if hex12(sub) == hex12(target) else ""
+                A(f"    · 子键 {pretty(sub) or sub}{hit}")
+                for name2, v2 in subvals:
+                    A(f"        - {name2} = "
+                      f"{'(二进制 ' + str(len(v2)) + ' 字节)' if isinstance(v2, bytes) else v2}")
+            if not vals and not subs:
+                A("    （空）")
+        A("")
+        k = d.get("keys") or {}
+        if target:
+            if k.get("readable") and k.get("locals"):
+                A(f"结论：当前地址下有本设备的密钥 ✅ —— 遥控器醒来就能握上手，不用重新配对。")
+            elif k.get("readable"):
+                A("结论：★ 当前地址下**没有**本设备的密钥 → 等它重建也没用，")
+                A("      只能重新配对：python pairing.py --fix --method purge --yes --take-ownership")
+            else:
+                A("结论：读不到密钥材料（权限不足），无法判断。")
+        A("（本模式**没有改动任何东西**。）")
         txt = "\n".join(L)
         print(txt)
         try:
