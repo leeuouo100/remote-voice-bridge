@@ -34,18 +34,27 @@ jobs:
 
       # 版本号只在 config.py 里写一次，tag 触发时校验两者一致。
       # 不校验的话会出"tag 是 v1.0.3、装出来还显示 1.0.2"这种需要重新发版才能修的事故。
+      #
+      # ⚠ 校验**只在 tag 触发时**做。`workflow_dispatch` 手动跑的是分支
+      #   （`github.ref_name` 形如 `main`），拿它当版本号比永远不可能相等 ——
+      #   之前没分这个岔，导致工作流虽然声明了 `workflow_dispatch`，
+      #   手动触发却必定在第一步抛异常，等于这个入口是死的。
       - name: Resolve & verify version
         id: ver
         shell: pwsh
         run: |
           $ref = "${{ github.ref_name }}"
-          $tagVer = $ref.TrimStart('v')
           $line = Select-String -Path config.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
           if (-not $line) { throw "config.py 里找不到 APP_VERSION" }
           $appVer = $line.Matches[0].Groups[1].Value
-          Write-Host "tag=$tagVer   config.APP_VERSION=$appVer"
-          if ($tagVer -ne $appVer) {
-            throw "版本号不一致：tag=$tagVer，但 config.py APP_VERSION=$appVer。请先把 config.py 改成 $tagVer 再打 tag。"
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tagVer = $ref.TrimStart('v')
+            Write-Host "tag=$tagVer   config.APP_VERSION=$appVer"
+            if ($tagVer -ne $appVer) {
+              throw "版本号不一致：tag=$tagVer，但 config.py APP_VERSION=$appVer。请先把 config.py 改成 $tagVer 再打 tag。"
+            }
+          } else {
+            Write-Host "非 tag 触发（ref_type=${{ github.ref_type }}，ref=$ref）—— 以 config.py 为准：$appVer"
           }
           "version=$appVer" >> $env:GITHUB_OUTPUT
 
