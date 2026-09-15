@@ -449,7 +449,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 # 遥控器按语音键时只会上报 AUDIO_START(0x04)，从不发 START_SEARCH(0x08)，
                 # 而开麦命令原先只挂在 start_search 分支 → 遥控器永远收不到 MIC_OPEN
                 # → 一帧音频都不推，日志表现就是连续「本次共收到 0 个音频帧」。
-                session.ensure_mic_open()
+                #
+                # ⚠⚠ 补发成功后**必须**顺手记一次 mic_reopen_at。
+                #   遥控器收到 MIC_OPEN 会立刻回一个 audio_start（意思是"我开始推流了"），
+                #   那是我们要来的回响，**不是用户按了第二次**。不挡掉它会一路向下走到
+                #   else 分支，后果是连环的：
+                #     ① 立刻 voice_hotkey_up() → 输入法那边的语音键被松开
+                #     ② voice_active 变 False → 等真松手(audio_stop)时不再补开麦
+                #     ③ 遥控器保持停推流 → 「本次共收到 0 个音频帧」
+                #   用户看到的就是「混音卡在等待录音 / 转文字逐字卡 / 一松手就不再调用输入法」。
+                #   2026-09-15 真机日志正是这个时序：补发 36.944s → 回响 36.995s，
+                #   只隔 51ms，远在 MIC_REOPEN_GRACE(1.5s) 之内 —— 只要这里记了就能挡住。
+                if session.ensure_mic_open():
+                    mic_reopen_at = time.time()
                 # ── 语音会话状态机：**每一次按下 = 一次翻转** ──────────────
                 #   第 1 次按下 → 开始   第 2 次按下 → 结束
                 # 松手（audio_stop）不参与翻转，见下面那个分支的注释。

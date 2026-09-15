@@ -42,6 +42,7 @@ from _utf8 import setup as _setup_utf8  # noqa: E402  （下面是中文输出�
 _setup_utf8()
 
 import ctypes  # noqa: E402
+import subprocess  # noqa: E402
 
 from config import APP_VERSION, CONFIG_DIR  # noqa: E402
 
@@ -72,6 +73,30 @@ STAGES = [
 
 # 每段之间留一点空隙，免得上一段的尾巴掉进下一段
 _GAP = 1.5
+
+
+def _bridge_running() -> str:
+    """桥接程序还在跑吗？返回非空 = 检测到（附证据）。
+
+    ⚠ 这不是"贴心提醒"，是**必须挡住**的一件事，理由见 main() 里的说明。
+    2026-09-15 的真机报告就是这么废掉的：程序没退，遥控器的原生键全被它的
+    拦截钩子吞掉，报告写成「遥控器 OK / 返回 / 音量 / 方向 各 0 次」，
+    看着像遥控器坏了，其实是**一个都没测到**；同时还混进了它自己注入的按键。
+
+    判据用进程名（安装版就是 RemoteVoiceBridge.exe）。
+    源码版跑的是 python.exe，名字区分不出来 —— 那种情况只能靠人看提示。
+    """
+    try:
+        p = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq RemoteVoiceBridge.exe", "/NH"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=0x08000000,      # CREATE_NO_WINDOW：别闪黑框
+        )
+        if "RemoteVoiceBridge.exe" in (p.stdout or ""):
+            return "进程 RemoteVoiceBridge.exe 正在运行"
+    except Exception:                       # noqa: BLE001
+        pass
+    return ""
 
 
 def _pad(s: str, width: int) -> str:
@@ -105,6 +130,23 @@ def main() -> int:
         print("  修复：pip install -r requirements.txt")
         return 1
     _kb = _kb_mod
+
+    # 在跑就先拦下来：带着它测出来的报告一定是错的。
+    running = _bridge_running()
+    if running and "--force" not in sys.argv:
+        print()
+        print("  ⛔ 桥接程序还在运行（%s）。" % running)
+        print()
+        print("     为什么必须先退出它：")
+        print("       · 它的拦截钩子会把遥控器原生按键**吞掉** —— 本脚本一个都收不到，")
+        print("         报告会显示「遥控器 OK / 返回 / 音量 / 方向 各 0 次」，")
+        print("         看着像遥控器坏了，其实是一个都没测到；")
+        print("       · 它自己注入的按键又会被本脚本记进来 → 报告里混进假数据。")
+        print("     两种污染都会让人得出错误结论，所以这里直接停下，不出一份脏报告。")
+        print()
+        print("     做法：托盘图标右键 → 退出，然后重新跑本诊断。")
+        print("     （确实要带着它测、并且接受报告作废：加 --force）")
+        return 2
 
     print("=" * 66)
     print(f" 遥控器真机诊断  ·  remote-voice-bridge v{APP_VERSION}")

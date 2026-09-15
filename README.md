@@ -67,7 +67,26 @@ Copyright © 2026 Sima Qingfeng）。原项目为本仓库提供了协议与会�
 
 完整历史见 **[CHANGELOG.md](CHANGELOG.md)**。下面是最近一版的要点：
 
-### v1.0.6（当前）
+### v1.0.7（当前）
+
+**修掉「按一下语音键立刻被关 + 全程 0 帧」** —— 真机日志定位到的真根因。
+
+- 程序在按下语音键后会补发一次开麦命令，遥控器随即回一个「我开始推流了」
+  的信号。那个回响被误当成了「用户又按了一次」，于是会话立刻结束、
+  输入法的语音被关掉、松手后也不再补开麦 → **一帧音频都没收到**。
+  表现就是混音卡在「等待录音」、转文字逐字卡、一松手就断。
+  现在这个回响会被正确识别并忽略。
+- `voice_mode` 与 `hotkey_mode` 两个开关打架时，启动即警告
+  （**只提醒，不动你的配置**）
+- 诊断工具检测到桥接程序还在运行会**直接拒绝**，不再产出
+  「遥控器按键 0 次」这种看着像硬件坏了的假报告
+
+> 顺带说清一个最容易搞混的点：**遥控器语音键走的是蓝牙数据通道（ATVV），
+> 不经过键盘**；而 OK / 返回 / 方向 / 音量 / 静音键走的是**键盘通道**。
+> 这两类键坏掉的排查方向完全不同：
+> 语音键不灵看程序日志，其他键不灵先看 Windows 有没有把遥控器当键盘。
+
+### v1.0.6
 
 **修一个我自己捅的洞**：v1.0.5 加了遥控器诊断工具，但它只是仓库里的
 一个 `.py` + 一个 `.bat`，**没有打进安装包**。安装版用户机器上一般没有 Python，
@@ -179,13 +198,13 @@ pyinstaller remote-voice-bridge.spec --noconfirm
 iscc installer.iss            :: 需安装 Inno Setup 6
 ```
 
-产物：`installer\RemoteVoiceBridge-Setup-1.0.6.exe`
+产物：`installer\RemoteVoiceBridge-Setup-1.0.7.exe`
 
 改版本号时记得**两个文件一起改**（`config.py` 的 `APP_VERSION` 和 `installer.iss`
 的 `MyAppVersion`），然后跑一次：
 
 ```bat
-python tools\check_version.py     :: 应输出 OK 1.0.6
+python tools\check_version.py     :: 应输出 OK 1.0.7
 python tools\smoke_console.py     :: 应输出 SMOKE OK
 ```
 
@@ -195,13 +214,13 @@ python tools\smoke_console.py     :: 应输出 SMOKE OK
 `Setup.exe` 挂到 Release：
 
 ```bash
-git tag v1.0.6 && git push origin v1.0.6
+git tag v1.0.7 && git push origin v1.0.7
 ```
 
 构建前会先校验 `tag` 与 `config.py` 的 `APP_VERSION` 是否一致，不一致会直接失败。
 
 > ⚠️ Actions 产出的 Release **默认是 Draft**，要对外可见需手动改：
-> `gh release edit v1.0.6 --draft=false`
+> `gh release edit v1.0.7 --draft=false`
 
 也可在 Actions 页面手动 `Run workflow`。
 

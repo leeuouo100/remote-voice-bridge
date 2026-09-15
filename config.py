@@ -14,7 +14,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
@@ -394,6 +394,7 @@ class Config:
                     # 但**默认值本身变了**的那几项必须搬过去 —— 不然新装的用户有
                     # 「静音键按住说话」，老用户永远看不到，还以为是坏了。
                     cfg = _migrate(cfg, saved_version)
+                _warn_mode_mismatch(cfg)
                 return cfg
             except Exception as e:
                 print(f"[CONFIG] Load error: {e}")
@@ -405,6 +406,31 @@ class Config:
             json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+
+def _warn_mode_mismatch(cfg: "Config") -> None:
+    """`voice_mode` 与 `hotkey_mode` 说的是同一件事，却可能互相打架。
+
+    · `hotkey_mode` 决定**注入方式**：tap = 点一下（切换式快捷键）/
+      hold = 按住不放。这个对真机是**真正生效**的那个。
+    · `voice_mode` 决定 session 的开麦状态机 —— 但那条分支只在收到
+      `START_SEARCH` 时才走到，而**真机遥控器从不发 START_SEARCH**
+      （见 `session.ensure_mic_open` 的说明），所以它对真机行为其实没有影响。
+
+    于是两个字段不一致时，用户看到的行为和配置面板上写的对不上。
+    2026-09-15 的真机事故正是这个：配的是微信输入法「启动语音输入」
+    （左Ctrl+左Win+左Shift，切换式），`hotkey_mode` 却停在 "hold"，
+    程序按「按住不放」的方式发它 —— 表现就是「一松手就不再调用输入法」。
+
+    这里只**提醒**，不擅自改用户配置。
+    """
+    if (cfg.voice_mode == "hold") != (cfg.hotkey_mode == "hold"):
+        what = "按住说话" if cfg.hotkey_mode == "hold" else "按一下开始 / 再按一下结束"
+        print("[CONFIG] ⚠ voice_mode 与 hotkey_mode 不一致："
+              f"voice_mode={cfg.voice_mode!r}，hotkey_mode={cfg.hotkey_mode!r}")
+        print(f"[CONFIG]    实际生效的是 hotkey_mode（当前 = {what}）；"
+              "voice_mode 对真机无效（遥控器从不发 START_SEARCH）")
+        print("[CONFIG]    请到控制台「设置 → 语音 → 触发方式」核对一下")
 
 
 def _migrate(cfg: "Config", from_version: int) -> "Config":
