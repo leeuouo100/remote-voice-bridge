@@ -119,6 +119,12 @@ def _status_text(item=None) -> str:
         return f"● 语音中 · {dev}"
     if s.connected:
         return f"● 已连接 · {dev}"
+    # ⚠ 这里以前无条件写「按遥控器任意键唤醒」—— 那句话只对"设备睡着了"成立。
+    #   遇上配对记录失效、无线电被禁用这类硬故障，它就是在骗人：
+    #   2026-09-15 真机事故，武哥照这句话按了几十次遥控器，
+    #   而桥其实每 3 秒崩一次。有具体原因就报具体原因。
+    if s.last_event:
+        return f"○ 未连接 · {s.last_event}"
     return "○ 未连接（按遥控器任意键唤醒）"
 
 
@@ -219,22 +225,38 @@ def build_menu(icon) -> pystray.Menu:
 # ── 桥线程 ────────────────────────────────────────────────────────────────────
 def _bridge_worker():
     import asyncio
+    import logging
     from main import run_bridge
 
+    # ⚠⚠ 这里原来是 print(f"[bridge] {e}") + traceback.print_exc()。
+    #   主 exe 是 console=False（PyInstaller 不分配控制台窗口）——
+    #   print 与 sys.stderr 的流向是空的，等于**把唯一的线索直接扔掉**。
+    #   2026-09-15 真机事故就是栽在这：桥每 3 秒崩一次、桥日志里一行报错都没有、
+    #   Windows 事件日志也查不到（异常是 Python 层的，不是进程崩溃），
+    #   最后只能靠手写探针才把 OSError 挖出来。异常必须走 logger（→ bridge.log）。
+    #   注：main 导入时已 basicConfig 好 FileHandler，这里拿同名 logger 即可。
+    log = logging.getLogger("rvb")
+
+    fails = 0
     while not _stop.is_set():
         try:
-            asyncio.run(run_bridge())
-        except Exception as e:  # noqa: BLE001
-            # ⚠ 必须带 traceback。只打一行 str(e) 的话，现场只有一个
-            # "KeyError: 'x'" 之类的光秃秃消息，完全不知道是哪一行炸的，
-            # 用户发过来的日志也就没法定位。桥断了会自动重连，
-            # 所以这条记录是事后唯一的线索。
-            import traceback
-            print(f"[bridge] {e}", flush=True)
-            traceback.print_exc()
+            ok = asyncio.run(run_bridge())
+            fails = 0 if ok else fails + 1
+        except Exception:  # noqa: BLE001
+            fails += 1
+            log.error("💥 桥线程异常退出（连续第 %d 次）", fails, exc_info=True)
+
         if _stop.is_set():
             break
-        time.sleep(3)
+
+        # 连续失败要退避：原来固定 3 秒，故障时每 3 秒把整段启动横幅刷一遍，
+        # 4 分钟就把日志撑到 47 KB，真正的线索被淹没。
+        delay = 3 if fails <= 2 else (10 if fails <= 5 else 30)
+        if fails and not state.get().last_event:
+            # 不覆盖 run_bridge 写下的具体原因（如"配对记录已失效"），
+            # 那比"启动失败"有用得多。
+            state.update(last_event=f"启动失败，{delay} 秒后重试（第 {fails} 次）")
+        time.sleep(delay)
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────

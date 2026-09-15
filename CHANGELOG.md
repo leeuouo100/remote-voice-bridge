@@ -7,6 +7,66 @@
 
 ---
 
+## v1.0.9：修「程序显示未连接 / Windows 显示已配对」—— 报错被丢进虚空 + 配对记录作废
+
+真机反馈（2026-09-15 上下午各一次）：托盘一直显示
+「○ 未连接（按遥控器任意键唤醒）」，可 Windows 设置里「Chromecast Remote」
+明明写着**已配对、电量 88%**。
+
+### 一、根因一：桥每 3 秒崩一次，而**报错被扔掉了**
+
+`bridge.log` 里 4 分钟刷了 71 轮启动横幅，每轮都在 `🔗 Connecting...` 之后
+戛然而止，**一行报错都没有**；Windows 事件日志也查不到（Python 层异常不是进程崩溃）。
+
+原因是一行代码 + 一个打包选项叠在一起：
+
+| 组件 | 干了什么 | 后果 |
+|---|---|---|
+| `main.py` | `from_id_async()` 抛 `OSError: [WinError -2147024809] 提供的设备 ID 不是有效的 BluetoothLEDevice 对象` | 异常逃出 `run_bridge` |
+| `tray_app._bridge_worker` | 用 `print()` + `traceback.print_exc()` 报 `[bridge] …` | 主 exe 是 `console=False`（不分配控制台窗口）→ **输出流向是空的** |
+
+`print` 在无控制台的 exe 里等于把唯一的线索直接扔掉。
+**现在异常走 `logging`（→ `bridge.log`），带完整 traceback。**
+
+### 二、根因二：配对记录绑在**另一块蓝牙无线电**上
+
+真正连不上的原因（注册表 `BTHPORT\Parameters\Devices\<远端MAC>\ServicesFor<本地适配器MAC>`）：
+
+| 项 | 值 |
+|---|---|
+| 配对记录绑在的本地地址 | `04:7F:0E:90:11:01` |
+| 当前生效的无线电地址 | `04:7F:0E:F2:D2:94`（BARROT USB 蓝牙） |
+
+设备能被枚举到、Windows 设置里也显示「已配对」，但蓝牙栈造不出可用的设备对象 ——
+`from_id_async` 抛 `E_INVALIDARG`，`from_bluetooth_address_async` 返回 `None`。
+**怎么重试都一样**，这不是软件能自己恢复的。
+
+**处置**：设置 → 蓝牙和其他设备 → 删掉「Chromecast Remote」→ 让遥控器进入配对模式
+（长按 Home+返回 约 3 秒）→ 重新添加。
+
+> 换 USB 口 / 换蓝牙模块会让这块 dongle 的**本地地址变化**，旧配对记录随之作废。
+> 「上午在 T420 上装也遇到过」就是同一个问题。
+
+### 三、改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `tray_app._bridge_worker` | 异常改走 `logging`（`exc_info=True`），不再 `print` |
+| `tray_app._status_text` | 有具体原因就报具体原因，不再无条件说「按遥控器任意键唤醒」 |
+| `main._open_ble_device` | 新增：主路径按 ID → 备用路径按远端 MAC → 都失败就把「地址对不上 + 处置」写进日志，并写进 `state` 供托盘/控制台显示 |
+| 重试节奏 | 连续失败退避 3s → 10s → 30s（原来固定 3s，故障时 4 分钟就把日志撑到 47 KB，线索被淹没） |
+| `tools/check_failure_visibility.py` | 新增回归闸（17 项，含 3 个反例） |
+
+### 四、新增自检：故障可见性
+
+`tools/check_failure_visibility.py` 用**静态 + 反例**锁住四条：桥线程异常必须走
+logging、连接失败必须「为什么 + 怎么办」且不只试一条路、托盘必须能说出具体原因、
+`_open_ble_device` 必须真的被 `run_bridge` 调用（写了没接上等于没写）。
+
+反例的逻辑是"把源码改坏，闸必须翻红" —— **一个永远绿的闸比没有闸更危险**。
+
+---
+
 ## v1.0.8：修控制台「遥控器麦克风」永远显示「等待语音」+ 补上「按键没反应」的盲区
 
 真机反馈（2026-09-15）：语音键按一下已经能说话了，但控制台「音频」页里

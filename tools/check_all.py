@@ -28,6 +28,7 @@ STEPS = [
                   "tools/diag_remote.py", "tools/check_packaging.py",
                   "tools/check_levels.py", "tools/check_mix_persist.py",
                   "tools/watch_reports.py", "tools/check_hidinfo.py",
+                  "tools/check_failure_visibility.py",
                   "tools/check_injection.py", "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -58,6 +59,12 @@ STEPS = [
     # 不做任何处理。这条事实直接决定"该修什么"，所以判定表 + 报告判读
     # 分支都用反例锁住。纯静态 + 假数据，CI 里可跑。
     ("HID 判定链", [PY, "tools/check_hidinfo.py"]),
+    # 故障必须"看得见"且"说人话"。
+    # v1.0.9 的真机事故：桥线程用 print 报异常，而主 exe 是 console=False ——
+    # print 的流向是空的，于是桥每 3 秒崩一次、日志一行报错都没有、
+    # 托盘还写着「按遥控器任意键唤醒」，把 OSError: E_INVALIDARG 捂了两小时。
+    # 纯静态 + 反例，不需要真机。
+    ("故障可见性", [PY, "tools/check_failure_visibility.py"]),
     # 注入自检会真的发按键，无桌面会话里自己会 SKIPPED（不算失败）。
     # 它是唯一能拦住"SendInput 静默失效"和"组合键顺序错"的一关。
     #

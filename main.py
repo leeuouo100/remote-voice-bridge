@@ -172,6 +172,93 @@ async def find_remote(device_type: str | None = None, name_hint: str | None = No
     return None, None
 
 
+# ── BLE 连接：把"连不上"的原因说清楚 ──────────────────────────────────────────
+def _fmt_bt_addr(v: int) -> str:
+    """48 位整数地址 → AA:BB:CC:DD:EE:FF。"""
+    return ":".join(f"{(v >> (8 * i)) & 0xFF:02X}" for i in range(5, -1, -1))
+
+
+def _addr_from_ble_id(device_id: str):
+    """从 `BluetoothLE#BluetoothLE<本地MAC>-<远端MAC>` 抠出两个地址。
+
+    返回 (本地适配器地址, 远端地址)，解析不出就是 (None, None)。
+    """
+    m = re.search(r"BluetoothLE([0-9a-f:]{17})-([0-9a-f:]{17})", device_id or "", re.I)
+    if not m:
+        return None, None
+    return int(m.group(1).replace(":", ""), 16), int(m.group(2).replace(":", ""), 16)
+
+
+async def _open_ble_device(dev_info):
+    """拿到一个可用的 BluetoothLEDevice；拿不到就把**原因和处置**写清楚再返回 None。
+
+    为什么不能一句 `await BluetoothLEDevice.from_id_async(...)` 了事：
+    "能枚举到"和"能连"是两件事。配对记录是**按本地蓝牙无线电**存的
+    （注册表 `BTHPORT\\Parameters\\Devices\\<远端MAC>\\ServicesFor<本地适配器MAC>`），
+    所以这块无线电换了、USB 口换了、地址变了之后：AQS 仍然能列出这台设备、
+    Windows 设置里也仍然写着「已配对」，但 from_id_async 会直接抛
+    `OSError: [WinError -2147024809] 提供的设备 ID 不是有效的 BluetoothLEDevice 对象`
+    （E_INVALIDARG），from_bluetooth_address_async 则返回 None。
+
+    2026-09-15 真机事故：桥每 3 秒崩一次 + 日志一片空白（异常被 print 丢掉）
+    + 托盘还写着「按遥控器任意键唤醒」，三件事叠起来把方向带偏了两小时。
+    """
+    from winrt.windows.devices.bluetooth import BluetoothLEDevice, BluetoothAdapter
+
+    # 主路径：按设备 ID
+    err = None
+    try:
+        dev = await BluetoothLEDevice.from_id_async(dev_info.id)
+        if dev is not None:
+            return dev
+    except OSError as e:
+        err = e
+
+    # 备用路径：按远端 MAC（有些机器上缓存 ID 失效，但地址仍然能用）
+    local_addr, remote_addr = _addr_from_ble_id(dev_info.id)
+    if remote_addr is not None:
+        try:
+            logger.warning("⚠️  按设备 ID 连接失败（%s），改用远端地址 %s 重试…",
+                           err, _fmt_bt_addr(remote_addr))
+            dev = await BluetoothLEDevice.from_bluetooth_address_async(remote_addr)
+            if dev is not None:
+                logger.info("✅ 备用方式（按远端地址）连接成功")
+                return dev
+        except OSError as e2:
+            logger.warning("⚠️  按远端地址也失败：%s", e2)
+
+    # 两条路都不通 —— 把"为什么"和"怎么办"一起写进日志
+    now_addr = None
+    try:
+        ad = await BluetoothAdapter.get_default_async()
+        now_addr = getattr(ad, "bluetooth_address", None) if ad is not None else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    name = dev_info.name or "该设备"
+    if local_addr is not None and now_addr and local_addr != now_addr:
+        # 最典型、也最难猜到的一种：配对记录绑在**另一块无线电**（或这块 dongle 的旧地址）上
+        logger.error(
+            "❌ 配对记录与当前蓝牙无线电对不上 —— 这就是连不上的原因。\n"
+            "     配对记录绑在的本地地址 : %s\n"
+            "     当前生效的无线电地址   : %s\n"
+            "   设备能被枚举到、Windows 设置里也显示「已配对」，所以看着一切正常；\n"
+            "   但蓝牙栈造不出可用的设备对象（E_INVALIDARG），怎么重试都一样。\n"
+            "   处置：设置 → 蓝牙和其他设备 → 删掉「%s」→ 让遥控器进入配对模式"
+            "（长按 Home+返回 约 3 秒）→ 重新添加。\n"
+            "   机器上有两块蓝牙的话：把用不上的那块在设备管理器里禁用，免得以后又漂过去。",
+            _fmt_bt_addr(local_addr), _fmt_bt_addr(now_addr), name,
+        )
+        state.update(last_event="配对记录已失效，请删除设备后重新配对")
+    else:
+        logger.error(
+            "❌ 连接失败（%s）—— 设备枚举到了，但蓝牙栈给不出可用的设备对象。\n"
+            "   处置：设置 → 蓝牙和其他设备 → 删除「%s」后重新配对。", err, name,
+        )
+        state.update(last_event="连接失败，建议删除设备后重新配对")
+    return None
+
+
 # ── Audio stream ───────────────────────────────────────────────────────────────
 def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
     """输出流：把「遥控器麦克风」和「电脑麦克风」按各自的增益/静音/独奏相加后写出去。
@@ -288,7 +375,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     from winrt.windows.storage.streams import DataWriter
 
     logger.info("🔗 Connecting...")
-    ble = await BluetoothLEDevice.from_id_async(dev_info.id)
+    ble = await _open_ble_device(dev_info)
+    if ble is None:
+        return False
     if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
         logger.warning("⚠️  Not connected yet — remote may be sleeping. Press any button to wake.")
         for _ in range(10):
@@ -297,6 +386,8 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 break
         if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
             logger.error("❌ Connection failed")
+            # 让托盘/控制台说真话，而不是继续显示「按遥控器任意键唤醒」
+            state.update(last_event="连接超时（遥控器可能没醒）")
             return False
     logger.info(f"✅ Connected  status={ble.connection_status}")
     state.update(connected=True, device=dev_info.name or "", last_event="已连接")
