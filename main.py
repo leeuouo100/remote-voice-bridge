@@ -1048,6 +1048,85 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 不这么做的话，第一次按键才发现问题，而"没反应"的用户一般不会去翻日志。
     _get_cfg()
 
+    # ── 遥控器按键（HID 厂商自定义页）────────────────────────────────────
+    #
+    # ⚠⚠ 这一块是 v1.0.11 修「方向/返回/Home/YouTube…一个都没反应」的关键，
+    #    别再只在键盘钩子里找原因。
+    #
+    # 遥控器（VID 18D1 / PID 9450）暴露 5 路 HID 集合：键盘 / 消费类 / 鼠标 /
+    # 厂商页 0xFF01 / 厂商页 0xFF80。实测它把**所有**按键都发在两个厂商页上，
+    # 而 Windows 只处理前三种 —— 厂商页 Windows 完全不理，既不产生键盘事件
+    # 也不产生媒体键事件。于是：
+    #   · 键盘钩子**永远**收不到（日志里连一行 🔘 都没有，不是"没映射")
+    #   · 改映射表改到天亮也没用 —— 事件根本没进 Windows
+    # 唯一出路就是自己 CreateFile 打开这两路集合、按参考实现
+    # （VincentKingHsu/vRemoter 的 ChromecastRemoteHIDBridge.swift）的格式解码。
+    #
+    # 解码走的是模块 remote_hid.py；解出来的 button_id 直接喂给现有的
+    # resolve_button，映射表 / 控制台 / config.json 全都不用改。
+    #
+    # ⚠ 语音键不在这条路上：它走 ATVV 的 BLE 数据通道（见 on_control）。
+    #   CHROMECAST_BUTTONS 里 voice 的 usage 是字符串 "voice"，
+    #   所以 remote_hid 的 USAGE_TO_BUTTON 天然不含它，两条路不会打架。
+    _hid_buttons = None
+
+    def _on_hid_button(btn_id: str, is_down: bool) -> None:
+        """厂商页解出来的按键 → 复用现有映射表派发（与 _on_key 同一套规则）。"""
+        nonlocal last_key_activity, last_ble_activity, voice_active, voice_started_at
+        now = time.time()
+        # 遥控器还活着的证据：watchdog 是"ATVV 静默 180 秒就重连"，
+        # 而按键走厂商页、不产生 ATVV 通知 —— 不记进来就会出现
+        # "一直在按遥控器却被判失联、给重连了"。
+        last_ble_activity = now
+        if is_down:
+            last_key_activity = now
+
+        cached = _get_cfg()
+        if not cached.get("mapping_enabled", True):
+            return                                  # 映射总开关关掉 → 什么都不发
+
+        # 语音会话中按「确认键」= 收尾。
+        # 这条本来只在 _on_key（键盘钩子）里有，而厂商页的确认键走不到那儿 ——
+        # 不在这里补上，就是"按 OK 关不掉语音"。
+        if is_down and voice_active and btn_id == "ok":
+            voice_hotkey_up()
+            voice_active     = False
+            voice_started_at = 0.0
+            state.update(streaming=False, level=0, last_event="语音结束（确认键）")
+            logger.info("🎙️ 语音会话【结束】（厂商页确认键）")
+            return
+
+        resolve_button(
+            btn_id,
+            event_type="down" if is_down else "up",
+            keymap=cached.get("keymap") or {},
+            on_voice=None,
+        )
+
+    if getattr(cfg, "hid_vendor_keys", True):
+        try:
+            import remote_hid
+            _hid_buttons = remote_hid.RemoteHidButtons(_on_hid_button)
+            n_col = _hid_buttons.start()
+            if n_col:
+                logger.info(f"✅ 遥控器厂商页按键已接管（{n_col} 路集合）→ 按键映射生效")
+            else:
+                # ⚠ 必须报出来。"开不了"和"开了但没按键"在用户眼里都是
+                # "按键没反应"，不写这一行就等于让下一个排查的人重新走一遍。
+                logger.warning(
+                    "⚠ 没找到遥控器的厂商页 HID 集合 —— 除语音键外的按键将不会生效。"
+                    " 常见原因：① 遥控器没连上/没配对；② 插的是别的蓝牙棒、"
+                    "设备 VID 不是 18D1；③ 设备被别的程序独占。"
+                    " 用 RemoteVoiceBridgeDiag.exe --hid 看设备在不在。"
+                )
+                _hid_buttons = None
+        except Exception as e:                      # noqa: BLE001
+            # 这一路挂了不该拖垮语音 —— 它是"读不到"，不是"桥起不来"。
+            logger.exception(f"⚠ 启动厂商页按键读取失败（语音功能不受影响）：{e}")
+            _hid_buttons = None
+    else:
+        logger.info("ℹ️  厂商页按键读取已在设置里关闭（hid_vendor_keys=false）")
+
     # ── Health check ──
     async def check_health(force: bool = False) -> bool:
         nonlocal last_health_check, voice_active, voice_started_at
@@ -1162,6 +1241,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             except Exception: pass
         try: _kb.unhook_all()
         except Exception: pass
+        if _hid_buttons is not None:
+            try: _hid_buttons.stop()
+            except Exception: pass
         try: ble.close()
         except Exception: pass
         logger.info("🧹 Cleanup done")

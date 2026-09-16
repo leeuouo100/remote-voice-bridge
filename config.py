@@ -14,12 +14,15 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
 # 旧版写下的 config.json 里没有这个字段 → 视为 0。
-CONFIG_VERSION = 1
+#
+# 2 = v1.0.11：按键改由厂商页接管 → 方向键不能再是「原样直通」
+#     （那个默认值的含义已经变了），4 个空项也补上默认动作。
+CONFIG_VERSION = 2
 
 
 # ── Device signatures ────────────────────────────────────────────────────────
@@ -149,7 +152,10 @@ CHROMECAST_BUTTONS = {
 # "native" 是 Windows 特有的一个必要选项，见下方注释。
 MAPPING_TARGETS: dict[str, str] = {
     "":            "禁用（不发送任何按键）",
-    "native":      "原样直通（遥控器自己的按键生效）",
+    # ⚠ v1.0.11 起这一项对遥控器按键**等于禁用**（遥控器按键发在厂商页，
+    #   Windows 不处理，原生按键并不会自己生效）。保留它是为了给"程序读到键
+    #   但什么都不发"这个行为留个名分，也让老配置不会被读成非法值。
+    "native":      "原样直通（程序读到但什么都不发）",
     "voice":       "语音输入（ATVV 语音键专用）",
     # 按住说话（PTT）—— 给**非语音键**（默认挂在静音键上）用的第二种语音方式。
     # 与语音键那套「按一下开始 / 再按一下结束」是**两套独立的键、两条独立的通道**：
@@ -207,31 +213,42 @@ MAPPING_TARGETS: dict[str, str] = {
 VIRTUAL_TARGETS = {"", "native", "voice", "voice_ptt"}
 
 # 「原样直通」的说明 —— 界面和文档共用同一份文案，避免两处说法不一致。
+#
+# ⚠ v1.0.11 改写：以前写的是「它自己的按键 Windows 本来就收得到」，
+#   那是**错的**，也是"上下键没反应"却查不出原因的根源 ——
+#   遥控器把按键发在厂商自定义页上，Windows 不处理厂商页，
+#   原生按键根本收不到。所以「原样直通」对遥控器按键实际等于"什么都不做"。
 NATIVE_TARGET_HINT = (
-    "遥控器走的是 HID 键盘通道，它自己的按键 Windows 本来就收得到。\n"
-    "选「原样直通」＝不做任何额外动作，直接让遥控器原生按键生效（不重复、不冲突）。\n"
-    "改成其它动作则会「原生键 + 映射键」一起发出 —— Windows 无法单独拦掉遥控器原生键，\n"
-    "要完全接管请在「设置」页打开「拦截遥控器原生按键」（代价：物理键盘的同名键也会被吞）。"
+    "遥控器的按键发在 HID 厂商自定义页上，Windows 不处理这一页，\n"
+    "所以遥控器自己的按键**并不会**变成 Windows 的按键（v1.0.11 起由本程序读厂商页接管）。\n"
+    "选「原样直通」＝程序读到这个键但什么都不发（等于禁用）。\n"
+    "想让按键生效，请在这里选一个具体动作（如方向上、Esc、Win+D…）。"
 )
 
 
 # Default keymap
 #
-# 方向键默认「原样直通」：遥控器的方向键本来就是标准方向键，再注入一次只会变成双份。
-# 确认/返回/Home/静音/音量沿用各自默认（Home 在原生的"浏览器主页"在桌面上没用，
-# 所以补一个 Win+D；音量/静音是遥控器原生的媒体键）。
+# ⚠⚠ v1.0.11 起方向键**不再是**「原样直通」—— 这是本表最重要的一条变更。
+#   遥控器把**所有**按键都发在两个厂商自定义页（0xFF01 / 0xFF80）上，
+#   而 Windows 根本不处理厂商页（只认键盘页 / 消费类页 / 鼠标页）。
+#   也就是说这些键**不会自己变成 Windows 的方向键**，"原样直通"="什么都不做"。
+#   所以默认值改成真正注入方向键；程序自己读厂商页、自己解、自己发。
+#   （诊断证据：5 路 HID 通道全 0 条；参考实现 vRemoter 同样是自开厂商页。）
+#
+# 剩下的键按遥控器物理布局给一套开箱即用的默认值，**不留空项** ——
+# 「装上就要能用」，不能让用户先去界面上把 4 个键填一遍才发现能按。
 DEFAULT_KEYMAP = {
-    "up":      "native",
-    "down":    "native",
-    "left":    "native",
-    "right":   "native",
+    "up":      "up",
+    "down":    "down",
+    "left":    "left",
+    "right":   "right",
     "ok":      "enter",
     "back":    "escape",
     "home":    "win+d",
-    "youtube": "",
-    "netflix": "",
-    "power":   "",
-    "input":   "",
+    "youtube": "win+s",
+    "netflix": "playpause",
+    "power":   "win+e",
+    "input":   "alt+tab",
     # 静音键默认给「按住说话」用：它是遥控器上唯一一个**按着不别扭**的键，
     # 而语音键已经分给「按一下开始 / 再按一下结束」了。
     # 想要回系统静音，在按键映射界面把它改回「系统静音」即可。
@@ -342,6 +359,16 @@ class Config:
     # 按键映射总开关（对应控制台「按键映射」页右上角的开关）。
     # 关掉后遥控器按键一律不处理 —— 等于让遥控器恢复成一只普通 HID 遥控器。
     mapping_enabled:    bool  = True
+
+    # 读「厂商自定义页」的按键（v1.0.11 起按键映射**全靠这一路**）。
+    #
+    # 为什么需要：遥控器把所有按键都发在两个厂商页（0xFF01 / 0xFF80）上，
+    # Windows **完全不处理厂商页**，键盘钩子永远看不到 —— 关掉这个开关，
+    # 除了走 ATVV 的语音键之外，其它按键一个都不会生效。
+    #
+    # 什么时候关：万一某个键出现了「按一下出两个动作」（遥控器在别的机器上
+    # 走的是标准键盘页、原生键也能用），关掉它退回纯键盘钩子那条路排查。
+    hid_vendor_keys:    bool  = True
 
     # 配置结构版本。旧版 config.json 里没有这个字段（= 0），
     # load() 会据此跑一次性迁移 —— 见 _migrate()。
@@ -473,6 +500,33 @@ def _migrate(cfg: "Config", from_version: int) -> "Config":
             cfg.voice_mode   = "toggle"
             cfg.hotkey_mode  = "tap"
             changed.append("语音键 → 按一下开始 / 再按一下结束（松手也在听）")
+
+    if from_version < 2:
+        # v1.0.11：按键改由**厂商自定义页**接管（Windows 不处理厂商页，
+        # 所以遥控器按键压根不会自己变成 Windows 按键）。
+        #
+        # 这条变更**改了默认值的含义**，不是加个新功能那么简单：
+        #   · 方向键原来是 "native"（原样直通）—— 那时候的前提是"遥控器的方向键
+        #     Windows 本来就收得到"。这个前提是错的（见 NATIVE_TARGET_HINT），
+        #     留着它 = 上下左右永远没反应。必须换成真正注入方向键。
+        #   · youtube/netflix/power/input 原来是 ""（禁用）—— 那是因为当时按键
+        #     走不通、填了也没用。现在能走了，出厂就该有动作，不该让用户自己填。
+        #
+        # 只搬**还停在旧默认值**上的那几项，用户自己改过的一律不动。
+        # ⚠ 已知代价：用户若当初是**故意**把某个键设成禁用/直通，这里会被覆盖
+        #   回默认值 —— 区分不了"没动过"和"故意设成一样的值"。
+        #   比留着一堆没反应的键强，且改回来只要点一下。
+        _OLD_V1_DEFAULTS = {
+            "up": "native", "down": "native", "left": "native", "right": "native",
+            "youtube": "", "netflix": "", "power": "", "input": "",
+        }
+        for btn, old_default in _OLD_V1_DEFAULTS.items():
+            if cfg.keymap.get(btn) == old_default:
+                new_default = DEFAULT_KEYMAP[btn]
+                if new_default != old_default:
+                    cfg.keymap[btn] = new_default
+                    changed.append(f"按键「{CHROMECAST_BUTTONS[btn]['label']}」"
+                                   f" → {MAPPING_TARGETS.get(new_default, new_default)}")
 
     cfg.config_version = CONFIG_VERSION
 

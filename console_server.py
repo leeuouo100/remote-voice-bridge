@@ -492,6 +492,9 @@ def build_state(force_devices: bool = False) -> dict:
             "input_method": cfg.input_method,
             "mapping_enabled": bool(getattr(cfg, "mapping_enabled", True)),
             "swallow_ok": bool(getattr(cfg, "swallow_ok_during_voice", True)),
+            # 厂商页按键读取（v1.0.11 起按键映射全靠这一路）——
+            # 面板上要能看见它是不是开着，否则"按键没反应"又变成猜谜。
+            "hid_vendor_keys": bool(getattr(cfg, "hid_vendor_keys", True)),
         },
         "devices": {
             "system_mic": s.sys_mic_name or "",
@@ -702,6 +705,7 @@ class Handler(BaseHTTPRequestHandler):
             "system_mic_gain": float, "hotkey_mode": str, "suppress_keys": bool,
             "input_method": str, "device": str, "voice_mode": str,
             "mapping_enabled": bool, "swallow_ok_during_voice": bool,
+            "hid_vendor_keys": bool,
             # ⚠ 这两个原先漏在白名单外：前端一发过来就被**静默丢掉**，
             #   界面显示"已关闭"、后端仍按旧配置把这一路混进去 ——
             #   「我明明不让系统麦克风参与说话了，它还是在输出」有一半出在这里。

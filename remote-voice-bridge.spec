@@ -44,6 +44,11 @@ a = Analysis(
         'tkinter',
         'tkinter.scrolledtext',
         'tkinter.ttk',
+        # 厂商页按键解码（v1.0.11 起按键映射全靠它）。
+        # main.py 里是在 run_bridge 内部 `import remote_hid` 的（为了它挂了
+        # 也不拖垮语音），显式列一遍更保险 —— 漏了的表现是「语音能用、
+        # 其它按键一个都不灵」，而且日志里只有一行 warning，极难往这上面想。
+        'remote_hid', 'hidinfo', 'hidwatch',
     ],
     hookspath=[],
     hooksconfig={},
