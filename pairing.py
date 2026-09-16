@@ -1001,8 +1001,15 @@ def fix_purge(d: dict, dry: bool = False, own: bool = False) -> tuple[bool, str]
 
     for x in d["targets"]:
         try:
-            winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE,
-                             f"{BTHPORT_DEVICES}\\{x['remote']}")
+            rec_path = BTHPORT_DEVICES + "\\" + x['remote']
+            if own:
+                ok_o, why_o = take_ownership_tree(rec_path)
+                if not ok_o:
+                    print(f"   ⚠ 接管配对记录键所有权未完全成功：{why_o}")
+            _failed = []
+            _del_tree(winreg.HKEY_LOCAL_MACHINE, rec_path, _failed)
+            if _failed:
+                return False, f"删配对记录失败：{_failed[0]}（可能需要管理员 / 蓝牙服务正在占用）"
             print(f"   🗑  已删除配对记录 {pretty(x['remote'])}")
         except Exception as e:                  # noqa: BLE001
             return False, (f"删配对记录失败：{e.__class__.__name__} {e}"
