@@ -81,6 +81,13 @@ jobs:
       - name: HID judgement check
         run: python tools/check_hidinfo.py
 
+      # 厂商页按键解码（v1.0.11 起按键映射全靠这一路）。
+      # 纯静态 + 假数据，不需要真遥控器：解码表错一位就是「按上键出来的是返回」，
+      # 报告格式（reportID=0x01 / 第 2 字节是用法码 / 0=松手）错了的话，
+      # 现象和"遥控器没连上"一模一样 —— 必须在 CI 里就钉死。
+      - name: Remote HID decode check
+        run: python tools/check_remote_hid.py
+
       # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
       # 以前只在本地 check_all 里跑，挪进 CI —— 它是"用户能不能拿到"的唯一守门人。
       - name: Packaging entry check
