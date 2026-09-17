@@ -34,6 +34,8 @@
   5. main.py 能编译 —— 这条顺带挡住 `global` 在函数里晚于使用而 SyntaxError
      那个坑（第一版就是这么炸的：name '_pending_send_at' is used prior to
      global declaration）。
+  6. **行为级**：真的把状态机跑一遍（假时钟 + 假 tap_key），确认"到点真的会发"，
+     以及零帧/取消/关开关/换键这几条真的按预期走 —— 静态检查证明不了这个。
 """
 
 from __future__ import annotations
@@ -171,6 +173,174 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
     return checks
 
 
+def run_behavior_tests() -> bool | None:
+    """行为级验证：真的把状态机跑一遍，看它到点有没有真的发。
+
+    为什么非要有这一层：静态检查只能证明"代码长成那样"，证明不了"它真的会发"。
+    v1.0.13 就吃过这个亏 —— 帧计数在 audio_start 顶部被清零，静态看完全正常，
+    实际却**永远不会发送**。凡是"到某个时刻做某件事"的逻辑，都必须真跑一次。
+
+    做法：
+      · 把 APPDATA 指到临时目录 —— main.py 在 import 时就会按 CONFIG_DIR 建
+        FileHandler **追加写** bridge.log，不引开就会污染用户真实日志；
+      · 把 main.tap_key 换成记录器（绝不真的注入按键，不然会往用户正在用的
+        窗口里打字）；
+      · 把 main.time 换成一个假时钟（直接改全局 time 模块会波及全世界，
+        只替换 main 命名空间里的那个引用）。
+
+    返回 None 表示环境不支持（import 不起来）→ 按 SKIPPED 处理，不算失败。
+    """
+    import os as _os
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="rvb_sendchk_")
+    saved_appdata = _os.environ.get("APPDATA")
+    _os.environ["APPDATA"] = tmp
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.modules.pop("main", None)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        import main  # noqa: PLC0415
+    except Exception as e:                                  # noqa: BLE001
+        print(f"  ⚠ SKIPPED（import main 失败：{type(e).__name__}: {e}）")
+        if saved_appdata is None:
+            _os.environ.pop("APPDATA", None)
+        else:
+            _os.environ["APPDATA"] = saved_appdata
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+
+    ok = True
+    calls: list[str] = []
+
+    # ⚠ `_get_cfg` 是 run_bridge 里的**闭包**，模块级拿不到。
+    #   这里直接拿 config.Config() 的真实默认值构造 cached ——
+    #   顺带把"默认值本身能不能用"也验了（默认必须是开、800ms、enter）。
+    import config as _cfgmod
+    _d = _cfgmod.Config()
+
+    def _defaults(**over) -> dict:
+        c = {"send_after_voice": _d.send_after_voice,
+             "send_after_voice_delay_ms": _d.send_after_voice_delay_ms,
+             "send_after_voice_key": _d.send_after_voice_key}
+        c.update(over)
+        return c
+
+    print(f"  · 实测默认值：开={_d.send_after_voice} "
+          f"延迟={_d.send_after_voice_delay_ms}ms 键={_d.send_after_voice_key!r}")
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.t = 10_000.0
+
+        def time(self) -> float:
+            return self.t
+
+    clock = _Clock()
+    real_time, real_tap = main.time, main.tap_key
+    main.time = clock
+    main.tap_key = lambda name: (calls.append(name), True)[1]   # type: ignore[assignment]
+
+    def _case(name: str, setup, expect_sent: bool, expect_key: str = "enter") -> None:
+        nonlocal ok
+        main._pending_send_at = 0.0
+        main._pending_send_frames = 0
+        calls.clear()
+        setup()
+        main.maybe_send_after_voice(_defaults())
+        sent = bool(calls)
+        good = (sent == expect_sent) and (not sent or calls[0] == expect_key)
+        detail = f"发了 {calls}" if sent else "没发"
+        print(f"  {'✅' if good else '❌'} {name} → {detail}")
+        if not good:
+            ok = False
+
+    try:
+        # ① 到点才发：延迟没到不许发（不然会抢在文字落进输入框之前打回车）
+        def _not_yet():
+            main.request_voice_send(120)
+            clock.t += 0.3
+        _case("延迟没到（300ms/800ms）不发", _not_yet, False)
+
+        # ② 到点发一次
+        def _on_time():
+            main.request_voice_send(120)
+            clock.t += 1.0
+        _case("到点后发一次（默认键 enter）", _on_time, True)
+
+        # ③ 发过就不再重复发（状态必须清干净）
+        def _then_again():
+            clock.t += 5.0
+        _case("发过之后不再重复发", _then_again, False)
+
+        # ④ 零帧 = 误触，绝不发（否则会把输入框里原有内容发出去）
+        def _zero():
+            main.request_voice_send(0)
+            clock.t += 1.0
+        _case("零帧（误触）不发", _zero, False)
+
+        # ⑤ 又开始说下一段 → 取消
+        def _cancelled():
+            main.request_voice_send(120)
+            main.cancel_voice_send("又说了一段")
+            clock.t += 1.0
+        _case("被取消后不发", _cancelled, False)
+
+        # ⑥ 开关关掉 → 不发
+        main._pending_send_at = 0.0
+        main.request_voice_send(120)
+        clock.t += 1.0
+        calls.clear()
+        main.maybe_send_after_voice({"send_after_voice": False,
+                                     "send_after_voice_delay_ms": 800,
+                                     "send_after_voice_key": "enter"})
+        good = not calls
+        print(f"  {'✅' if good else '❌'} 开关关掉 → {'没发' if good else '还是发了'}")
+        ok = ok and good
+
+        # ⑦ 换发送键要真的换（不写死 enter）
+        main._pending_send_at = 0.0
+        main._pending_send_frames = 0
+        calls.clear()
+        main.request_voice_send(120)
+        clock.t += 1.0
+        main.maybe_send_after_voice({"send_after_voice": True,
+                                     "send_after_voice_delay_ms": 800,
+                                     "send_after_voice_key": "ctrl+enter"})
+        good = calls == ["ctrl+enter"]
+        print(f"  {'✅' if good else '❌'} 自定义发送键生效（ctrl+enter）→ 发了 {calls}")
+        ok = ok and good
+
+        # ⑧ 配置残缺也不许崩（老 config.json 里没有这几个字段）
+        main._pending_send_at = 0.0
+        main._pending_send_frames = 0
+        calls.clear()
+        main.request_voice_send(5)
+        clock.t += 1.0
+        try:
+            main.maybe_send_after_voice({})
+            crashed = False
+        except Exception as e:                              # noqa: BLE001
+            crashed = True
+            print(f"  ❌ 空配置把自动发送弄崩了：{type(e).__name__}: {e}")
+            ok = False
+        if not crashed:
+            print(f"  ✅ 配置残缺不崩（空白配置 → 用默认值，发了 {calls}）")
+    finally:
+        main.time = real_time
+        main.tap_key = real_tap
+        main._pending_send_at = 0.0
+        main._pending_send_frames = 0
+        _os.environ["APPDATA"] = saved_appdata if saved_appdata is not None else ""
+        if saved_appdata is None:
+            _os.environ.pop("APPDATA", None)
+        sys.modules.pop("main", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
 def main() -> int:
     main_src = open(MAIN, encoding="utf-8").read()
     cfg_src = open(CFG, encoding="utf-8").read()
@@ -184,6 +354,13 @@ def main() -> int:
         print(f"  {'✅' if good else '❌'} {name}")
         if not good:
             ok = False
+
+    # ── 行为级：真的把状态机跑一遍 ───────────────────────────────────
+    print()
+    print("── 行为级（假时钟 + 假 tap_key，绝不真注入按键）──")
+    beh = run_behavior_tests()
+    if beh is False:
+        ok = False
 
     # ── 反例：故意改坏，确认这道闸真的会红 ───────────────────────────
     #    "闸全绿"只有在"它本来会红"的前提下才有意义。

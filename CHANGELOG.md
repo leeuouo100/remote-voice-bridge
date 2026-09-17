@@ -62,7 +62,15 @@
 
 ### 四、闸
 
-`tools/check_send_after_voice.py`（新增，**23 项 + 9 条反例自证**）。
+`tools/check_send_after_voice.py`（新增：**23 项静态 + 8 项行为级 + 9 条反例自证**）。
+
+**行为级那 8 项**是这次补上的，因为它才是真正说明问题的那一层：
+前面那个"永远不触发"的 bug 静态看完全正常。做法是把 `main` 真的 import 进来
+（`APPDATA` 先指到临时目录 —— 否则 import 就会**追加写**用户真实的
+`bridge.log`），换成假时钟 + 假 `tap_key`（绝不真注入，不然会往用户正在用的
+窗口里打字），然后真调 `maybe_send_after_voice` 看它到点有没有真的发：
+延迟没到不发 / 到点发一次 / 发过不重复 / 零帧不发 / 取消后不发 /
+关开关不发 / 换键真的换（`ctrl+enter`）/ 配置残缺不崩。
 
 反例里有一条**一开始没报红**：检查写的是"这一段里出现过 `"send_after_voice"`"，
 而同一行的 `getattr(new, "send_after_voice", True)` 让改坏后的代码照样蒙混过关。
