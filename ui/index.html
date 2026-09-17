@@ -356,16 +356,20 @@
       </div>
 
       <div class="set-row col">
-        <label class="chk"><input type="checkbox" id="set-send-after-voice"><span>说完自动发送（按语音键结束后，自动替你按一下发送键）</span></label>
+        <label class="chk"><input type="checkbox" id="set-send-after-voice"><span>说完自动发送（<strong>默认关，建议保持关</strong>）</span></label>
         <div class="tiny-note">
-          勾上就是完整的 voice coding 闭环：<strong>按语音键开始 → 说完 → 再按一次语音键结束 → 消息自己发出去</strong>，
-          全程不用伸手去够鼠标。<br>
+          <strong>默认：说完 → 文字落进输入框 → 什么时候发由你决定</strong>（改完按键盘回车就行，
+          手本来就在键盘上 —— 原来别扭的是"得去够鼠标点一下"。）<br>
+          <strong>勾上会发生什么：</strong>按语音键结束后，程序等一会儿就<strong>替你按发送键</strong>。
+          也就是说，你说到一半去倒杯水、回来想接着改，话可能<strong>已经被发出去了</strong> ——
+          发到哪、发给谁都不再由你把关。所以除非你确定"每次说完都是想直接发"，否则别勾。<br>
           发送键
           <input type="text" id="set-send-key" class="mini-input" style="width:7em" placeholder="enter">
           延迟
           <input type="number" id="set-send-delay" class="mini-input" style="width:5em" min="50" step="50"> ms<br>
           <span class="tiny-note">延迟是等输入法把识别结果落进输入框——<strong>调太小会在文字进去之前就回车，等于把刚说的话弄丢一次</strong>，别低于 300ms。</span><br>
-          想先看一眼再自己发就取消勾选；结束之后马上又开始说下一段，上一条会自动取消发送。
+          勾上之后也有几道保护：结束马上又开始说下一段 → 上一条自动取消；
+          这一段一帧音频都没收到（误触）→ 不发；挂着忘了关（超时收尾）→ <strong>永不发送</strong>。
         </div>
       </div>
 

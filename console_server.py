@@ -492,9 +492,11 @@ def build_state(force_devices: bool = False) -> dict:
             "input_method": cfg.input_method,
             "mapping_enabled": bool(getattr(cfg, "mapping_enabled", True)),
             "swallow_ok": bool(getattr(cfg, "swallow_ok_during_voice", True)),
-            # 语音结束后自动发送（v1.0.13）：说完 → 按语音键结束 → 自动把消息发出去。
+            # 语音结束后自动发送（v1.0.13）：**默认关** —— 什么时候发由用户决定。
             # 面板上要能看见、也能改，否则"发不出去/乱发"都只能靠猜。
-            "send_after_voice": bool(getattr(cfg, "send_after_voice", True)),
+            # ⚠ 这里的 getattr 兜底也必须是 False：属性缺失时若报 True，
+            #   面板会显示成"已勾上"、而后端实际不发（方向相反，最难查）。
+            "send_after_voice": bool(getattr(cfg, "send_after_voice", False)),
             "send_after_voice_delay_ms": int(
                 getattr(cfg, "send_after_voice_delay_ms", 800) or 800),
             "send_after_voice_key": str(

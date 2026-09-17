@@ -62,9 +62,24 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
     checks: list[tuple[bool, str]] = []
 
     # ── 1. 配置项 ────────────────────────────────────────────────────
+    # 🔴 默认必须是**关**。2026-09-17 武哥否掉了原来的"默认开"，理由是对的：
+    #   说到一半去上厕所、回来想接着改，程序却已经把半截话发进真人对话里了。
+    #   替用户发出一条他还没决定要发的消息是不可逆的；少发一次只是多按一下回车。
     m = re.search(r"send_after_voice:\s*bool\s*=\s*(True|False)", cfg_src)
-    checks.append((bool(m) and m.group(1) == "True",
-                   "config：send_after_voice 默认开（武哥要的就是「说完即发」）"))
+    checks.append((bool(m) and m.group(1) == "False",
+                   "config：send_after_voice 默认**关**"
+                   "（什么时候发由用户决定 —— 程序不许替他发出还没想好的话）"))
+
+    checks.append(("if from_version < 3:" in cfg_src
+                   and "cfg.send_after_voice = False" in cfg_src,
+                   "config：_migrate 把旧配置里被打开的自动发送**归位成关**"
+                   "（跑过未发布开发版的配置也得归位）"))
+    checks.append((bool(re.search(r"^CONFIG_VERSION\s*=\s*3", cfg_src, re.M)),
+                   "config：CONFIG_VERSION 已同步（改默认值必须一起改，"
+                   "否则老配置读不到新默认）"))
+    checks.append((bool(re.search(r"c\.send_after_voice\s*=\s*False", cfg_src)),
+                   "config：「呆瓜配置」也不替用户自动发送"
+                   "（呆瓜化的是「怎么听」，不是「替你决定要不要发」）"))
 
     m = re.search(r"send_after_voice_delay_ms:\s*int\s*=\s*(\d+)", cfg_src)
     delay = int(m.group(1)) if m else -1
@@ -105,6 +120,9 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
                    "main：零音频帧时不发送（误触保护 —— 否则会把输入框里原有内容发出去）"))
     checks.append(("tap_key(key)" in body,
                    "main：用 keys.tap_key 注入（SendInput，且会登记回声防自激）"))
+    checks.append(('cached.get("send_after_voice", False)' in main_src,
+                   "main：读不到配置时的兜底方向是**不发**"
+                   "（兜底写成 True 的话，配置一残缺就会替用户发消息）"))
     checks.append(("send_after_voice_delay_ms" in body and "send_after_voice_key" in body,
                    "main：延迟与按键都从配置读，不写死"))
 
@@ -217,7 +235,7 @@ def run_behavior_tests() -> bool | None:
 
     # ⚠ `_get_cfg` 是 run_bridge 里的**闭包**，模块级拿不到。
     #   这里直接拿 config.Config() 的真实默认值构造 cached ——
-    #   顺带把"默认值本身能不能用"也验了（默认必须是开、800ms、enter）。
+    #   顺带把"默认值本身对不对"也验了（必须是**关**、800ms、enter）。
     import config as _cfgmod
     _d = _cfgmod.Config()
 
@@ -227,6 +245,10 @@ def run_behavior_tests() -> bool | None:
              "send_after_voice_key": _d.send_after_voice_key}
         c.update(over)
         return c
+
+    # 要验"打开开关之后"的行为，就得显式打开 —— 默认已经是关了。
+    def _on(**over) -> dict:
+        return _defaults(send_after_voice=True, **over)
 
     print(f"  · 实测默认值：开={_d.send_after_voice} "
           f"延迟={_d.send_after_voice_delay_ms}ms 键={_d.send_after_voice_key!r}")
@@ -243,13 +265,14 @@ def run_behavior_tests() -> bool | None:
     main.time = clock
     main.tap_key = lambda name: (calls.append(name), True)[1]   # type: ignore[assignment]
 
-    def _case(name: str, setup, expect_sent: bool, expect_key: str = "enter") -> None:
+    def _case(name: str, setup, expect_sent: bool, expect_key: str = "enter",
+              cfg: dict | None = None) -> None:
         nonlocal ok
         main._pending_send_at = 0.0
         main._pending_send_frames = 0
         calls.clear()
         setup()
-        main.maybe_send_after_voice(_defaults())
+        main.maybe_send_after_voice(_on() if cfg is None else cfg)
         sent = bool(calls)
         good = (sent == expect_sent) and (not sent or calls[0] == expect_key)
         detail = f"发了 {calls}" if sent else "没发"
@@ -258,7 +281,16 @@ def run_behavior_tests() -> bool | None:
             ok = False
 
     try:
-        # ① 到点才发：延迟没到不许发（不然会抢在文字落进输入框之前打回车）
+        # ⓪ 🔴 最重要的一条：**默认配置下，哪怕到点了也一个键都不许按**。
+        #    这是武哥 2026-09-17 定的规矩：什么时候发由他决定。
+        #    它必须排在所有用例最前面 —— 默认值一旦回退成 True，先红的就是它。
+        def _default_off():
+            main.request_voice_send(120)
+            clock.t += 10.0
+        _case("【默认】到点了也绝不发（什么时候发由用户决定）", _default_off, False,
+              cfg=_defaults())
+
+        # ① 打开开关后，到点才发：延迟没到不许发（否则会抢在文字落进输入框之前打回车）
         def _not_yet():
             main.request_voice_send(120)
             clock.t += 0.3
@@ -313,7 +345,8 @@ def run_behavior_tests() -> bool | None:
         print(f"  {'✅' if good else '❌'} 自定义发送键生效（ctrl+enter）→ 发了 {calls}")
         ok = ok and good
 
-        # ⑧ 配置残缺也不许崩（老 config.json 里没有这几个字段）
+        # ⑧ 配置残缺也不许崩，而且**兜底方向必须是不发**
+        #    （老 config.json 里没有这几个字段；缺字段就替用户发消息是不可接受的）
         main._pending_send_at = 0.0
         main._pending_send_frames = 0
         calls.clear()
@@ -327,7 +360,10 @@ def run_behavior_tests() -> bool | None:
             print(f"  ❌ 空配置把自动发送弄崩了：{type(e).__name__}: {e}")
             ok = False
         if not crashed:
-            print(f"  ✅ 配置残缺不崩（空白配置 → 用默认值，发了 {calls}）")
+            good = not calls
+            print(f"  {'✅' if good else '❌'} 配置残缺不崩，且兜底是「不发」"
+                  f" → {'没发' if good else f'居然发了 {calls}'}")
+            ok = ok and good
     finally:
         main.time = real_time
         main.tap_key = real_tap
@@ -411,6 +447,24 @@ def main() -> int:
         ("让超时收尾也自动发送（会把 10 分钟环境音发出去）",
          main_src.replace('cancel_voice_send("超时收尾：这段时间录到的内容不适合自动发")',
                           'cancel_voice_send("x")\n            request_voice_send(_audio_frames)'),
+         cfg_src),
+        # —— 2026-09-17 武哥否掉"默认开"之后新增的几条 ——
+        ("把默认值改回「开」（＝又会替用户发出没想好的话）",
+         main_src,
+         cfg_src.replace("send_after_voice: bool = False",
+                         "send_after_voice: bool = True")),
+        ("拿掉配置迁移（跑过开发版的配置会一直开着）",
+         main_src,
+         cfg_src.replace("if from_version < 3:", "if False:")),
+        ("CONFIG_VERSION 不同步",
+         main_src,
+         cfg_src.replace("CONFIG_VERSION = 3", "CONFIG_VERSION = 2")),
+        ("「呆瓜配置」里又替用户打开自动发送",
+         main_src,
+         cfg_src.replace("c.send_after_voice   = False", "c.send_after_voice   = True")),
+        ("把读不到配置时的兜底改成「发」",
+         main_src.replace('cached.get("send_after_voice", False)',
+                          'cached.get("send_after_voice", True)'),
          cfg_src),
     ]
     for name, ms, cs in negatives:

@@ -393,8 +393,11 @@ function renderSettings() {
   $('#set-hotkey-mode').value = c.hotkey_mode;
   $('#set-suppress').checked  = !!c.suppress_keys;
   $('#set-swallow-ok').checked = c.swallow_ok !== false;
-  // v1.0.13「说完自动发送」：默认开 —— 关掉它就得回去点鼠标，见 config.py 的长注释
-  $('#set-send-after-voice').checked = c.send_after_voice !== false;
+  // v1.0.13「说完自动发送」：**默认关**（2026-09-17 武哥定案 —— 什么时候发由他决定，
+  // 程序不许替他发出还没想好的话）。所以回填必须是 === true，见下面那行的注释。
+  // ⚠ 必须是 === true（默认关）：写成 !== false 的话，字段一旦缺失就会显示成"已勾上"，
+  //   与后端"缺字段＝不发"的兜底方向相反，用户会以为开着、实际没开（或反过来）。
+  $('#set-send-after-voice').checked = c.send_after_voice === true;
   $('#set-send-key').value   = c.send_after_voice_key || 'enter';
   $('#set-send-delay').value = c.send_after_voice_delay_ms || 800;
   $('#set-autostart').checked = !!state.autostart;
