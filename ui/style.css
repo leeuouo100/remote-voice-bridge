@@ -188,6 +188,20 @@ main { padding: 18px 22px 40px; max-width: 1180px; margin: 0 auto; }
 .select.grow   { flex: 1; min-width: 0; }
 .select optgroup { background: #16161a; color: var(--text-3); }
 
+/* 行内小输入框（v1.0.13「说完自动发送」的发送键 + 延迟）。
+   和 .select 用同一套配色，只是没有下拉箭头、宽度由行内 style 定。 */
+.mini-input {
+  background: #16161a;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit; font-size: 12.5px;
+  padding: 6px 9px;
+  transition: border-color .14s;
+}
+.mini-input:hover { border-color: #3b3b45; }
+.mini-input:focus { outline: none; border-color: var(--accent-dim); }
+
 .btn {
   border: 1px solid var(--line);
   background: var(--card-2);

@@ -492,6 +492,13 @@ def build_state(force_devices: bool = False) -> dict:
             "input_method": cfg.input_method,
             "mapping_enabled": bool(getattr(cfg, "mapping_enabled", True)),
             "swallow_ok": bool(getattr(cfg, "swallow_ok_during_voice", True)),
+            # 语音结束后自动发送（v1.0.13）：说完 → 按语音键结束 → 自动把消息发出去。
+            # 面板上要能看见、也能改，否则"发不出去/乱发"都只能靠猜。
+            "send_after_voice": bool(getattr(cfg, "send_after_voice", True)),
+            "send_after_voice_delay_ms": int(
+                getattr(cfg, "send_after_voice_delay_ms", 800) or 800),
+            "send_after_voice_key": str(
+                getattr(cfg, "send_after_voice_key", "enter") or "enter"),
             # 厂商页按键读取（v1.0.11 起按键映射全靠这一路）——
             # 面板上要能看见它是不是开着，否则"按键没反应"又变成猜谜。
             "hid_vendor_keys": bool(getattr(cfg, "hid_vendor_keys", True)),
@@ -710,6 +717,10 @@ class Handler(BaseHTTPRequestHandler):
             #   界面显示"已关闭"、后端仍按旧配置把这一路混进去 ——
             #   「我明明不让系统麦克风参与说话了，它还是在输出」有一半出在这里。
             "system_mic_enabled": bool, "remote_mic_enabled": bool,
+            # v1.0.13 语音结束自动发送。同样必须进白名单：不进就是
+            # "界面上改了、后端当没听见"，而用户看到的只是"它不听话"。
+            "send_after_voice": bool, "send_after_voice_delay_ms": int,
+            "send_after_voice_key": str,
         }
         ignored: list[str] = []
         for k, v in body.items():

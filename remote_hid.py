@@ -46,6 +46,22 @@ _DEDUPE_SEC = 0.06
 _TRIM_AT = 200
 # 隔多久重扫一次 HID 集合（遥控器重连后要重新挂载，见 _recover）
 _RESCAN_SEC = 10.0
+# 隔多久往日志里打一次「各路集合到底收到过几条报告」。
+#
+# 为什么非要有这一行：在这个审计行之前，"按键没反应"在日志里的样子是
+# **一片空白** —— 和"程序没在跑""遥控器没连上""集合没打开"长得一模一样。
+# 用户按了十几次键、把日志发回来，里面什么线索都没有，只能靠猜。
+# 有了它，一次按键就能定案：
+#   · 审计行里厂商页计数在涨 → 报告到了，问题在解码或映射表
+#   · 审计行里全是 0      → 报告根本没来，问题在蓝牙/HID 那一层
+_AUDIT_SEC = 20.0
+# ⚠ 但审计行本身不能每 20 秒无条件刷一条：桥是要连着跑几天的，
+#   按键一直不来时一天就是 4300+ 行重复警告 —— 把日志淹掉，
+#   真正有用的那几行反而找不到了（这就是"体检报告刷屏"式的新坑）。
+#   规矩：前 _AUDIT_LOUD_TIMES 次照常报（刚启动/刚排查时一眼就看得到），
+#         之后就压到这个静默窗口，按键后来翻日志仍然看得到。
+_AUDIT_QUIET_SEC = 300.0
+_AUDIT_LOUD_TIMES = 3
 
 
 def decode_report(raw: bytes) -> tuple[str | None, bool]:
@@ -82,6 +98,14 @@ class RemoteHidButtons:
         self._last_down: str | None = None          # 松手时要补上的键
         self._recent: dict[tuple[str, bool], float] = {}
         self._last_scan = 0.0
+        # 各路集合累计收到多少条原始报告（col.key → 条数）。
+        # 这是"按键到底有没有到本程序"的唯一硬证据，见 _AUDIT_SEC 的注释。
+        self._counts: dict[str, int] = {}
+        self._audit_at = 0.0
+        self._zero_warned = 0            # 「0 条」告警报过几次（前几次不压）
+        self._zero_warn_at = 0.0         # 上次「0 条」告警的时间
+        self._audit_logged_total = -1    # 上次打明细时的累计条数
+        self._audit_detail_at = 0.0      # 上次打明细的时间
         # 已报过的"奇怪报告"，(来源, 前缀) → 只报一次，别刷屏
         self._unknown_seen: set[tuple[str, bytes]] = set()
 
@@ -203,9 +227,66 @@ class RemoteHidButtons:
                     self._recover()
                 except Exception as e:               # noqa: BLE001
                     logger.warning("重扫厂商页集合异常：%s", e.__class__.__name__)
+
+            if now - self._audit_at > _AUDIT_SEC:
+                self._audit_at = now
+                try:
+                    self._audit(now)
+                except Exception as e:               # noqa: BLE001
+                    logger.warning("通道审计异常：%s", e.__class__.__name__)
             time.sleep(0.02)
 
+    def _audit(self, now: float | None = None) -> None:
+        """定期把「哪一路收到过几条报告」打进日志。
+
+        这一个方法就是"按键没反应"这个问题的判决书 —— 在它出现之前，
+        日志对 HID 按键是一片空白，和"遥控器没连上"完全无法区分：
+          · 厂商页计数在涨      → 报告到了，问题在我们的解码或映射表
+          · 非厂商页涨、厂商页 0 → 按键落在 Windows 认的那几路，得改读法
+          · 一路都没涨          → 报告根本没到本程序（蓝牙/HID 层的问题）
+
+        ⚠ 判决书不等于要一直念：见 _AUDIT_QUIET_SEC。这里已经按"前几次照报、
+        之后压到静默窗口"限流；**判决能力一分没少，噪音降两个数量级**。
+        now 可注入，是为了能脱离真实时钟单测限流逻辑（见 check_remote_hid.py）。
+        """
+        now = time.time() if now is None else now
+        total = sum(self._counts.values())
+
+        if total == 0:
+            self._zero_warned += 1
+            if (self._zero_warned > _AUDIT_LOUD_TIMES
+                    and now - self._zero_warn_at < _AUDIT_QUIET_SEC):
+                return                               # 静默期：能力还在，只是不再刷屏
+            self._zero_warn_at = now
+            heads = "、".join(c.key for c in self._cols) or "（一路都没打开）"
+            tail = ("" if self._zero_warned > 1
+                    else "（这条不会再每 20 秒刷：前几次照报，之后每 5 分钟提醒一次）")
+            logger.warning(
+                "📊 HID 通道审计：已挂 %d 路集合、累计 **0 条**原始报告｜%s｜"
+                "此刻按遥控器的方向/确认/返回/音量键都**不会**产生任何日志 —— "
+                "说明按键没有到达本程序，问题在蓝牙/HID 那一层，"
+                "不在按键映射表上。（语音键不走 HID，它照常工作）%s",
+                len(self._cols), heads, tail,
+            )
+            return
+
+        # 有报告：只在"条数变了"或"过一个心跳周期"时打明细，同样防刷屏。
+        if (total == self._audit_logged_total
+                and now - self._audit_detail_at < _AUDIT_QUIET_SEC):
+            return
+        self._audit_logged_total = total
+        self._audit_detail_at = now
+        detail = "、".join(f"{k}={v}" for k, v in sorted(self._counts.items()))
+        logger.info("📊 HID 通道审计：累计 %d 条｜%s", total, detail)
+
     def _handle(self, raw: bytes, col=None) -> None:
+        # 计数先记：无论这条报告认不认识，**它来过**这件事本身才是证据。
+        # （认不认识决定后面派不派发动作，见下面的分支。）
+        if col is not None:
+            self._counts[col.key] = self._counts.get(col.key, 0) + 1
+        else:
+            self._counts["<未知集合>"] = self._counts.get("<未知集合>", 0) + 1
+
         # 非厂商页（键盘/消费类/鼠标）：Windows 自己会处理，我们再发一次就是双份。
         # 但**必须记下来** —— "按键到底落在哪一路"这个问题的答案就在这一行里。
         # 前几种不同的报告各记一次，之后静默，避免刷屏。

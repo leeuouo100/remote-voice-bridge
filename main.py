@@ -25,7 +25,7 @@ from atvv import (
 )
 from adpcm import IMAADPCMDecoder
 from session import SessionCoordinator, Phase
-from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up
+from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up, tap_key
 from buttons import resolve_button
 import mixer
 
@@ -84,6 +84,87 @@ _drop_frames = 0       # 因队列满而**丢掉**的音频帧数
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
 # 连接和同一个托盘图标，谁赢不确定，表现为"点了重连就时好时坏"。
 _reconnect_request = threading.Event()
+
+
+# ── 语音结束后的「自动发送」──────────────────────────────────────────────
+#
+# 补上 voice coding 闭环里缺的最后一环。原来的流程是：
+#     按语音键（开始听）→ 说完 → 再按一次语音键（结束）→ 文字进输入框
+#     → **然后人要伸手去够鼠标点「发送」** ← 就是这个动作毁掉了整件事
+#
+# 「按遥控器上的某个键替我按回车」这条路暂时走不通：遥控器除语音键以外的
+# 按键走 HID 厂商页，在 Windows 上至今收不到报告（见 remote_hid.py 文件头）。
+# 但**不需要**按键：语音会话本来就是这个程序自己在记账的（见 on_control 里的
+# voice_active 状态机），所以"这段说完了"这个时刻我们**本来就知道** ——
+# 知道了就够了，不必再等用户按第二个键。
+#
+# 为什么状态放模块级、而不是 on_control 的闭包里：
+#   on_control 可能在 _get_cfg 定义之前就被 BLE 回调线程调到（订阅是先于
+#   后面那些闭包定义的），闭包会 UnboundLocalError。放模块级 + 在主循环里
+#   读配置，时序上就不存在这个窗口。
+_pending_send_at: float = 0.0     # 「待发送」的登记时刻（0 = 没有待发送）
+_pending_send_frames: int = 0     # 结束那一次会话共收到多少音频帧
+
+
+def request_voice_send(frames: int) -> None:
+    """语音会话刚结束 → 登记一次「待发送」。
+
+    真正的发送动作在主循环里做：那里读配置方便，也不在 BLE 回调线程上
+    （回调线程没有 asyncio 循环，见 v1.0.3 那个坑）。
+    """
+    global _pending_send_at, _pending_send_frames
+    _pending_send_at = time.time()
+    _pending_send_frames = int(frames or 0)
+
+
+def cancel_voice_send(reason: str = "") -> None:
+    """取消待发送（用户又开始说下一段了 → 上一条显然不该发出去）。"""
+    global _pending_send_at
+    if _pending_send_at:
+        _pending_send_at = 0.0
+        if reason:
+            logger.info("↩ 取消自动发送（%s）", reason)
+
+
+def maybe_send_after_voice(cached: dict) -> None:
+    """主循环每轮调用一次：到点了就替用户按下发送键。
+
+    为什么收成一个模块级函数、而不是把逻辑摊在主循环里：
+    主循环里出现 `global _pending_send_at` 会直接 SyntaxError
+    （`name is used prior to global declaration` —— 循环条件先读了它）。
+    把"改状态"和"读状态"都关进模块级函数，这个坑就不存在了。
+
+    ⚠ 一帧音频都没有时不发送。那种情况多半是误触，而按回车会把输入框里
+      **原有的内容**发出去 —— 比不发送更糟（等于替用户发了一条错消息）。
+    """
+    global _pending_send_at, _pending_send_frames
+    if not _pending_send_at:
+        return
+
+    if not cached.get("send_after_voice", True):
+        _pending_send_at = 0.0                          # 开关关掉 → 直接作废
+        return
+
+    delay = max(0.05, float(cached.get("send_after_voice_delay_ms") or 800) / 1000.0)
+    if time.time() - _pending_send_at < delay:
+        return                                          # 还没到点，下一轮再看
+
+    frames = _pending_send_frames
+    _pending_send_at = 0.0
+    _pending_send_frames = 0
+
+    if frames <= 0:
+        logger.info("📨 本次语音没有任何音频帧 → 判定为误触，不发送")
+        return
+
+    key = cached.get("send_after_voice_key") or "enter"
+    if tap_key(key):
+        logger.info("📨 已发送（替用户按了 %s）", key)
+    else:
+        logger.error(
+            "❌ 发送失败：%r 这个键名发不出去（看 config.json 的 send_after_voice_key）",
+            key,
+        )
 
 
 def request_reconnect() -> None:
@@ -636,8 +717,6 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 atvv.state.decoder.reset()
                 _pending_samples.clear()
                 logger.info("▶ Audio START")
-                _audio_frames = 0
-                _audio_peak   = 0
                 state.clear_audio()          # 清掉上一次的波形，UI 从空开始画
                 state.update(streaming=True, last_event="语音中…")
                 # ⚠ 必须补发 MIC_OPEN。
@@ -672,6 +751,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     mic_reopen_at = 0.0
                     logger.debug("↩ 忽略自动重开麦触发的 audio_start（非用户第二次按下）")
                 elif not voice_active:
+                    # 用户又开始说下一段了 → 上一条「待发送」显然不该再发出去。
+                    # 例：说完一句觉得不对，紧接着按一下重说 —— 若不等这一下就
+                    # 把上一条发出去，聊天框里就会多出一条残缺消息。
+                    cancel_voice_send("又开始了一段新的语音")
+                    # ⚠ 帧计数**只在这里**清零 —— 不能放在上面 audio_start 的顶上。
+                    #   放在顶上：第 2 次按下（＝收尾）也会先走到 audio_start，
+                    #   于是「先清零、再回头读它去登记发送」→ 传进去永远是 0
+                    #   → 零帧误触保护每次都被触发 → **自动发送永远不触发**，
+                    #   而且日志还会理直气壮地报「误触」，把排查方向指歪。
+                    #   （这是本项目的老病：0 帧和误触长得一模一样，这次是程序
+                    #   自己把计数器清零造成的。）
+                    _audio_frames = 0
+                    _audio_peak   = 0
                     voice_hotkey_down()      # tap=点按开始 / hold=按下并保持
                     voice_active     = True
                     voice_started_at = time.time()
@@ -683,6 +775,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     voice_started_at = 0.0
                     state.update(streaming=False, level=0, last_event="语音结束")
                     logger.info("🎙️ 语音会话【结束】（第二次按下语音键）")
+                    # 结束之后替用户按一下「发送」—— 详见 request_voice_send 的注释。
+                    # 传这一段的帧数：一帧都没收到 = 这次其实是误触，不该发。
+                    request_voice_send(_audio_frames)
             elif event["type"] == "audio_stop":
                 session.on_audio_stop(event["reason"])
                 # ⚠ 松手 **不等于** 语音结束。
@@ -1018,6 +1113,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     # 语音会话中要不要吞掉确认键的 Enter（见 config 里的长注释：
                     # 物理键盘与遥控器在钩子层不可区分，所以这个开关是必要的逃生口）
                     "swallow_ok": bool(getattr(new, "swallow_ok_during_voice", True)),
+                    # 语音结束后自动发送（见 config 里的长注释）。这三个字段
+                    # 必须进这个白名单，否则用户改了 config.json 也不会生效 ——
+                    # 而且会**静默**不生效（缓存里读不到就当默认值用）。
+                    "send_after_voice": bool(getattr(new, "send_after_voice", True)),
+                    "send_after_voice_delay_ms": int(
+                        getattr(new, "send_after_voice_delay_ms", 800) or 800),
+                    "send_after_voice_key": str(
+                        getattr(new, "send_after_voice_key", "enter") or "enter"),
                 }
                 _warn_bad_keymap(_cfg_cache["keymap"])
                 logger.debug(f"config reloaded (mtime={mt})")
@@ -1100,6 +1203,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 "🎙️ 语音会话【结束】（确认键）"
                 + ("；这一下不再当 Enter 发出" if swallow else "；Enter 照常放行")
             )
+            # ⚠ 收尾路径**不止「第二次按语音键」一条**：用确认键收尾的更该发出去
+            #   （按确认＝"我确定说完了"）。只接一条路 = 另外几条静默失效 ——
+            #   本项目反复踩的坑：同一套机制在多条路径都要落地，漏一条等于没有。
+            #   但 swallow=False 时这一下 OK **自己就会变成 Enter** 发出去，
+            #   再登记一次就是连发两下（多发一条空消息）→ 只在吞掉这一下时补。
+            if swallow:
+                request_voice_send(_audio_frames)
             return not swallow               # 吞掉这一下，不让它再当 Enter 发出去
 
         if btn_id and btn_id != "voice":
@@ -1205,6 +1315,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             voice_started_at = 0.0
             state.update(streaming=False, level=0, last_event="语音结束（确认键）")
             logger.info("🎙️ 语音会话【结束】（厂商页确认键）")
+            # 同上：这条收尾路径也要接上自动发送。下面直接 return，这一下按键被
+            # 我们**吞掉了**、不会走到 resolve_button 变成 Enter → 无条件补上，
+            # 不存在重复发送。
+            request_voice_send(_audio_frames)
             return
 
         resolve_button(
@@ -1254,6 +1368,12 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             voice_active     = False
             voice_started_at = 0.0
             state.update(streaming=False, level=0, last_event="语音结束（超时自动收尾）")
+            # ⚠ 超时收尾**故意不自动发送** —— 别顺手改成"那也发一下吧"：
+            #   麦克风已经开着最多 10 分钟，里面很可能全是环境音、旁人的话
+            #   （用户人可能早走开了）。把这种内容自动发进聊天框，
+            #   比"少发一次"严重得多 —— 宁可不发，让用户自己看一眼再决定。
+            #   顺手取消待发送，防别处残留的登记在这一刻被触发。
+            cancel_voice_send("超时收尾：这段时间录到的内容不适合自动发")
 
         if not force and now - last_health_check < cfg.heartbeat_cooldown:
             return True
@@ -1305,6 +1425,16 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 await _supervise_audio()
             except Exception as e:                      # noqa: BLE001
                 logger.error("音频监护异常：%s", e)
+
+            # ── 语音结束后的自动发送（见 request_voice_send 的注释）──────────
+            # 放在主循环而不是 BLE 回调线程里，有三个好处：
+            #   ① 回调线程没有 asyncio 循环，那边只能干同步活
+            #   ② 这里能安全地读配置（用户在控制台改了开关下一轮就生效）
+            #   ③ 到点发送这件事本身是"延迟动作"，天然属于循环
+            try:
+                maybe_send_after_voice(_get_cfg())
+            except Exception as e:                      # noqa: BLE001
+                logger.error("自动发送异常：%s", e)
 
             # 控制台点了「重新连接」/ 改了输出设备 → 断开重来，用上新配置
             if _reconnect_request.is_set():

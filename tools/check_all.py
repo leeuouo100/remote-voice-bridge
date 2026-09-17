@@ -31,6 +31,7 @@ STEPS = [
                   "tools/check_failure_visibility.py", "tools/check_pairing.py",
                   "tools/check_remote_hid.py", "tools/check_injection.py",
                   "tools/check_audio_watchdog.py",
+                  "tools/check_send_after_voice.py",
                   "tools/dump_report_descriptor.py",
                   "tools/probe_gatt_hid.py", "tools/probe_hid_claim.py",
                   "tools/watch_all_channels.py",
@@ -89,6 +90,12 @@ STEPS = [
     # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
     # 纯静态，几毫秒。
     ("音频流自愈", [PY, "tools/check_audio_watchdog.py"]),
+    # voice coding 的最后一环：说完 → 按语音键结束 → **替用户把消息发出去**。
+    # 2026-09-17 武哥的原话是"说完还要去电脑上按鼠标点发送，完全没有
+    # voice coding 的感觉"。这道闸钉住：默认开、延迟不能小到在文字落进
+    # 输入框之前就打回车、开始新一段要取消待发送、零帧误触不发、
+    # 三个字段进了 _get_cfg 白名单。带 5 条反例自证。
+    ("语音结束自动发送", [PY, "tools/check_send_after_voice.py"]),
     # 注入自检会真的发按键，无桌面会话里自己会 SKIPPED（不算失败）。
     # 它是唯一能拦住"SendInput 静默失效"和"组合键顺序错"的一关。
     #

@@ -393,6 +393,10 @@ function renderSettings() {
   $('#set-hotkey-mode').value = c.hotkey_mode;
   $('#set-suppress').checked  = !!c.suppress_keys;
   $('#set-swallow-ok').checked = c.swallow_ok !== false;
+  // v1.0.13「说完自动发送」：默认开 —— 关掉它就得回去点鼠标，见 config.py 的长注释
+  $('#set-send-after-voice').checked = c.send_after_voice !== false;
+  $('#set-send-key').value   = c.send_after_voice_key || 'enter';
+  $('#set-send-delay').value = c.send_after_voice_delay_ms || 800;
   $('#set-autostart').checked = !!state.autostart;
 
   $('#set-device').textContent     = state.status.device || '未连接';
@@ -603,6 +607,25 @@ function initEvents() {
   // 立刻生效（映射表按 mtime 热重载），不用重连
   $('#set-swallow-ok').addEventListener('change', e =>
     api('/api/config', { swallow_ok_during_voice: e.target.checked }));
+
+  // v1.0.13 说完自动发送。三处都是**立刻生效**：桥的主循环每轮读一次配置，
+  // 改完下一轮就按新值走，不用重连（重连一次遥控器要哑几秒）。
+  $('#set-send-after-voice').addEventListener('change', e =>
+    api('/api/config', { send_after_voice: e.target.checked }));
+  // 输入框用 change 而不是 input：否则边打字边提交，配置被写成一堆半截值
+  $('#set-send-key').addEventListener('change', e => {
+    const v = (e.target.value || '').trim() || 'enter';
+    e.target.value = v;
+    api('/api/config', { send_after_voice_key: v });
+  });
+  $('#set-send-delay').addEventListener('change', e => {
+    // ⚠ 服务端白名单只做类型转换、不夹取值域，所以下限必须在这里守。
+    //   太小会在输入法把文字落进输入框**之前**就回车 —— 等于把用户刚说的
+    //   那句话弄丢一次，比不自动发更糟。
+    const ms = Math.max(300, parseInt(e.target.value || '800', 10) || 800);
+    e.target.value = ms;
+    api('/api/config', { send_after_voice_delay_ms: ms });
+  });
   $('#set-autostart').addEventListener('change', e => api('/api/autostart', { enabled: e.target.checked }));
 
   $('#btn-reload-dev').addEventListener('click', async () => {

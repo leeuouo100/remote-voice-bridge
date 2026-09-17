@@ -112,6 +112,114 @@ def run_decode_tests() -> bool:
     return True
 
 
+def run_audit_throttle_tests() -> bool:
+    """通道审计的**限流**逻辑 —— 用假时钟真跑，不看源码。
+
+    为什么值得单测：审计行是"按键没反应"唯一的判决书，但判决书每 20 秒念一次
+    就会把日志淹掉（一天 4300+ 行重复），反而找不到真正有用的那几行。
+    这里钉死两件事：
+      ① 前几次必须照报（不然刚启动排查时什么都看不到）；
+      ② 之后必须是限流过的（不然就是刷屏）。
+    两个方向都要卡，只卡一个就会走向另一种极端。
+    """
+    import remote_hid
+
+    class _FakeCol:
+        key = "vid=18D1 pid=9450 page=0xFF01 usage=0x0001"
+        is_vendor = True
+
+    class _FakeLog:
+        def __init__(self) -> None:
+            # ⚠ 计数属性不能叫 warn / info —— 那会把同名方法在实例上盖掉，
+            #   报错是 "'int' object is not callable"，看着像 logger 的毛病。
+            self.n_warn = 0
+            self.n_info = 0
+
+        def warning(self, msg, *a):                 # noqa: A003
+            self.n_warn += 1
+
+        def info(self, msg, *a):
+            self.n_info += 1
+
+        def exception(self, *a, **k):
+            pass
+
+    orig_log = remote_hid.logger
+    orig_loud = remote_hid._AUDIT_LOUD_TIMES
+    orig_quiet = remote_hid._AUDIT_QUIET_SEC
+    ok = True
+    try:
+        rb = remote_hid.RemoteHidButtons(lambda *a: None)
+        rb._cols = [_FakeCol()]
+
+        # ① 一条报告都没有：10 分钟内每 20 秒调一次＝30 次
+        lg = _FakeLog()
+        remote_hid.logger = lg
+        for i in range(30):
+            rb._audit(1000.0 + i * 20.0)
+        print(f"   无报告时 30 次审计 → 告警 {lg.n_warn} 条")
+        if lg.n_warn < remote_hid._AUDIT_LOUD_TIMES:
+            print("   ❌ 前几次的告警被压掉了（刚启动排查时什么都看不到）")
+            ok = False
+        elif lg.n_warn > remote_hid._AUDIT_LOUD_TIMES + 2:
+            print("   ❌ 告警没有限流（这就是「一天 4300 行重复」那个刷屏坑）")
+            ok = False
+        else:
+            print("   OK 前几次照报、之后限流")
+
+        # ② 有报告但条数不变：也不许每 20 秒打一次明细
+        lg2 = _FakeLog()
+        remote_hid.logger = lg2
+        rb._counts = {"vid=18D1 pid=9450 page=0xFF01 usage=0x0001": 7}
+        for i in range(30):
+            rb._audit(2000.0 + i * 20.0)
+        print(f"   条数不变 30 次审计 → 明细 {lg2.n_info} 条")
+        if lg2.n_info == 0:
+            print("   ❌ 有报告却一条明细都不打（判决书没了）")
+            ok = False
+        elif lg2.n_info > 4:
+            print("   ❌ 条数没变还一直在打明细")
+            ok = False
+        else:
+            print("   OK 明细只在条数变化 / 心跳周期时打")
+
+        # ③ 反例：把限流参数拆掉，上面两条必须变红
+        remote_hid._AUDIT_LOUD_TIMES = 10 ** 9
+        lg3 = _FakeLog()
+        remote_hid.logger = lg3
+        rb2 = remote_hid.RemoteHidButtons(lambda *a: None)
+        rb2._cols = [_FakeCol()]
+        for i in range(30):
+            rb2._audit(3000.0 + i * 20.0)
+        if lg3.n_warn >= 30:
+            print(f"   OK [反例] 去掉「前几次之后压静默」→ 30 次全报（{lg3.n_warn} 条），"
+                  "证明上面卡的不是空气")
+        else:
+            print(f"   ❌ [反例] 去掉限流后仍然只报 {lg3.n_warn} 条 → 说明检查无效")
+            ok = False
+
+        remote_hid._AUDIT_LOUD_TIMES = orig_loud
+        remote_hid._AUDIT_QUIET_SEC = 0.0
+        lg4 = _FakeLog()
+        remote_hid.logger = lg4
+        rb3 = remote_hid.RemoteHidButtons(lambda *a: None)
+        rb3._cols = [_FakeCol()]
+        rb3._counts = {"x": 7}
+        for i in range(30):
+            rb3._audit(4000.0 + i * 20.0)
+        remote_hid._AUDIT_QUIET_SEC = orig_quiet
+        if lg4.n_info >= 30:
+            print(f"   OK [反例] 去掉静默窗口 → 条数不变也每 20 秒打（{lg4.n_info} 条）")
+        else:
+            print(f"   ❌ [反例] 去掉静默窗口后仍只打 {lg4.n_info} 条 → 说明检查无效")
+            ok = False
+    finally:
+        remote_hid.logger = orig_log
+        remote_hid._AUDIT_LOUD_TIMES = orig_loud
+        remote_hid._AUDIT_QUIET_SEC = orig_quiet
+    return ok
+
+
 def list_collections() -> None:
     import hidinfo
     print("── 当前 HID 集合 ──")
@@ -184,6 +292,7 @@ def main() -> int:
         return 0
 
     ok = run_decode_tests()
+    ok = run_audit_throttle_tests() and ok
     list_collections()
     if args.watch:
         ok = watch(args.watch) and ok

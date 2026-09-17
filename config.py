@@ -14,7 +14,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
@@ -332,6 +332,31 @@ class Config:
     #   需要一边说话一边敲键盘的人，把这个关掉即可 ——
     #   关掉后确认键仍会结束语音会话，只是额外多打一个回车。
     swallow_ok_during_voice: bool = True
+
+    # ── 语音会话结束后「自动发送」──────────────────────────────────────
+    # 补上 voice coding 闭环里缺的最后一环：说完 → 按语音键结束 → **消息发出去**。
+    #
+    # 为什么必须有：遥控器语音键是 ATVV 通道，是**唯一确定能收到**的键；
+    # 其余按键（确认/方向/返回）走 HID 厂商页，在 Windows 上至今收不到报告
+    # （见 remote_hid.py 的文件头）。所以「按遥控器上的某个键发回车」这条路
+    # 当时走不通，结果就是：语音识别完了，人还得伸手去够鼠标点发送 ——
+    # 这正是「完全没有 voice coding 的感觉」的那一下。
+    #
+    # 现在的做法：语音会话**由本程序记账**（按下翻转，见 main.py 的
+    # voice_active 状态机），所以"这段说完了"这个时刻我们是知道的 ——
+    # 知道就够了，不必再等用户按第二个键。结束之后等一小会儿（让输入法把
+    # 识别结果落进输入框），然后替用户按一下发送键。
+    #
+    # ⚠ 只有「再按一次语音键」结束这条路会触发；按确认键结束**不触发**
+    #   （那条路的语义是 swallow_ok_during_voice 决定的"只说、先别发"）。
+    # ⚠ 想先看一眼再自己发 → 把 send_after_voice 关掉。
+    send_after_voice: bool = True
+    # 等输入法把文字落进输入框再发。太小会"文字还没进去就把消息发出去了"，
+    # 那比不自动发更糟（等于把用户刚说的话弄丢一次），所以默认给得比较宽。
+    send_after_voice_delay_ms: int = 800
+    # 发送用哪个键。键名同 keys.py（enter / ctrl+enter / shift+enter / space …）。
+    # 微信、QQ、以及大部分 AI 对话框都是 Enter 发送。
+    send_after_voice_key: str = "enter"
 
     # 非空则覆盖 INPUT_METHODS 内置组合。
     # 键名支持：ralt(右Alt) / lalt / alt / ctrl / win / shift / 字母 / f1-f24 / space …

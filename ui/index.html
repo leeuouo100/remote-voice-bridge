@@ -355,6 +355,20 @@
         <div class="tiny-note">不勾选时确认键仍会结束语音，但会额外打出一个回车。Windows 分不出遥控器和物理键盘，所以勾上后<strong>物理键盘的 Enter 也会一起被吞</strong> —— 想一边说话一边敲键盘就取消勾选。</div>
       </div>
 
+      <div class="set-row col">
+        <label class="chk"><input type="checkbox" id="set-send-after-voice"><span>说完自动发送（按语音键结束后，自动替你按一下发送键）</span></label>
+        <div class="tiny-note">
+          勾上就是完整的 voice coding 闭环：<strong>按语音键开始 → 说完 → 再按一次语音键结束 → 消息自己发出去</strong>，
+          全程不用伸手去够鼠标。<br>
+          发送键
+          <input type="text" id="set-send-key" class="mini-input" style="width:7em" placeholder="enter">
+          延迟
+          <input type="number" id="set-send-delay" class="mini-input" style="width:5em" min="50" step="50"> ms<br>
+          <span class="tiny-note">延迟是等输入法把识别结果落进输入框——<strong>调太小会在文字进去之前就回车，等于把刚说的话弄丢一次</strong>，别低于 300ms。</span><br>
+          想先看一眼再自己发就取消勾选；结束之后马上又开始说下一段，上一条会自动取消发送。
+        </div>
+      </div>
+
       <div class="set-row">
         <label>开机自动启动</label>
         <label class="chk"><input type="checkbox" id="set-autostart"><span>随系统启动</span></label>
