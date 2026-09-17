@@ -37,6 +37,7 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `check_pairing.py` | 蓝牙配对判定链：6 种状态（真机形态必须判成 `STALE_ADDR`、`migrate` 之后的形态必须是 `NODE_PHANTOM`）；分支顺序（`STALE_ADDR` 要排在 `NODE_PHANTOM` 前面）；「幽灵」口径；PnP 实例 ID 带 `USB\` 前缀；搬家保留注册表值类型；「删不动」只在管理员下下结论；ACL 接管开一组特权 + 循环到不动点；提权带全部开关。含**行为级反例**（把 `classify` 改坏 exec 起来必须判错） | v1.0.10 的真机事故：「换过 USB 口就连不上」—— 程序显示未连接、Windows 显示已配对、设置里还删不掉。判定读的是真机注册表，CI 里没有蓝牙棒，所以抽成纯函数 + 假数据锁死 |
 | `check_failure_visibility.py` | 故障必须「看得见、说人话」：桥线程异常走 logging（不是 `print`）、连接失败必须给出原因+处置且不只试一条路、托盘必须能说出具体原因、`_open_ble_device` 必须真被 `run_bridge` 调用 | v1.0.9 真机：桥每 3 秒崩一次却**一行报错都没有** —— 因为 `tray_app` 用 `print` 报异常，而主 exe 是 `console=False`（输出流向是空的）；托盘还一直写着「按遥控器任意键唤醒」，把 `OSError: E_INVALIDARG` 捂了两小时。这类「静默 + 误导」是这个项目最反复的一类 bug，所以用反例锁死 |
 | `check_remote_hid.py` | 厂商页按键解码：解码表完整（int-usage 的键一个不少、且**不含**语音键）、17 条报告格式、按下→松手配对、遥控器集合能不能打开 | v1.0.11 起按键映射全靠厂商页，解码表错一位就是「键全串位」；**不用按遥控器**就能验，真机上按一次键再对日志 | 
+| `check_audio_watchdog.py` | 音频输出流停摆必须**可见且能自愈**：回调用 `_cb_last_at` 报心跳、心跳写在混合逻辑之前、主循环每轮调 `_supervise_audio`、超时走 `_rebuild_audio`、重建前清积压、混音回调**无论增益是否为 0 都按一比一消费队列**、队列满不再只打 debug。含「不许退回老写法」的反例断言 | v1.0.12 真机：语音输入开着、波形在动，输入法却收不到声音，重启才好。根因是输出流**建一次就没人管** + 静音期间不消费队列导致 `queue.Full` 静默丢帧。纯静态，几毫秒 |
 | `check_ui.js` | 控制台截图 + 波形动画（需 Playwright，可选） | 前端改挂了不至于没人发现 |
 
 > `check_keymap.py` 会跳过 `config.VIRTUAL_TARGETS` 里的虚拟目标
@@ -56,6 +57,11 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `pairing.py` | 「换过 USB 口之后程序显示未连接，Windows 却显示已配对」——**先跑这个** | **安装版**开始菜单 → **「修复蓝牙配对」**（等价于安装目录里的 `修复蓝牙配对.bat`，也等价于 `RemoteVoiceBridgeDiag.exe --fix-pairing`）；**源码版**双击 `修复蓝牙配对.bat` 或 `python pairing.py --fix-pairing`。⚠ **不带 `--fix-pairing` 就是纯只读诊断**（不需要管理员）。修复会弹一次 UAC，动注册表前自动备份到 `%APPDATA%\remote-voice-bridge\backup\`。可用 `--method restore\|migrate\|purge` 指定方案，`purge` 需 `--yes`。报告：`pairing-fix.txt` |
 | `check_remote_hid.py` | 「按键没反应」先跑它 —— **不用按键**就能验厂商页解码；`--watch N` 再实时听 N 秒 | `python tools\check_remote_hid.py`（纯单测）/ `--list`（列集合）/ `--watch 20`（监听 20 秒，期间按遥控器） |
 | `watch_reports.py` | 想知道**某个键的报告到底落在哪一路**（键盘 / 鼠标 / 厂商自定义页） | `python tools\watch_reports.py`（默认听 40 秒，`--seconds 60` 改时长，`--all` 连非 Google 的集合一起看）。⚠ **跑之前先退出桥接程序**（托盘右键 → 退出），否则它会把遥控器原生按键吞掉、报告显示"一条都没收到"。产出 `%APPDATA%\remote-voice-bridge\remote-hidwatch.txt` |
+| `watch_all_channels.py` | **「按键到底走哪条通道」的终极一问** —— HID 层看只有 0 条时，用它把**所有可能的路**一次全挂上 | `python tools\watch_all_channels.py --seconds 45`。⚠ 先退出桥接程序（它占着 ATVV，不关就听不到 CTL）；实在要带着它测加 `--force`。同时监听：键盘钩子 / 5 路 HID 集合 / 私有服务 `AE42` / 私有服务 `D343BFC5` / **ATVV CTL 的每一个字节**（认不出的 opcode 会标【认不出】）。**不用按键也能跑**（静态部分照出）。产出 `%APPDATA%\remote-voice-bridge\watch-all-channels.txt` |
+| `probe_gatt_hid.py` | 绕开 Windows HID 栈，**直接问蓝牙**：遥控器暴露了哪些服务/特征 | `python tools\probe_gatt_hid.py` / 加 `--listen 40` 订阅并实时听。**不用退出桥程序**。产出 `gatt-probe.txt` |
+| `probe_hid_claim.py` | HID 服务被 `ACCESS_DENIED` 挡住时，换三个入口（按 UUID 直接取 / `from_id_async` 重开 / 写 HID Control Point）能不能"要"过来 | `python tools\probe_hid_claim.py` |
+| `dump_report_descriptor.py` | 想看遥控器各集合的 HID 报告描述符（**设备自报的权威**） | `python tools\dump_report_descriptor.py`。⚠ 顺带记下一个坑：`IOCTL 0x000B0193` 返回的是 `HidP KDR` 结构（缓冲区开头就是 ASCII `HidPKDR`），**不是**原始描述符 |
+| `probe_devnode_binding.py` | 想知道遥控器每个 devnode **绑没绑驱动**、有没有 `Problem` | `python tools\probe_devnode_binding.py`。⚠ 注意判读口径：HIDClass 子集合（消费类/厂商页）的 `Service=(未绑定)` 是**正常**的（Driver 指向 HIDClass 类 GUID `{745a17a0-…}`）；HID 服务的驱动是 `mshidumdf`（Windows 的 HOGP 驱动） |
 
 > `diag_remote.py` 的**真机部分**必须有人按键，没法自动化；但它的「报告生成器」
 > 是纯函数式的，`check_all` 会用假数据把两条分支（能区分设备 / 不能区分）都跑一遍 ——

@@ -68,6 +68,18 @@ _pending_samples = deque()
 _audio_frames = 0
 _audio_peak   = 0
 
+# 输出流（喂给 CABLE Input 那一路）的存活证据。
+#
+# 为什么非要这两个数：输出流是"建一次、start 一次"的，之后**没有任何监护** ——
+# 一旦 PortAudio 那一路死了（WASAPI 抖动、设备被别的程序抢、睡眠唤醒），
+# 回调就再也不被调用，于是 CABLE Input 永远收到静音。
+# 而遥控器那一路的波形照旧在动（它走 on_audio，和输出流无关），
+# 用户看到的就是「有波形、但输入法收不到声音，重启软件才好」。
+# 2026-09-17 武哥报的正是这一条。
+_cb_last_at  = 0.0     # 输出回调最后一次被调用的时刻
+_cb_calls    = 0       # 回调总次数（隔一段时间应该涨）
+_drop_frames = 0       # 因队列满而**丢掉**的音频帧数
+
 # 手动重连请求。控制台点「重新连接」时置位，主循环看到就断开重来。
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
 # 连接和同一个托盘图标，谁赢不确定，表现为"点了重连就时好时坏"。
@@ -331,6 +343,12 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
     import sounddevice as sd
 
     def cb(outdata, frames, timeinfo, status):
+        global _cb_last_at, _cb_calls
+        # 存活心跳：主循环靠它判断"这路流还活着吗"，见 _supervise_audio。
+        # 必须放在最前面 —— 就算下面混合逻辑抛异常，心跳也得先记上，
+        # 否则一个 bug 会让看门狗误判成"流死了"而去反复重建。
+        _cb_last_at = time.time()
+        _cb_calls += 1
         if status:
             logger.debug(f"Audio status: {status}")
         # 混合波形取点密度：按"每秒约 200 个点"折算，让三路波形的时间窗口一致
@@ -354,15 +372,24 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
         peak = 0
         for i in range(frames):
             v = 0.0
-            if r_gain > 0.0:
-                if _pending_samples:
-                    v = int(_pending_samples.popleft()) * r_gain
-                else:
-                    try:
-                        _pending_samples.extend(_sample_queue.get_nowait())
-                        v = int(_pending_samples.popleft()) * r_gain
-                    except queue.Empty:
-                        v = 0.0
+            # ⚠⚠ 无论这一路**是否发声**，都要按一比一的比例把队列消费掉。
+            #
+            # 老写法是"只在 r_gain > 0 时才取"，于是遥控器那一路静音/未参与混音的
+            # 期间（source_audible 为假、或增益滑到 0）队列**一点都不消费**：
+            #   · 涨到 maxsize=65536 之后，on_audio 的 put_nowait 抛 queue.Full，
+            #     后面**每一帧都被丢掉**，而日志里一个字都没有（"静默丢弃"老坑）；
+            #   · 重新打开声音时，先播出来的是几分钟前积压的旧音频。
+            # 症状正好是武哥 2026-09-17 报的「波形在动、输入法收不到声音，重启才好」。
+            # 现在改成每帧必取一个：队列永远不会积压，重新出声时也是当下的声音。
+            if not _pending_samples:
+                try:
+                    _pending_samples.extend(_sample_queue.get_nowait())
+                except queue.Empty:
+                    pass
+            if _pending_samples:
+                s = int(_pending_samples.popleft())
+                if r_gain > 0.0:
+                    v = s * r_gain
             if i < sys_len:
                 v += float(sys_blk[i]) * s_gain
 
@@ -717,7 +744,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     def on_audio(sender, args):
         nonlocal last_ble_activity
-        global _audio_frames, _audio_peak
+        global _audio_frames, _audio_peak, _drop_frames
         last_ble_activity = time.time()
         if not atvv.state.stream_active:
             return
@@ -762,7 +789,15 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             try:
                 _sample_queue.put_nowait(samples)
             except queue.Full:
-                logger.debug("Queue full, dropping frame")
+                # ⚠ 以前这里是 `logger.debug("Queue full, dropping frame")` ——
+                #   正式版日志级别是 INFO，等于**一声不响地把音频扔掉**。
+                #   用户那边只看到"没声音"，日志里没有任何证据，只能靠猜。
+                #   现在按"第一次 + 每 200 次"报到 WARNING。
+                _drop_frames += 1
+                if _drop_frames == 1 or _drop_frames % 200 == 0:
+                    logger.warning(
+                        "⚠ 音频队列已满，正在丢帧（累计 %d 帧）—— "
+                        "输出流多半停摆了，看门狗会重建它", _drop_frames)
         except Exception as e:
             logger.error(f"AUD handler error: {e}")
 
@@ -826,6 +861,82 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     stream = await loop.run_in_executor(None, _start_stream)
     await loop.run_in_executor(None, stream.start)
     logger.info("✅ Audio stream started")
+
+    # 起跑线：先给心跳一个初值，否则监护第一次检查时 _cb_last_at 还是 0，
+    # 会被当成"已静默很久"而白重建一次。
+    global _cb_last_at
+    _cb_last_at = time.time()
+
+    # ── 输出流监护（"波形在动、输入法却没声音"的根因就在这）────────────────
+    #
+    # 为什么必须有个监护：这条流是**建一次、start 一次**的，之后没人管。
+    # PortAudio/WASAPI 那一路只要出一次事（设备被别的程序独占、睡眠唤醒、
+    # 驱动抖动），回调就不再被调用 —— CABLE Input 永远收到静音，而遥控器
+    # 那一路的波形照旧在动（on_audio 与输出流无关），看起来"程序明明是好的"。
+    # 用户唯一的出路是重启软件，这正是 2026-09-17 武哥报的那条。
+    #
+    # 判据只有一个、且非常硬：**输出回调的心跳**。
+    # 这条流是一直开着的，所以正常时 _cb_last_at 每几十毫秒就刷新一次；
+    # 静默超过 _AUDIO_SILENT_LIMIT 秒 = 这一路已经死了，直接重建。
+    _AUDIO_SILENT_LIMIT = 3.0        # 秒。正常回调间隔 ~5ms（240 帧 @16k）
+    _AUDIO_REBUILD_GAP  = 20.0       # 两次重建之间至少隔这么久，防止死循环重建
+    _audio_sup = {"last_rebuild": 0.0, "rebuilt": 0}
+
+    def _drain_audio_queues() -> int:
+        """丢掉积压的旧采样 —— 重建后绝不能把"过去的声音"播出去。"""
+        global _drop_frames
+        _pending_samples.clear()
+        n = 0
+        while True:
+            try:
+                _sample_queue.get_nowait()
+                n += 1
+            except queue.Empty:
+                break
+        _drop_frames = 0
+        return n
+
+    async def _rebuild_audio(reason: str) -> None:
+        nonlocal stream
+        old = stream
+        _audio_sup["last_rebuild"] = time.time()
+        logger.warning(
+            "🔇 音频输出流已停摆（%s）→ 重建这条管道。\n"
+            "   为什么会出现：PortAudio/WASAPI 那一路出过一次事就再也不回来了，"
+            "而遥控器波形照旧在动，所以看起来『程序没坏、就是没声音』。", reason)
+        state.update(last_event="音频输出流停摆 → 已自动重建")
+
+        def _stop_old():
+            for fn in ("stop", "close"):
+                try:
+                    getattr(old, fn)()
+                except Exception:                       # noqa: BLE001
+                    pass
+
+        await loop.run_in_executor(None, _stop_old)
+        dropped = _drain_audio_queues()
+        if dropped:
+            logger.info("🧹 重建前清掉 %d 块积压音频（避免播出旧声音）", dropped)
+        try:
+            new = await loop.run_in_executor(None, _start_stream)
+            await loop.run_in_executor(None, new.start)
+            stream = new
+            _audio_sup["rebuilt"] += 1
+            logger.info("✅ 音频输出流已重建（累计 %d 次），声音应立刻恢复",
+                        _audio_sup["rebuilt"])
+        except Exception as e:                          # noqa: BLE001
+            logger.error("❌ 重建音频输出流失败：%s —— 将稍后重试", e)
+
+    async def _supervise_audio() -> None:
+        now = time.time()
+        if not _cb_last_at:
+            return
+        silent = now - _cb_last_at
+        if silent <= _AUDIO_SILENT_LIMIT:
+            return
+        if now - _audio_sup["last_rebuild"] < _AUDIO_REBUILD_GAP:
+            return
+        await _rebuild_audio(f"输出回调已静默 {silent:.1f} 秒")
 
     # ── Keyboard hooks ──
     import keyboard as _kb
@@ -1187,6 +1298,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     try:
         while True:
             await asyncio.sleep(0.2)
+
+            # 音频输出流监护：回调静默超时就重建（见 _supervise_audio 注释）。
+            # 放在每一轮的最前面 —— 这是"没声音"里唯一能自愈的一条，越早发现越好。
+            try:
+                await _supervise_audio()
+            except Exception as e:                      # noqa: BLE001
+                logger.error("音频监护异常：%s", e)
 
             # 控制台点了「重新连接」/ 改了输出设备 → 断开重来，用上新配置
             if _reconnect_request.is_set():

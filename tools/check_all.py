@@ -30,6 +30,11 @@ STEPS = [
                   "tools/watch_reports.py", "tools/check_hidinfo.py",
                   "tools/check_failure_visibility.py", "tools/check_pairing.py",
                   "tools/check_remote_hid.py", "tools/check_injection.py",
+                  "tools/check_audio_watchdog.py",
+                  "tools/dump_report_descriptor.py",
+                  "tools/probe_gatt_hid.py", "tools/probe_hid_claim.py",
+                  "tools/watch_all_channels.py",
+                  "tools/probe_devnode_binding.py",
                   "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -80,6 +85,10 @@ STEPS = [
     # 一旦错了，现象和"遥控器没连上"一模一样 —— 必须先用纯单测钉死，
     # 真机上按下键之后只要对焦"报告来没来"这一件事。
     ("厂商页按键解码", [PY, "tools/check_remote_hid.py"]),
+    # "波形在动、输入法却收不到声音，重启才好"（2026-09-17 真机）——
+    # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
+    # 纯静态，几毫秒。
+    ("音频流自愈", [PY, "tools/check_audio_watchdog.py"]),
     # 注入自检会真的发按键，无桌面会话里自己会 SKIPPED（不算失败）。
     # 它是唯一能拦住"SendInput 静默失效"和"组合键顺序错"的一关。
     #
