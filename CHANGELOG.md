@@ -7,6 +7,54 @@
 
 ---
 
+## 未发布（工具侧）：0x1812 这条路被 Windows 封死了 —— 按键到此为止
+
+2026-09-22 夜里，武哥授权跑了最后一个纯软件实验（`tools\takeover_hid_reports.py --go`，
+以管理员身份）：临时停掉遥控器那个 HID-over-GATT 节点，好让 `0x1812` 空出来自己订 Report。
+
+### 一、结论：不是我们没测成，是 **Windows 不许任何人让它放手**
+
+| 入口 | 结果 |
+|---|---|
+| `Disable-PnpDevice -InstanceId …` | ❌ `DISABLE_FAIL: 不支持`（= `ERROR_NOT_SUPPORTED`） |
+| `pnputil /disable-device "…"` | ❌ `Cannot disable critical system device`（**rc 却是 0**） |
+
+再只读查一下那个 devnode 的属性，原因一目了然：
+
+```
+DevNodeStatus = 0x0180000A   → DRIVER_LOADED | STARTED …
+                 ↑ 没有 DN_DISABLEABLE(0x08000000) 这一位
+Capabilities  = 0x80         → 只有 SURPRISEREMOVALOK
+InfPath       = hidbthle.inf （Windows 的 HOGP 驱动包）
+RemovalPolicy = 3            （EXPECT_ORDERLY_REMOVAL）
+```
+
+**没有 `DN_DISABLEABLE` ⇒ 设备管理器里「禁用设备」也是灰的 ⇒ 用户态没有任何办法。**
+节点禁不掉 → HOGP 栈一直占着 `0x1812` → 我们自己订就永远是 `ACCESS_DENIED`
+（实测正是如此，`特征枚举被拒：ACCESS_DENIED`）。
+
+⇒ **「自己订阅 `0x1812` 读遥控器按键」这条纯软件的路，到此为止。**
+再往下只剩内核过滤驱动或换硬件 —— 两条都不是本项目要走的（加硬件已被武哥否决）。
+收尾回读 `STATUS=OK`（其实压根没被禁掉，设备没受影响）。
+
+### 二、顺手发现的两件事
+
+1. **这台机器上同一个遥控器配对过两次**：`find_all` 出来两个 `'Chromecast Remote'`，
+   本地地址分别是 `04:7f:0e:f2:d2:94` 与 `04:7f:0e:90:11:01`（两块蓝牙）。
+   旧代码「挑第一个名字像遥控器的」从没被验证过 —— 现在会把整张表打出来再逐个试。
+2. **`pnputil` 失败也返回 `rc=0`**。只判返回码会把"没禁成"记成"禁成了"，
+   再拿这个假阴性去下结论。所以判据一律看输出**正文**，不看 rc。
+
+### 三、工具自身修掉的两个 bug（都是这次才暴露的）
+
+- `Start-Process -ArgumentList` 是**用空格把参数拼成一行**的：路径里有空格
+  （`D:\Pi Agent\…`）会被切断，python 一闪就退、什么都不打印 —— 于是"实验根本没跑"，
+  而外面只看得到"什么都没发生"（三次 UAC 都白点）。改成**相对路径 + `-WorkingDirectory`**。
+- GATT 那半换成"**全列 + 逐个 `from_id_async`**"（旧写法直接挑第一个，
+  真机上吃 `E_INVALIDARG`，而且一个设备名都没打出来，无从排查）。
+
+---
+
 ## v1.0.13：说完话不用再够鼠标 —— 但「要不要发」由你决定
 
 2026-09-17 武哥的原话：

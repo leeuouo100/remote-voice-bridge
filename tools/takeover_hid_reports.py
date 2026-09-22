@@ -69,23 +69,48 @@ HID_CONTROL_POINT = "00002a4c-0000-1000-8000-00805f9b34fb"
 HID_REPORT = "00002a4d-0000-1000-8000-00805f9b34fb"
 
 # 禁用 → 睡 → 启用，一条命令。放 PowerShell 里跑，Python 崩了也能恢复。
+#
+# ⚠ 两条路都要走：`Disable-PnpDevice`（SetupAPI / `DICS_DISABLE`）和
+#   `pnputil /disable-device`（另一套入口）。2026-09-22 真机实测第一条回
+#   `DISABLE_FAIL: 不支持`（elevated 下也一样）—— 只写一条的话，这个实验会永远
+#   卡在第一步，然后被记成"没测成"（好在没被记成"遥控器不发按键"）。
 PS_CYCLE = r"""
 $ErrorActionPreference = 'Stop'
 $id = $env:RVB_DEV_ID
+
+$how = 'none'
 try {
     Disable-PnpDevice -InstanceId $id -Confirm:$false
+    $how = 'pnpdevice'
     Write-Output 'DISABLED'
 } catch {
-    Write-Output "DISABLE_FAIL: $($_.Exception.Message)"
-    exit 1
+    Write-Output ("DISABLE_FAIL: " + $_.Exception.Message)
+    try {
+        $r  = (& pnputil /disable-device "$id" 2>&1 | Out-String).Trim()
+        $rc = $LASTEXITCODE
+        Write-Output ("PNPUTIL_DISABLE: rc=" + $rc + " | " + $r)
+        if ($rc -eq 0) { $how = 'pnputil'; Write-Output 'DISABLED' }
+    } catch {
+        Write-Output ("PNPUTIL_DISABLE_FAIL: " + $_.Exception.Message)
+    }
 }
+Write-Output ("DISABLE_HOW=" + $how)
+
 Start-Sleep -Seconds $([int]$env:RVB_HOLD_SEC)
+
+# 恢复：两条路都试一遍。**不能**按"刚才用哪条禁的"挑恢复方式 ——
+# 真没恢复回来的代价是用户设备哑掉，多试一条是免费的。
 try {
     Enable-PnpDevice -InstanceId $id -Confirm:$false
     Write-Output 'ENABLED'
 } catch {
-    Write-Output "ENABLE_FAIL: $($_.Exception.Message)"
-    exit 2
+    Write-Output ("ENABLE_FAIL: pnpdevice -> " + $_.Exception.Message)
+}
+try {
+    $r2 = (& pnputil /enable-device "$id" 2>&1 | Out-String).Trim()
+    Write-Output ("PNPUTIL_ENABLE: rc=" + $LASTEXITCODE + " | " + $r2)
+} catch {
+    Write-Output ("ENABLE_FAIL: pnputil -> " + $_.Exception.Message)
 }
 """
 
@@ -172,19 +197,41 @@ async def gatt_probe(seconds: int, say) -> tuple[int, str]:
 
     sel = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
     devs = await DeviceInformation.find_all_async_aqs_filter(sel)
-    tgt = None
-    for d in devs:
-        n = (d.name or "").lower()
-        if "remote" in n or "chromecast" in n:
-            tgt = d
-            break
-    if tgt is None:
-        return 0, "没找到已配对的遥控器"
 
-    try:
-        ble = await BluetoothLEDevice.from_id_async(tgt.id)
-    except OSError as e:
-        return 0, f"连不上遥控器：{e}"
+    # 先把已配对的 BLE 设备**全列出来**，再逐个试着打开。
+    # 2026-09-22 真机在这里翻过车：旧写法挑了第一个名字像遥控器的就直接
+    # `from_id_async`，报 `E_INVALIDARG（提供的设备 ID 不是有效的 BluetoothLEDevice
+    # 对象）`，而且**一个设备名都没打出来** —— 连"它挑的是谁"都查不到，
+    # 整个实验只能记成"没测成"。全列 + 逐个试，把"挑错"从可能性里去掉。
+    say(f"\n【已配对的 BLE 设备】共 {len(devs)} 个")
+    named: list = []
+    others: list = []
+    for d in devs:
+        nm = d.name or ""
+        hit = "remote" in nm.lower() or "chromecast" in nm.lower()
+        say(f"   {'→' if hit else ' '} {nm!r}  id={d.id[:78]}")
+        (named if hit else others).append(d)
+
+    ble = None
+    used = None
+    # 名字像遥控器的优先；一个都打不开再退到前 5 个别的（只是多开个句柄，
+    # 没有 0x1812 会被下面的服务枚举筛掉，不会误判）。
+    for d in (named + others[:5]):
+        try:
+            cand = await BluetoothLEDevice.from_id_async(d.id)
+        except OSError as e:
+            say(f"   ⚠ from_id_async({d.name!r}) 失败：{e}")
+            continue
+        if cand is None:
+            say(f"   ⚠ from_id_async({d.name!r}) 返回 None（配对记录可能已失效）")
+            continue
+        ble, used = cand, d
+        break
+    if ble is None:
+        if not devs:
+            return 0, "连不上遥控器：没枚举到任何已配对的 BLE 设备"
+        return 0, "连不上遥控器：所有已配对 BLE 设备都打不开（逐条原因见上）"
+    say(f"   ✔ 用上了：{used.name!r}")
     if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
         say("  BLE 未连接，等它醒来（按一下遥控器）最多 10 秒…")
         for _ in range(20):
@@ -378,6 +425,7 @@ def main() -> int:
 
     say("  等 Windows 放手…")
     disabled = False
+    ps_all: list[str] = []
     t0 = time.time()
     while time.time() - t0 < 25:
         line = p.stdout.readline()
@@ -389,6 +437,7 @@ def main() -> int:
         line = line.strip()
         if line:
             say("  PS> " + line)
+            ps_all.append(line)
         if "DISABLED" in line:
             disabled = True
             break
@@ -396,7 +445,7 @@ def main() -> int:
             break
     if not disabled:
         say("  ⚠ 没等到 DISABLED —— 可能没禁用成功（下面照样会试一次 GATT，"
-            "结果会被记成「没测成」）")
+            "结果会被记成「没测成」或「被 Windows 封死」）")
     time.sleep(2.0)                      # 给 PnP 一点稳定时间
 
     n, tag = asyncio.run(gatt_probe(a.seconds, say))
@@ -409,6 +458,19 @@ def main() -> int:
     for ln in rest.splitlines():
         if ln.strip():
             say("  PS> " + ln.strip())
+            ps_all.append(ln.strip())
+
+    # 「禁不掉」和「没测成」必须分开 —— 它们指向完全相反的下一步。
+    # 2026-09-22 真机：两个 API 都拒（`Disable-PnpDevice` 回「不支持」、
+    # `pnputil` 回「Cannot disable critical system device」），只读查得到那个
+    # devnode 的 DevNodeStatus 里**没有 `DN_DISABLEABLE` 位**（0x0180000A）。
+    # 这是**结论性**的：不是我们没测成，是 Windows 不许任何人让它放手。
+    ps_low = "\n".join(ps_all).lower()
+    disable_blocked = (not disabled) and (
+        "critical system device" in ps_low or "disable_fail" in ps_low
+        or "disable_how=none" in ps_low)
+    if disable_blocked:
+        say("  🚫 两个入口都拒绝禁用这个节点（见上面的 DISABLE_FAIL / PNPUTIL_DISABLE）")
     try:
         p.wait(timeout=hold + 40)
     except subprocess.TimeoutExpired:
@@ -430,6 +492,18 @@ def main() -> int:
         say("     遥控器的按键确实走 0x1812 —— 本项目可以自己订这个服务、")
         say("     按报告字节解按键：**纯软件就能把按键映射做出来，不用加硬件。**")
         say("     下一步是把这套订阅搬进主程序，并设计「什么时候让 Windows 让位」。")
+    elif disable_blocked:
+        say("  → 🚫 这条路被 **Windows 自己**封了 —— 不是「没测成」，"
+            "也不是「遥控器不发按键」：")
+        say("     `Disable-PnpDevice` 回「不支持」（＝ `ERROR_NOT_SUPPORTED`），")
+        say("     `pnputil /disable-device` 回「Cannot disable critical system device」。")
+        say("     只读查一下就知道为什么：这个 devnode 的 `DevNodeStatus`")
+        say("     **没有 `DN_DISABLEABLE` 位**（2026-09-22 真机 = `0x0180000A`，")
+        say("     设备管理器里「禁用设备」也是灰的）⇒")
+        say("     Windows 不许可用户态让它放手，`0x1812` 就一直被 HOGP 栈占着，")
+        say("     所以下面看到的是 `ACCESS_DENIED`。")
+        say("     ⇒ **用户态读遥控器 HID 报告这条路到此为止。**")
+        say("       再往下只剩内核过滤驱动或换硬件 —— 两条都不是这个项目要走的。")
     elif tag.startswith("特征枚举被拒") or "连不上" in tag or "没找到" in tag \
             or "没枚举到" in tag:
         say(f"  → ⚠ 没测成（{tag}）—— 这一轮**不能**下结论，请把报告发出来。")
