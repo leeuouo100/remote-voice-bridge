@@ -99,7 +99,10 @@ def bridge_running() -> bool:
 
 
 def main() -> int:
-    seconds = 45
+    # 默认 90 秒：测 "遥控器按键有没有到 Windows" 要按 11 个键，
+    # 45 秒太赶（一边读说明一边按），而窗口不够长时读到的 "0 条"
+    # 会被当成"按键没来"—— 那是**测量误差**冒充结论（09-22 就误读过一次）。
+    seconds = 90
     a = sys.argv[1:]
     for i, x in enumerate(a):
         if x == "--seconds" and i + 1 < len(a):
@@ -246,16 +249,30 @@ def main() -> int:
         # ── 实时监听 ──────────────────────────────────────────────
         say("\n" + "=" * 78)
         say(f" 现在开始 {seconds} 秒实时监听 —— 请**依次按遥控器的每个键**：")
-        say("   方向上下左右 → 确认 → 返回 → 主页 → 音量＋ → 音量－ → 静音")
+        say("   ① 先按这三个（当前最要紧）：确认 OK → 返回 ← → 主页 ⌂")
+        say("   ② 再按：方向上下左右 → 音量＋ → 音量－ → 静音")
         say("   （语音键走 ATVV，这里会看到 op 0x04；其它键看落在哪条通道）")
         say("=" * 78)
+        # ⚠ 倒计时不是装饰：这一段以前是"打印完立刻开始计时"，
+        #   用户还在读说明、手还没伸到遥控器上，窗口已经烧掉一截，
+        #   最后看到"0 条"还以为按键没来 —— 其实是**没来得及按**。
+        #   这也是本工具上最容易被误读成"结论"的地方（09-22 那次就是这么读的）。
+        for n in (3, 2, 1):
+            say(f"   ⏳ {n} 秒后开始，把手放到遥控器上…")
+            await asyncio.sleep(1.0)
+        say("   🟢 开始！现在按（下面这行会实时跳秒，跳满就是结束）")
         t0 = time.time()
+        last_tick = -1
         while time.time() - t0 < seconds and not stop.is_set():
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.2)
             el = time.time() - t0
-            if int(el) % 5 == 0:
+            tick = int(el)
+            # 每秒刷**一次**（原来是 int(el) % 5 == 0 → 同一秒里刷 5 遍，白屏）
+            if tick != last_tick:
+                last_tick = tick
                 tot = sum(len(v) for v in live_hits.values())
-                print(f"  … {el:4.1f}s / {seconds}s，共 {tot} 条", end="\r", flush=True)
+                print(f"  ⏱ 还剩 {seconds - tick:3d}s ｜ 已收到 {tot} 条  "
+                      f"（键盘事件会直接打印在下面）", end="\r", flush=True)
         say("")
         for key, ch, tok in subs:
             try:

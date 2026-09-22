@@ -96,6 +96,58 @@ def who(uuid_s: str) -> str:
     return KNOWN.get(uuid_s.lower(), "")
 
 
+# ── ATT 协议错误码（只列会在这台设备上真的出现的几个）─────────────────────
+_ATT_ERR = {
+    0x00: "无协议错误",
+    0x01: "Invalid Handle",
+    0x02: "Read Not Permitted",
+    0x03: "Write Not Permitted",
+    0x05: "Insufficient Authentication（对端要求认证链路）",
+    0x06: "Request Not Supported",
+    0x07: "Invalid Offset",
+    0x08: "Insufficient Authorization",
+    0x0A: "Attribute Not Found",
+    0x0C: "Insufficient Encryption Key Size",
+    0x0F: "Insufficient Encryption（对端要求加密链路）",
+}
+
+
+def _pe(result) -> int:
+    """从 WinRT 的 Gatt*Result 里取 ATT 协议错误码。
+
+    为什么非要有这一位：只看 `status` 时，"枚举被拒"只有
+    `AccessDenied` 一个词，而它对应**两种修法完全相反**的成因 ——
+      · 协议码 0    → 不是 ATT 拒的，是 Windows 侧（驱动/WinRT）挡的
+      · 协议码 5/15 → ATT 侧拒的：链路没加密/没认证
+    前者的修法是"让占用方放手"，后者是"修配对密钥"。
+    项目此前一直按前者走，就是因为没把这一位打出来。
+    取不到时返回 -1（表示"这个对象没提供"），不要瞎猜成 0。
+    """
+    for attr in ("protocol_error", "ProtocolError"):
+        try:
+            v = getattr(result, attr)
+        except (AttributeError, TypeError):
+            continue
+        if v is None:
+            continue
+        try:
+            return int(getattr(v, "value", v))
+        except (TypeError, ValueError):
+            continue
+    return -1
+
+
+def _pe_hint(pe: int) -> str:
+    if pe < 0:
+        return "这个对象没给协议码（更老的 WinRT 会这样），无法区分，请升级后再看"
+    name = _ATT_ERR.get(pe, f"ATT 0x{pe:02X}")
+    if pe == 0:
+        return f"{name} → 是 Windows 侧挡的（不是对端拒绝）"
+    if pe in (0x05, 0x0F, 0x0C):
+        return f"{name} → **链路加密/认证不足**：修配对（密钥），不是修「谁占着」"
+    return name
+
+
 def main() -> int:
     listen = 0
     argv = sys.argv[1:]
@@ -172,7 +224,8 @@ async def _run(listen: int) -> None:
     say("─" * 74)
     res = await ble.get_gatt_services_async()
     if res.status != GattCommunicationStatus.SUCCESS:
-        say(f"❌ 枚举服务失败 status={res.status}")
+        say(f"❌ 枚举服务失败 status={res.status} "
+            f"protocol_error={_pe(res)}  ← {_pe_hint(_pe(res))}")
         _save(L)
         return
 
@@ -184,7 +237,20 @@ async def _run(listen: int) -> None:
         say(f"\n  ▸ {su}  {('← ' + note) if note else '（未知/私有）'}")
         cr = await svc.get_characteristics_async()
         if cr.status != GattCommunicationStatus.SUCCESS:
-            say(f"      ⚠ 枚举特征失败 status={cr.status}")
+            # ⚠ 必须把 ATT 的 protocol_error 一起打出来 —— 只看 status 会把
+            #   **两种修法完全相反**的成因混成一个词「ACCESS_DENIED」：
+            #     · protocol_error == 0    → 不是 ATT 拒绝，是 Windows 侧
+            #                               （WinRT/驱动）把这条路挡在门外，
+            #                               典型就是某个驱动"占"着这个服务
+            #     · protocol_error == 5    → ATT 0x05 Insufficient Authentication
+            #                               对端要求**加密/认证链路**，而我们这条链路
+            #                               没加密（多半是没有 LTK）
+            #     · protocol_error == 15   → ATT 0x0F Insufficient Encryption
+            #                               同上，加密不足
+            #   前者的修法是"让占用方放手"，后者是"把配对（密钥）修好" ——
+            #   2026-09-23 之前本项目一直按前者推进，正是因为没有看这一位。
+            say(f"      ⚠ 枚举特征失败 status={cr.status} "
+                f"protocol_error={_pe(cr)}  ← {_pe_hint(_pe(cr))}")
             continue
         for ch in cr.characteristics:
             cu = str(ch.uuid)

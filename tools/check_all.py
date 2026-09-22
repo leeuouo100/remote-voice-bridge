@@ -36,6 +36,7 @@ STEPS = [
                   "tools/probe_gatt_hid.py", "tools/probe_hid_claim.py",
                   "tools/watch_all_channels.py",
                   "tools/probe_devnode_binding.py",
+                  "tools/probe_hogp_state.py",
                   "tools/takeover_hid_reports.py",
                   "tools/check_takeover_guard.py",
                   "tools/check_voice_session.py",
@@ -121,6 +122,13 @@ STEPS = [
     # （2026-09-22 真机：两个 audio_start 隔 19ms，第 2 个把会话关了）、
     # 松手不许结束会话、吞掉的事件不许静默。带 2 条反例自证。
     ("语音会话状态机", [PY, "tools/check_voice_session.py"]),
+    # 「按键在 Windows 上全没反应」这件事的**判词**。
+    # 2026-09-23 查到根因：配对记录里**没有 LE 密钥材料**（没有 LTK），
+    # 链路加不了密 → HOGP 订阅不到 HID 报告 → 遥控器发出去也没人接。
+    # 这条判词是整份报告里唯一"会给出行动建议"的地方：哪天有人顺手把它
+    # 改成永远打 ✅，就会把人引到错误的方向上。所以它脱离注册表单独可测，
+    # 带 6 项自检（含"两种输入的判词必须不一样"这条反例 —— 防止硬编码凑）。
+    ("按键不通的判词", [PY, "tools/probe_hogp_state.py", "--selftest"]),
 ]
 
 STEP_DEFAULTS = {"settle": 0.0, "retries": 0, "retry_hint": ""}

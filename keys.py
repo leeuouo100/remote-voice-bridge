@@ -315,6 +315,122 @@ def _verify_pressed(name: str) -> bool:
 _ECHO_TTL = 0.30
 _injected_at: dict[str, float] = {}
 
+# 「左右分体的键」的通用写法。真机日志里**同一个物理键会以两种名字出现**：
+#   `left shift`(scan=42) 和 `shift`(scan=42)、`left ctrl`(-162) 和 `ctrl`(29)、
+#   `left windows`(scan=91)。
+# 实测（2026-09-23）：只登记带左右的那一种时，
+#   was_self_injected('left shift')=True 却 ('shift')=False
+# ⇒ 我们**自己的**语音热键会以简称绕回 main.py 的键盘钩子，在日志里
+#   冒充成"遥控器按键"（查按键取证时被它带歪过），映射目标正好落回这些
+#   键名时还会自激。所以登记时把通用写法一起记上。
+#
+# ⚠ 只加在**登记侧**，不动 `_COMBO_ALIAS` —— 那张表参与键名解析，
+#   改它会把 `resolve` 的结果一起改掉（check_keymap 会拦，但没必要冒险）。
+_GENERIC_OF = {
+    "lctrl": "ctrl", "rctrl": "ctrl",
+    "lshift": "shift", "rshift": "shift",
+    "lalt": "alt", "ralt": "alt",
+    "lwin": "win", "rwin": "win",
+}
+
+
+# 我们发出的键名 → 钩子那边会报出来的名字（含 keyboard 库的规范叫法）。
+#
+# ⚠ 为什么必须自动推导、不能手写一张表：
+#   「同一个键、两个名字」在库和本模块之间有一整批 ——
+#     `escape` ↔ `esc`、`apps`/`applications` ↔ `menu`、
+#     `mute` ↔ `volume mute`、`vol_up` ↔ `volume up`、
+#     `nexttrack` ↔ `next track`、`browserback` ↔ `browser back` …
+#   回声防护是**纯字符串比对**，对不上的那一个就等于没防。
+#   手写必漏，而漏一个的后果是**自激**：
+#     映射表默认就把遥控器的静音键指向 `mute`；
+#     我们发 0xAD 出去，钩子在那边把它报成 `volume mute`；
+#     比对不上 ⇒ 当成"用户又按了一下静音" ⇒ 再发一次 ⇒ 无限循环。
+#   所以直接问库：先用 `_resolve_key` 求出 VK，再用
+#   `official_virtual_keys` 反查库给这个 VK 起的名字。
+#   （本文件刻意不硬依赖 keyboard —— 装不出来时退化成"只有本模块的键名"，
+#     不报错、不中断，只是少了这层保护。）
+_hook_name_cache: dict[str, tuple[str, ...]] = {}
+# keyboard 库的三张表：official_virtual_keys（VK→规范名）、to_name（钩子真正
+# 会报的名字）、scan_code_to_vk。用 `_kb_tables` 一次性拿到，拿不到就给 None。
+_kb_tables = None
+_kb_tried = False
+
+
+def _kb_load():
+    """惰性取 keyboard 库的内部表（拿不到返回 None，绝不抛）。"""
+    global _kb_tables, _kb_tried
+    if _kb_tried:
+        return _kb_tables
+    _kb_tried = True
+    try:
+        from keyboard import _winkeyboard as _w
+        _w._setup_name_tables()          # 幂等；钩子那边本来也会调用它
+        _kb_tables = (_w.official_virtual_keys, _w.to_name,
+                      _w.scan_code_to_vk)
+    except Exception:                                  # noqa: BLE001
+        _kb_tables = None
+    return _kb_tables
+
+
+def _names_from_vk(vk: int) -> set[str]:
+    """VK → 库会给它报的名字。"""
+    if not vk:
+        return set()
+    t = _kb_load()
+    if not t:
+        return set()
+    ent = t[0].get(vk)
+    return {str(ent[0]).strip().lower()} if ent else set()
+
+
+def _names_from_scan(scan: int, extended: int) -> set[str]:
+    """扫描码 → 库会给它报的名字。
+
+    ⚠ 这条路径必须单列：`win`、`;` 这些键在 `_resolve_key` 里走的是
+    **扫描码**通道（返回值 vk=0），只按 VK 查会漏 —— 实测漏掉了
+    `win` ↔ `left windows`，而 `win` 正是语音热键（左Ctrl+左Win+左Shift）的一段。
+    这里查的是库自己的 `to_name` 表，也就是钩子报名字时用的**同一张表**，
+    所以查出来就是权威答案，不用我再猜一次。
+    """
+    if not scan:
+        return set()
+    t = _kb_load()
+    if not t:
+        return set()
+    vk = t[2].get(scan)
+    if not vk:
+        return set()
+    names = t[1].get((scan, vk, extended, ()))
+    return {str(names[0]).strip().lower()} if names else set()
+
+
+def _hook_names_of(name: str) -> tuple[str, ...]:
+    """我们发的键名 → keyboard 库在钩子里会报出来的名字（可能为空元组）。"""
+    cached = _hook_name_cache.get(name)
+    if cached is not None:
+        return cached
+    got: set[str] = set()
+    spec = _resolve_key(name)
+    vk = spec[0] if spec else 0
+    scan = spec[1] if spec else 0
+    ext = 1 if (spec and spec[2] & _KEYEVENTF_EXTENDEDKEY) else 0
+    got.update(_names_from_vk(vk))
+    got.update(_names_from_scan(scan, ext))
+    try:
+        from keyboard._canonical_names import normalize_name as _kb_norm
+        for cand in (name, normalize_combo_part(name)):
+            try:
+                got.add(str(_kb_norm(cand)).strip().lower())
+            except (ValueError, TypeError):
+                continue
+    except Exception:                                  # noqa: BLE001
+        pass
+    got.discard("")
+    out = tuple(sorted(got))
+    _hook_name_cache[name] = out
+    return out
+
 
 def _mark_injected(name: str) -> None:
     """登记"这个键是我发的"。
@@ -322,6 +438,8 @@ def _mark_injected(name: str) -> None:
     同时登记归一化后的名字：我们发出去用的是本模块的键名（`win`、`ralt`），
     而键盘钩子回调里拿到的是 keyboard 库的叫法（`left windows`、`right menu`）——
     两边字符串对不上，只登记原文的话回声防护对这些键等于没生效。
+    另外把不带左右的**通用写法**（`_GENERIC_OF`）和**库那边的叫法**
+    （`_hook_names_of`）也记上。
     """
     raw = str(name).strip().lower()
     if not raw:
@@ -331,6 +449,14 @@ def _mark_injected(name: str) -> None:
     norm = normalize_combo_part(raw)
     if norm and norm != raw:
         _injected_at[norm] = exp
+    for n in (raw, norm):
+        if not n:
+            continue
+        gen = _GENERIC_OF.get(n)
+        if gen:
+            _injected_at[gen] = exp
+    for n in _hook_names_of(raw):
+        _injected_at[n] = exp
 
 
 def mark_injected(names) -> None:

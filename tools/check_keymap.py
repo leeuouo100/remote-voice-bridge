@@ -75,6 +75,80 @@ def _keyboard_lib_names() -> list[str]:
     return sorted(names)
 
 
+def _library_reported_names() -> set:
+    """keyboard 库**可能报出**的键名（归一化之后）—— 权威清单。
+
+    取 `_winkeyboard.to_name` 里每条的 `names[0]`：那正是钩子回调
+    `e.name` 的来源（`process_key` 里 `name = names[0]`），
+    再过一遍 `normalize_name`，与 `KeyboardEvent.__init__` 完全一致。
+
+    拿不到库时返回**空集合**，调用方据此跳过这项检查 ——
+    "拿不到清单"不等于"键名有问题"，不许把没测成说成测出来是坏的。
+    """
+    try:
+        import keyboard._winkeyboard as w
+        from keyboard._canonical_names import normalize_name as nn
+        w._setup_name_tables()
+        out = set()
+        for names in w.to_name.values():
+            if names:
+                out.add(nn(names[0]))
+        return out
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _main_key_map_names() -> list[str]:
+    """从 main.py 源码里取出 KEY_MAP 的键名。
+
+    用 ast 解析源码而不是 import main —— import 会启动整个程序。
+    """
+    import ast
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "main.py")
+    try:
+        src = open(path, encoding="utf-8", errors="replace").read()
+        tree = ast.parse(src)
+    except Exception:  # noqa: BLE001
+        return []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "KEY_MAP":
+                    return [k.value for k in node.value.keys
+                            if isinstance(k, ast.Constant)
+                            and isinstance(k.value, str)]
+    return []
+
+
+def audit_key_map(names, known) -> list[str]:
+    """KEY_MAP 的键名体检。抽成纯函数是为了能给反例（见 main 里第 6 步）。
+
+    为什么非要有这一项：键名写错的失效是**绝对静默**的 ——
+    那个按键永远匹配不上，而日志一个字都不说。遥控器按键本来就不来，
+    两件事叠在一起就再也查不出来了 —— `escape`（库只报 `esc`）
+    就是这么躺了整整一版。
+    """
+    out: list[str] = []
+    for n in names:
+        if len(n) == 1:
+            # 库用 MapVirtualKeyW(vk, VK_TO_CHAR) 兜底给多媒体键起了字母名：
+            # mute→'d'、vol_up→'b'、play/pause media→'g'…
+            # 映射它们等于劫持物理键盘的字母键（打字变调音量）。
+            out.append(f"KEY_MAP 里有单字母键名 {n!r} —— 会劫持物理键盘，必须删掉")
+            continue
+        if known and n not in known:
+            out.append(f"KEY_MAP 里的 {n!r} 是 keyboard 库**永远不会报出**的名字"
+                       f"（写错就是静默失效：按了没反应、日志也不留痕）")
+    return out
+
+
+# 每个遥控器按键都必须有一条能命中的映射（否则那个键永远没动作）。
+# 这里写的是"库真正会报的名字"，不是想当然的写法。
+_KEY_MAP_MUST_HAVE = ("home", "enter", "esc", "browser back",
+                      "up", "down", "left", "right")
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -124,12 +198,38 @@ def main() -> int:
         if _resolve_key(norm) is None and norm not in _SPECIAL:
             soft.append(f"{raw} → {norm}")
 
+    # 6. main.KEY_MAP 的键名必须都是 keyboard 库真会报出来的写法。
+    #    这一项守的是 `escape` vs `esc` 那类**静默失效**：
+    #    映射表里写着一个永远匹配不上的名字，按键就永远没动作，且不留痕。
+    km = _main_key_map_names()
+    known = _library_reported_names()
+    if not km:
+        errors.append("没能从 main.py 里解析出 KEY_MAP（源码结构变了？）")
+    else:
+        errors.extend(audit_key_map(km, known))
+        for need in _KEY_MAP_MUST_HAVE:
+            if need not in km:
+                errors.append(f"KEY_MAP 少了 {need!r} —— 遥控器对应的按键将永远没动作")
+
+        # ── 反例自证：把检查本身也测一遍 ──
+        # 不测的话，哪天 `_library_reported_names()` 悄悄返回空集合，
+        # 上面的断言会**全都不报**，这道闸就变成了摆设（本项目反复踩的坑）。
+        bad = audit_key_map(["escape"], known)
+        if known and not any("escape" in b for b in bad):
+            errors.append("反例失败：把死键名 'escape' 放进去居然没被拦下")
+        bad2 = audit_key_map(["b"], known)
+        if not any("单字母" in b for b in bad2):
+            errors.append("反例失败：单字母键名居然没被拦下")
+        if known and audit_key_map(["esc", "home", "enter"], known):
+            errors.append("反例失败：合法键名被误报")
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
         return 1
     print(f"OK {len(MAPPING_TARGETS)} 个目标动作 / {len(DEFAULT_KEYMAP)} 个按键 / "
-          f"{len(_RECORDER_MUST_WORK)} 个录制键名")
+          f"{len(_RECORDER_MUST_WORK)} 个录制键名 / "
+          f"KEY_MAP {len(km)} 个键名（含 3 条反例自证）")
     if soft:
         print(f"[提示] {len(soft)} 个冷门键名未覆盖（不影响使用）："
               + "、".join(soft[:12]) + ("…" if len(soft) > 12 else ""))

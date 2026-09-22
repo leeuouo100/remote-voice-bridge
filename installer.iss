@@ -8,7 +8,7 @@
 ;     tag 就是唯一真源 —— 避免"tag 打的是 1.0.3、装出来的还是 1.0.2"这种事故。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.14"
+  #define MyAppVersion "1.0.15"
 #endif
 
 #define MyAppName "Remote Voice Bridge"

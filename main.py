@@ -34,22 +34,33 @@ import mixer
 # 不能让输入法一直挂着听。这是本程序"管好语音功能"的一部分，不能指望用户记得。
 VOICE_MAX_SECONDS = 600
 
-# 松手后自动重开麦 → 遥控器多半会回一个 audio_start。
-# 这段时间内收到的 audio_start 是**我们自己触发的**，不是用户"第二次按下"，
-# 绝不能当成结束信号，否则会"刚开立刻被关"。
+# 我们每发一次 MIC_OPEN，遥控器就会回一个 audio_start（"我开始推流了"）。
+# 那一声不是用户按的，绝不能被当成"第二次按下"去结束会话 ——
+# 否则用户按下语音键的瞬间就会被自己关掉（"按一次它掉"）。
 #
-# ⚠ 窗口宽度是**双向**代价，不能随手调大（v1.0.13 血的教训）：
-#   · 太窄 → 回响漏过去 → 落到结束分支 → 会话被自己关掉（v1.0.12 的病）
-#   · 太宽 → 真按键被当成回响吞掉 → **用户当场用不了**（v1.0.13 的病）
-# 真机实测的时间尺度：
-#   · 回响：紧跟我们的 MIC_OPEN，实测 +17ms / +90ms / +300ms / +320ms 都有，
-#           最长不超过 ~350ms（2026-09-22 22:43 与 23:34 两段日志）
-#   · 用户真按键：最早也在"松手那次重开麦"之后 1 秒以上（人不可能 0.8s 内
-#     松手、再想好、再按下）
-# ⇒ 0.8s 落在 ~350ms 与 1s 之间，两边都留了余量：回响全盖住，真按键放过去。
-#   吞掉真按键的代价 = "多听一会儿，再按一下结束"（无害，往不做那边倒）；
-#   吞掉回响的代价 = "用户当场用不了"（不可逆）。
-MIC_REOPEN_GRACE = 0.8
+# ⚠⚠ 关键：回声是**遥控器收到 MIC_OPEN 之后**才发的，而我们记账的时刻是
+#   `ensure_mic_open()` 返回的那一刻 —— 那只是**把写入排进 BLE 线程**，
+#   真正的 GATT 写入可能慢到 1 秒才完成。v1.0.14 就是在这儿翻的车：
+#   它把窗口从 1.5 收到 0.8，而真机实测"排进队列 → 回声"最慢 1070ms
+#   → 那 8 次回声漏出窗口 → 被当成第二次按下 → **按下就掉**。
+#   真机日志（2026-09-23 00:18:35）：
+#     Audio START → TAP(开) → 补发 MIC_OPEN → [+969ms] Audio START(回声)
+#     → 又被判成真按键 → TAP(关) → 会话结束 → **用户一个字都没说上**
+#   对比同一晚成功的那次（00:18:39）：补发 → 写入完成只花 20ms → 回声落在窗口内。
+#
+# ⇒ 所以判据不能只看"过了多久"，还要有一条**该来还没来的回声**没到：
+#     pending_mic_echo > 0  且  距离那次 MIC_OPEN 不到 ECHO_MAX_AGE
+#   回声一到就把这条账销掉 —— 于是"回声之后 1.3 秒用户真按键"不会被误吞
+#   （旧写法只看时间窗，1.5s 内的真按键会被吞掉）。
+#
+# 真机实测（2026-09-23，239 次 MIC_OPEN，239 次都配上回声）：
+#   中位 20ms、最大 1070ms；>0.8s 有 8 次、>1.5s **0 次**
+# ⇒ ECHO_MAX_AGE = 1.5s：比实测最大值留 40% 余量。
+#
+# ⚠ 窗口宽度仍是**双向**代价，不许随手调：
+#   · 太窄 → 回声漏过去 → 会话被自己关掉（v1.0.12 的病）
+#   · 太宽 → 真按键被当成回声吞掉 → **用户当场用不了**（v1.0.13 的病）
+ECHO_MAX_AGE = 1.5
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 # 必须写到用户目录而不是程序目录：打包成 exe 后程序目录是 PyInstaller 的
@@ -621,10 +632,15 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # ── Protocol + Session ──
     atvv = ATVVProtocol()
 
-    def _send_tx(cmd: bytes, tag: str = "TX") -> bool:
+    def _send_tx(cmd: bytes, tag: str = "TX", on_sent=None) -> bool:
         """Write raw bytes to the ATVV TX characteristic (fire-and-forget).
 
         返回 True = **已成功投递到主事件循环**（写入本身异步进行）。
+
+        `on_sent`：GATT 写入**真正成功**时回调。别小看这个回调 ——
+        它跑在 BLE 线程上、发生在写入落地的那一刻，而"排队成功"和
+        "遥控器真的收到了"之间能差 1 秒。回声窗口必须锚在这儿（见
+        ECHO_MAX_AGE 那段注释）。
 
         ⚠ 必须用 run_coroutine_threadsafe 投递回主循环，不能在当前线程直接
         asyncio.get_event_loop().create_task() —— BLE 通知回调跑在 WinRT/COM
@@ -643,7 +659,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 w.write_bytes(cmd)
                 r = await tx_char.write_value_with_result_async(w.detach_buffer())
                 logger.info(f"📤 {tag} [{cmd.hex(' ')}] status={r.status}")
-                return r.status == GattCommunicationStatus.SUCCESS
+                ok = r.status == GattCommunicationStatus.SUCCESS
+                if ok and on_sent is not None:
+                    # 回调失败不能把已经成功的写入报成失败 —— 分开处理。
+                    try:
+                        on_sent()
+                    except Exception as e:                # noqa: BLE001
+                        logger.error(f"{tag} on_sent 回调失败: {e}")
+                return ok
             except Exception as e:
                 logger.error(f"{tag} write failed: {e}")
                 return False
@@ -660,17 +683,44 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             logger.error(f"{tag} schedule failed: {e}")
             return False
 
+    # ── 回声窗口的记账（两处调用点都不能少，见 ECHO_MAX_AGE 的注释）──────
+    def _mark_mic_open_scheduled():
+        """我们**刚排队**一次 MIC_OPEN —— 从现在起该来一声回声了。"""
+        nonlocal pending_mic_echo, mic_echo_since
+        pending_mic_echo += 1
+        mic_echo_since = time.time()
+
+    def _mark_mic_open_written():
+        """MIC_OPEN **真正写进 BLE** 了 —— 把窗口锚点挪到这一刻。
+
+        ⚠ 只挪时刻、**不加计数**：这是同一次 MIC_OPEN 的第二个事实，
+          不是新的一次。写成 `+= 1` 会让回声永远还剩一条账没销，
+          下一条真按键就可能被误吞。
+        ⚠ 只在"还欠着回声"时挪（pending_mic_echo > 0）：否则一次迟到的
+          写入回调会把已经销完账的窗口重新拉开。
+        """
+        nonlocal mic_echo_since
+        if pending_mic_echo > 0:
+            mic_echo_since = time.time()
+
     def _on_mic_open(sid: int):
         """Host 主动开麦 — 必须真正写入 BLE，否则遥控器不会推流。
 
         返回 None = 没发出去（构造失败或调度失败），调用方据此不置 mic_open_sent。
+
+        ⚠ MIC_OPEN 是**唯一**会引来回声的动作，所以"该来一声回声"这笔账
+          在这里记，而且只在真的排队成功之后记 —— 没排上就不会有回声，
+          记了账反而会让下一条真按键被吞（v1.0.13 就是这么全废的）。
         """
         try:
             cmd = atvv.mic_open_cmd()
         except Exception as e:
             logger.error(f"mic_open_cmd failed: {e}")
             return None
-        return cmd if _send_tx(cmd, "MIC_OPEN") else None
+        if not _send_tx(cmd, "MIC_OPEN", on_sent=_mark_mic_open_written):
+            return None
+        _mark_mic_open_scheduled()
+        return cmd
 
     def _on_mic_close(sid: int):
         try:
@@ -707,7 +757,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 两边都要有，缺一个都不行。
     voice_active     = False   # 语音会话是否正在进行
     voice_started_at = 0.0     # 本次会话开始时刻（超时兜底用）
-    mic_reopen_at    = 0.0     # 上次"松手后自动重开麦"的时刻（防自激用）
+    # 「我们发过 MIC_OPEN、但还没等到它那一声回声」的条数与时刻（防自激用）。
+    # 判据见 ECHO_MAX_AGE 那段注释 —— 不能只看时间，还要看这笔账还没销。
+    pending_mic_echo = 0
+    mic_echo_since   = 0.0
     ctl_token = aud_token = None
     stream    = None
     sysmic    = None
@@ -717,7 +770,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
-        nonlocal mic_reopen_at
+        nonlocal pending_mic_echo, mic_echo_since
         global _audio_frames, _audio_peak, _echo_swallowed
         last_ble_activity = time.time()
         try:
@@ -772,13 +825,18 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 #   （这是**静默失效**：不崩、不报错，UI 波形还在跳那 17 帧，
                 #     所以只能靠日志里"少了哪一行"来发现，不能靠崩溃提示。）
                 #
-                # 判据 = 距离**我们上一次发 MIC_OPEN** 过了多久：
-                #   · 回声一定紧跟我们的 MIC_OPEN：真机实测 +17ms、+90ms、
-                #     +300ms、+320ms 都是；最长不超过 ~350ms
-                #   · 用户真按键最早也在"松手那次重开麦"之后 1 秒以上
-                #   窗口给 MIC_REOPEN_GRACE(0.8s)：两种回声都盖住，真按键放过去。
+                # 判据 = 「我们欠遥控器一声回声，而这一下大概率就是它」：
+                #   · pending_mic_echo > 0            —— 发过 MIC_OPEN、回声还没到
+                #   · now - mic_echo_since < ECHO_MAX_AGE —— 那一声就在这一带
+                # 真机实测（2026-09-23，239 次 MIC_OPEN，239 次都配上了回声）：
+                #   延迟中位 20ms、最大 1070ms；>0.8s 有 8 次、>1.5s **0 次**。
+                #   ⚠ v1.0.14 把窗口设成 0.8s，依据是"回声最长 ~350ms"——
+                #     那个 350ms 是拿**排队时刻**量的**假数**：真正的 GATT 写入
+                #     可能慢到 1 秒，回声就跟着晚 1 秒，于是漏出窗口、被当成
+                #     真按键 → **按下就掉**（武哥 2026-09-23 报的正是这个）。
                 now = time.time()
-                is_echo = bool(mic_reopen_at) and (now - mic_reopen_at) < MIC_REOPEN_GRACE
+                is_echo = (pending_mic_echo > 0
+                           and (now - mic_echo_since) < ECHO_MAX_AGE)
                 # ── 语音会话状态机：**每一次按下 = 一次翻转** ──────────────
                 #   第 1 次按下 → 开始   第 2 次按下 → 结束
                 # 松手（audio_stop）不参与翻转，见下面那个分支的注释。
@@ -791,19 +849,24 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 #   那是我们自己触发的，不是用户"第二次按下" —— 当成结束就会
                 #   "刚开立刻被关"，必须在这里挡掉。
                 if is_echo:
-                    # 不是用户按的 → 吞掉。⚠ 这里**既不清零、也不刷新** mic_reopen_at：
-                    #   · 清零 = 只挡一次 → 第 2 个回响落进下面的结束分支，会话被自己关掉
-                    #   · 刷新 = 窗口永不过期 → 按键全被吞（v1.0.13 的下场）
-                    #   窗口只靠**时间**过期：任何事件都**不许**改它。
+                    # 不是用户按的 → 吞掉，并把这笔账销掉（回声到了）。
+                    # ⚠ 「销账」不等于「刷新窗口」，这里**只减计数、
+                    #   绝不动 mic_echo_since**：
+                    #   · 不动时刻 = 窗口只能靠时间过期，一条回声不可能把窗口续下去
+                    #     （v1.0.13 就是刷新时刻 → 窗口永不过期 → 按键全被吞）
+                    #   · 减去计数 = 回声之后再来真按键不会被误吞
+                    #     （旧写法只看时间窗：1.5s 内用户的真按键会被一起吞掉）
+                    pending_mic_echo = max(0, pending_mic_echo - 1)
                     _echo_swallowed += 1
                     if _echo_swallowed <= 3:
                         logger.info(
-                            f"↩ 忽略自动重开麦引来的回声 audio_start"
-                            f"（距上次 MIC_OPEN {now - mic_reopen_at:.2f}s"
-                            f" < {MIC_REOPEN_GRACE}s，本段第 {_echo_swallowed} 次）"
+                            f"↩ 忽略遥控器回给 MIC_OPEN 的回声 audio_start"
+                            f"（距我们发 MIC_OPEN {now - mic_echo_since:.2f}s"
+                            f" < {ECHO_MAX_AGE}s，本段第 {_echo_swallowed} 次，"
+                            f"还欠 {pending_mic_echo} 声）"
                         )
                     else:
-                        logger.debug("↩ 又是自动重开麦引来的回声，已忽略")
+                        logger.debug("↩ 又是 MIC_OPEN 引来的回声，已忽略")
                 elif not voice_active:
                     # 用户又开始说下一段了 → 上一条「待发送」显然不该再发出去。
                     # 例：说完一句觉得不对，紧接着按一下重说 —— 若不等这一下就
@@ -838,11 +901,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     #   **这一次（真按键）自己就落进了回声窗口**、当场被吞掉。
                     #   于是热键一次都没注入，输入法从头到尾没被叫起来。
                     #
-                    # 补发成功才记时刻 —— 这个时刻是给**下一个** audio_start
-                    # （遥控器收到 MIC_OPEN 后回的那声"我开始推流了"）用的，
-                    # 不是给这一次用的。顺序颠倒一次就再次踩同一个坑。
-                    if session.ensure_mic_open():
-                        mic_reopen_at = time.time()
+                    # ⚠ 这里**不再自己记时刻** —— 回声窗口的记账已经收进
+                    #   `_on_mic_open`（那个唯一会引来回声的地方）：
+                    #     排队成功 → 记一条"欠一声回声"
+                    #     写入成功 → 把窗口锚点挪到"遥控器真的收到了"那一刻
+                    #   旧写法把时刻记在这儿，记的是"排队成功"而不是"写入成功"
+                    #   —— 两者能差 1 秒，回声因此漏出窗口 → 按下就掉。
+                    #   顺序铁律仍然成立：判定在**前**、补开麦在**后**。
+                    session.ensure_mic_open()
                 else:
                     voice_hotkey_up()        # tap=再点按结束 / hold=松开结束
                     voice_active     = False
@@ -878,7 +944,6 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     #      （on_audio 与 decode_audio 都先看这个标志，audio_stop 时已被置 False）
                     if session.ensure_mic_open():
                         atvv.state.stream_active = True
-                        mic_reopen_at = time.time()
                         logger.info("🎤 松手后自动重新开麦 → 遥控器麦克风继续收音")
                     elif not session.state.mic_open_sent:
                         # ensure_mic_open 返回 False 有两种：已发过（正常），
@@ -1112,26 +1177,117 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     from keys import was_self_injected
 
     # 遥控器按键（HID）→ 内部 button_id。
-    # 键名是 keyboard 库的写法，必须和它实际报出来的名字一致，
-    # 否则这个按键在映射界面里改了也不会有反应。
+    #
+    # ⚠⚠ 这里的键名必须是 keyboard 库 **normalize_name() 之后**的样子。
+    #    钩子回调里的 `e.name` 在 `KeyboardEvent.__init__` 里被归一化过
+    #    （keyboard/_keyboard_event.py:32），它会：整体小写（长度>1 时）、
+    #    `_`→空格、再查一遍规范名表（keyboard/_canonical_names.py）。
+    #    那张表把 'escape'→'esc'、'return'→'enter'、' '→'space'、
+    #    'spacebar'→'space'、'applications'→'menu'、'left menu'→'left alt'、
+    #    'play/pause'→'play/pause media'。
+    #
+    # 🔴 2026-09-23 实测整改（别再写回去）：
+    #    旧表里有 4 个**永远不会命中**的死键名，其中 `escape` 是致命的 ——
+    #    库只会报 `esc`，于是"遥控器返回键"这条映射从一开始就是死的。
+    #    这次不是照文档猜，而是把库的 `to_name` 表整个跑了一遍
+    #    （见 CHANGELOG v1.0.15），拿到"钩子究竟可能报哪些名字"的**完整清单**。
+    #
+    # 🔴 三条不许违反的规矩：
+    #  ① 只写库真会报的名字。写错的代价是静默失效 —— 按了没反应，日志一片空白。
+    #  ② **绝不写单个字母**。本机实测（同一份清单）：库用
+    #     `MapVirtualKeyW(vk, VK_TO_CHAR)` 兜底给多媒体键起了字母名 ——
+    #     `mute`→'D'、`vol_down`→'C'、`vol_up`→'B'、`next track`→'P'、
+    #     `previous track`→'Q'、`stop media`→'J'、`play/pause media`→'G'、
+    #     `browser start and home`→'M'。
+    #     把 'B' 映射成 vol_up 就等于**劫持物理键盘的 B 键**（打字变调音量）。
+    #     所以这 8 个键**一律不进这张表**。
+    #  ③ 音量 / 静音 / 播放这些键本来也不该靠钩子：Windows 会把手电（消费类）
+    #     集合的按键翻成 WM_APPCOMMAND 而不是键盘事件，钩子根本看不到。
+    #     它们走的是**厂商页**那条路（`remote_hid.py` 直接读 0x2A4D 报告），
+    #     解出来的 button_id 直接进同一个 `resolve_button`，不经过这里。
     KEY_MAP = {
-        "browser start and home":     "home",
-        "browser home":               "home",
-        "home":                       "home",
-        "back":                       "back",
-        "browser back":               "back",   # HID 消费键，遥控器返回键常报这个名字
-        "enter":                      "ok",
-        "return":                     "ok",
-        "escape":                     "back",
-        "up":                         "up",
-        "down":                       "down",
-        "left":                       "left",
-        "right":                      "right",
-        "volume mute":                "mute",
-        "volume up":                  "vol_up",
-        "volume down":                "vol_down",
-        "media play pause":           "ok",
+        # 主页
+        "home":                       "home",     # 0x24
+        # 确认
+        "enter":                      "ok",       # 0x0D
+        "space":                      "ok",       # 0x20（确认键走键盘页时可能是空格）
+        # 返回
+        "esc":                        "back",     # 0x1B ⚠ 曾经写成 "escape"（死键名）
+        "browser back":               "back",     # 0xA6 消费键，遥控器返回键常报这个
+        # ⚠ 不要再写 "back" / "browser home" / "browser start and home" /
+        #   "return" / "volume up" 这些 —— 已用库的 `to_name` 表逐条实测，
+        #   它们**一个都不会**被报出来。`tools/check_keymap.py` 第 6 步会拦。
+        # 方向
+        "up": "up", "down": "down", "left": "left", "right": "right",
     }
+
+    # 这些名字是**真的**会被库报出来（实测清单里有），只是没有语义明确的内置动作。
+    # 用途只有一个：让日志把话说清楚 —— 出现它们说明按键
+    # **已经到 Windows 了**（这是好消息，问题不在蓝牙那一层），
+    # 而不是笼统一句"没有对应按钮"。
+    # ⚠ 刻意不硬凑映射：把 `browser refresh` 硬指向某个动作，
+    #   用户按物理键盘上的浏览器键也会中招。
+    REMOTE_LIKE_KEYS = {
+        "browser forward", "browser refresh", "browser stop",
+        "browser search key", "browser favorites",
+        "menu", "select", "select media", "start mail",
+        "start application 1", "start application 2",
+        "play", "page up", "page down",
+    }
+
+    def _library_key_names() -> set:
+        """keyboard 库**可能报出来**的全部键名（归一化之后的）。
+
+        做法：把库的 `to_name` 表整张跑一遍，取每条的 `names[0]` ——
+        那正是钩子回调里 `e.name` 的来源（`_winkeyboard.process_key` 里
+        `name = names[0]`），再过一遍 `normalize_name` 与
+        `KeyboardEvent.__init__` 完全一致。所以这就是权威清单，
+        不用我们照着文档猜（照文档猜正是 `escape` 那个死键名的来源）。
+
+        拿不到库（没装 / 换了实现）时返回空集合，此时**不报结论** ——
+        这一点很重要：拿不到清单不等于"键名有问题"，
+        不许把"没测成"说成"测出来是坏的"。
+        """
+        try:
+            from keyboard import _winkeyboard as _w
+            from keyboard._canonical_names import normalize_name as _nn
+            _w._setup_name_tables()
+            out = set()
+            for names in _w.to_name.values():
+                if names:
+                    out.add(_nn(names[0]))
+            return out
+        except Exception as e:                          # noqa: BLE001
+            logger.debug(f"取 keyboard 键名清单失败（跳过这项自检）：{e}")
+            return set()
+
+    def _audit_key_map_names() -> None:
+        """开机自检：KEY_MAP 里的键名，库真的会报出来吗？
+
+        为什么值得单项检查：写错键名的失效是**绝对静默**的 ——
+        那个按键永远匹配不上，而日志一个字都不说（"认不出"分支只在
+        **真收到事件**时才走）。遥控器按键本来就不来，两件事叠在一起
+        就再也查不出来了 —— `escape` vs `esc` 就是这么躺了整整一版的。
+        """
+        known = _library_key_names()
+        if not known:
+            return                                   # 拿不到清单 → 不出结论
+        dead = [k for k in KEY_MAP if k not in known]
+        if dead:
+            logger.error(
+                "❌ 按键映射表里有 %d 个**永远不会命中**的键名 %s —— "
+                "对应按键按下去不会有任何反应，而且日志不会留痕。"
+                "（键名必须是 keyboard 库归一化之后的写法，"
+                "例如库报 `esc` 而不是 `escape`）",
+                len(dead), dead,
+            )
+        else:
+            logger.info(
+                "✅ 按键映射自检：%d 个键名都能被 keyboard 库报出来",
+                len(KEY_MAP),
+            )
+
+    _audit_key_map_names()
 
     # keymap 缓存：按键事件可能一秒来好几个，不能每次都读一遍 config.json。
     # 用 mtime 判断是否被控制台/手改过 —— 改了立即生效，不用重启。
@@ -1318,11 +1474,26 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             #   无法区分。武哥的「静音键没反应」就卡在这个盲区里。
             # 同样只报一次（去重），物理键盘最多吵几十行就安静了。
             _seen_keys.add(e.name)
-            logger.info(
-                f"🔘 HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
-                f" → 没有对应按钮，已忽略"
-                f"（若这是遥控器上的键，请到控制台「按键映射」页给它指定动作）"
-            )
+            if e.name in REMOTE_LIKE_KEYS:
+                # ⚠ 这一条要说清楚"这是好消息"。
+                #   本机实测里出现过一种最容易被误读的情形：遥控器按键
+                #   **确实到了 Windows**（说明蓝牙/HID 那层是通的！），
+                #   但这个键名不在映射表里，于是日志只留一句"没有对应按钮"，
+                #   看起来和"按键根本没来"一模一样 —— 排查方向会整个走反。
+                logger.info(
+                    f"✅ HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
+                    f" → **已到 Windows**（这是遥控器/多媒体键盘上的功能键），"
+                    f"但目前没有对应动作，已忽略。"
+                    f" 它没进 KEY_MAP 是**刻意的**：这类键名要么语义不明确、"
+                    f"要么会被误当成普通字母，硬凑映射会劫持物理键盘。"
+                    f" 需要用它的话请把这一行发出来。"
+                )
+            else:
+                logger.info(
+                    f"🔘 HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
+                    f" → 没有对应按钮，已忽略"
+                    f"（若这是遥控器上的键，请到控制台「按键映射」页给它指定动作）"
+                )
 
         return True
 
