@@ -33,6 +33,22 @@
 > 那么 HID 报告**永远没人订阅**，遥控器当然一个键都送不进 Windows。
 > 这条假说以前没人验证过，因为它只能靠"在场判定"分出来，注册表看不出来。
 
+> ⚠ **2026-09-23 二次改判。** 本工具最初盯的是「0x1812 是不是少了一代」，
+> 后来改判成「配对记录里没有密钥」—— **第二个结论是错的**（详见下面
+> 「配对密钥材料」那段注释：它看的是元数据键，那里本来就不该有 LTK）。
+> 现在它按四段体检，并在最后给一段**综合判决**：
+>
+>   ① **密钥材料**：三态（读到 / 存在但空 / 读不到）。**读不到就只报读不到**，
+>      不给「没有密钥」的结论 —— 密钥键只放 SYSTEM。
+>   ② **Windows 此刻连没连着**（`ConnectionStatus`）：一条就能否掉
+>      「没连上所以收不到」这一整类解释。
+>   ③ 同一个遥控器有几条已配对条目。
+>   ④ 各 devnode 的在场判定（cfgmgr32）—— 分出「现在活着的那一代」和幽灵。
+>
+> 判词由 `bond_verdict()` 这个**纯函数**给出，`--selftest` 用反例钉住
+> 「四种输入必须四种判词」，防止哪天被改成永远打 ✅ 或又把人引到错方向。
+
+
 用法
 ====
     python tools\\probe_hogp_state.py              # 只读，不按任何键
@@ -224,18 +240,52 @@ def short(instance_id: str) -> str:
     return s
 
 
-# ── 配对密钥材料 ─────────────────────────────────────────────────────────────
-# Windows 把 BLE 的绑定材料存在
-#   HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\<远端地址>
-# 正常绑定完一台 BLE 设备，这里应该有 LTK / IRK / Address / AddressType …
-# **没有 LTK 就意味着这条链路不可能加密**，而 HID over GATT 规范要求
-# 加密链路 —— 于是 Windows 的 HOGP 永远订阅不到 HID 报告，
-# 遥控器的按键也就永远没有接收方。
+# ── 配对密钥材料：到底存在哪一层 ─────────────────────────────────────────────
+# ⚠⚠ 2026-09-23 二次改判。上一版这里写错了，别再改回去：
 #
-# ⚠ 这份判断只在**能读到**时才给结论（Keys 分支需要管理员）。
-#   读不到就说读不到 —— 「真空」和「被 ACL 拒」必须分开说。
-_BOND_VALUES = ("Address", "AddressType", "IRK", "LTK", "KeyLength",
-                "CSRK", "EDIV", "ERand")
+# 上一版是这么推的：读 `BTHPORT\Parameters\Devices\<远端地址>`，看到里面没有
+# LTK/IRK/CSRK，就下结论「配对记录里没有密钥 ⇒ 链路加不了密 ⇒ HOGP 收不到报告」。
+# **那个结论是错的。** `Devices\<远端>` 本来就是**元数据**键
+# （Name / LEName / VID / PID / LEAppearance / Fingerprint* / LastSeen…），
+# 它**从来就不该有** LTK —— 在那里"没找到 LTK"是**正常状态**，不是异常。
+# 拿它当证据，等于"在抽屉里找不到牛奶，就断定冰箱里没有牛奶"。
+#
+# BLE 绑定材料真正的存放位置（ArchWiki 与 BlueVein 交叉核实）：
+#   A. 经典蓝牙(BR/EDR) ：BTHPORT\Parameters\Keys\<适配器MAC>           值名 = 设备MAC
+#   B. BLE（BT 5.1 起）：BTHPORT\Parameters\Keys\<适配器MAC>\<设备MAC>\
+#                         子键里放 LTK / KeyLength / EDIV / ERand / IRK / CSRK
+#   C. 部分 Windows 版本：BTHLE\Parameters\Keys\<适配器MAC>\<设备MAC>\
+#
+# ⇒ 注意 A 与 B 是**同一个父键的两种形态**，而这个父键 **只放 SYSTEM**
+#   （ArchWiki 原话：只有一个不可登录的 SYSTEM 账户能访问它），
+#   非 SYSTEM 一律 Access Denied ⇒ **读不到就只是读不到，不能当"没有"**。
+#
+# 所以本工具的口径是**三态**：读到了 / 存在但空 / 读不到（被拒或不存在）。
+# 只有"读到了"才允许下结论 —— 本项目已经踩过一次"被 ACL 拒当成空"，
+# 不许再踩第二次。
+_BOND_VALUES = ("LTK", "IRK", "CSRK", "EDIV", "ERand", "KeyLength",
+                "Authenticated", "Address", "AddressType")
+
+READ_OK = "ok"           # 读到了（键能打开、里面有几个值）
+READ_EMPTY = "empty"     # 键能打开，但一个值都没有
+READ_DENIED = "denied"   # 读不到：被 ACL 拒，或这个键在本机不存在
+
+
+def _bond_paths(adapter: str, remote: str) -> list:
+    """BLE 绑定材料**可能**存放的全部位置 → [(标签, 注册表路径), …]
+
+    一次全试，是因为不同 Windows 版本用不同分支（见上面 A/B/C）。
+    `adapter` 拿不到时只留"整个分支"那一项，仍然有意义（能看出被不被拒）。
+    """
+    bt = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys"
+    le = r"SYSTEM\CurrentControlSet\Services\BTHLE\Parameters\Keys"
+    out = []
+    if adapter:
+        out.append(("BTHPORT\\Keys\\<适配器>  (经典：值名=设备MAC)", f"{bt}\\{adapter}"))
+        out.append(("BTHPORT\\Keys\\<适配器>\\<设备>  (BLE 5.1+)", f"{bt}\\{adapter}\\{remote}"))
+        out.append(("BTHLE\\Keys\\<适配器>\\<设备>", f"{le}\\{adapter}\\{remote}"))
+    out.append(("BTHLE\\Keys  (整个分支)", le))
+    return out
 
 
 def _reg_read(path):
@@ -297,31 +347,77 @@ def _live_adapter_addr() -> str:
     return ""
 
 
-def bond_verdict(present) -> list:
-    """绑定材料清单 → 判词。**纯函数**，这样能给反例（见 --selftest）。
+def bond_probe(adapter: str, addr: str) -> list:
+    """把候选位置全试一遍 → [(标签, 三态, 值名列表), …]
 
-    为什么抽出来：这段判词是整份报告里唯一"会给出行动建议"的地方。
-    哪天有人顺手把它改成永远打 ✅，报告就会把人引到错误的方向上去 ——
-    所以它必须能被脱离注册表单独测。
+    ⚠ 三态必须分开：`READ_DENIED`（读不到）和 `READ_EMPTY`（真的空）
+    是**两回事**，混在一起就会得出完全相反的结论（本项目踩过）。
     """
-    have = set(present or ())
-    if "LTK" not in have:
+    out = []
+    for label, path in _bond_paths(adapter, addr):
+        vals, err = _reg_read(path)
+        if err is None:
+            names = sorted(vals)
+            state = READ_OK if names else READ_EMPTY
+        else:
+            names, state = [], READ_DENIED
+        out.append((label, state, names))
+    return out
+
+
+def bond_verdict(states) -> list:
+    """绑定材料的三态 → 判词。**纯函数**，这样能给反例（见 --selftest）。
+
+    `states` = [("位置标签", READ_OK|READ_EMPTY|READ_DENIED, [值名…]), …]
+
+    为什么必须抽成纯函数：这是整份报告里唯一「会给出行动建议」的地方。
+    上一版恰恰是在这里犯了错 —— 把「读不到」当成「没有」。
+    所以它必须能脱离注册表单独测，并用反例钉住"四种输入四种判词"。
+    """
+    ok = [p for p in states if p[1] == READ_OK]
+    empty = [p for p in states if p[1] == READ_EMPTY]
+
+    if ok:
+        have = set()
+        for _label, _st, vals in ok:
+            have |= set(vals)
+        if "LTK" in have:
+            return [
+                f"  ✅ 判决：**读到了绑定材料，里面有 LTK**（{sorted(have)}）。",
+                "     含义：键能读、密钥也在 ⇒ 这台设备的 BLE 链路能加密。",
+                "           那么「因为没有密钥，所以 HOGP 收不到报告」这条解释",
+                "           **不成立**，方向要转到「报告到底落在哪一层」。",
+                "     下一步：退出桥程序后跑",
+                "           `python tools\\watch_all_channels.py --seconds 90`，",
+                "           按 确认/返回/主页，看落在键盘层、鼠标层还是厂商页。",
+            ]
         return [
-            "  🔴 判决：**没有 LTK**（长期密钥），绑定材料是残缺的。",
-            "     含义：Windows 手里没有这台遥控器的长期密钥 ⇒ 这条 BLE 链路",
-            "           **无法加密**。而 HID over GATT 是要求加密链路的 ——",
-            "           所以 Windows 的 HOGP 驱动永远订阅不到 HID 报告：",
-            "           遥控器把按键发出去，也没有接收方。",
-            "     ⚠ 这就解释了那个一直查不通的现象：配对状态显示「已配对」、",
-            "       设备管理器里一切正常（已启动、Problem=None、5 路集合都在），",
-            "       但按键一个都到不了 Windows，映射表改到天亮也没用。",
-            "     下一步：**重新配对**（见本报告末尾）。",
+            f"  🔴 判决：**读到了这个键，但里面没有 LTK**（只有 {sorted(have) or '空'}）。",
+            "     含义：键存在、我们也有权读 ⇒ 这不是「读不到」，是真的缺长期密钥。",
+            "           HID over GATT 要求加密链路，缺 LTK 就加不了密 ⇒",
+            "           HOGP 订阅不到 HID 报告 ⇒ 遥控器发出去也没有接收方。",
+            "     下一步：**重新配对**（手法见本报告末尾）。",
         ]
+
+    if empty:
+        return [
+            "  🔴 判决：绑定材料的键**能打开，但里面一个值都没有**。",
+            "     含义：这是真的空（不是被 ACL 拒）⇒ 这台设备没有可用的密钥材料。",
+            "     下一步：**重新配对**（手法见本报告末尾）。",
+        ]
+
     return [
-        f"  ✅ 判决：绑定材料齐全（{sorted(have)} 里含 LTK）。",
-        "     那么「没人订阅 HID 报告」这条解释不成立，要另找原因 ——",
-        "     下一步跑 `python tools\\watch_all_channels.py --seconds 90`",
-        "     看按键到底落在哪条通道上。",
+        "  ⚪ 判决：**无法判定** —— 上面这几个位置一个都读不到。",
+        "     这不是「没有密钥」，是「我们没权限看」：",
+        "       · `BTHPORT\\Parameters\\Keys` **只放 SYSTEM**",
+        "         （ArchWiki 原话：只有一个不可登录的 SYSTEM 账户能访问它）",
+        "       · 真机实测拿到 `WinError 5`（拒绝访问）就是这条路",
+        "     ❗ 上一版工具在这里下了「没有密钥」的结论，**那是错的**：",
+        "        它看的是元数据键（`Devices\\<远端>`），那里本来就不该有 LTK。",
+        "     想真拿到答案只有两条路（今晚都不必做）：",
+        "       ① 以 SYSTEM 身份读一次（PsExec -s，或建一个一次性计划任务）；",
+        "       ② 直接**重新配对**：重配后若按键通了，说明原来那份绑定确实是坏的。",
+        "     在那之前，本工具**不给「密钥缺失」的结论**。",
     ]
 
 
@@ -336,49 +432,52 @@ def selftest() -> int:
             bad += 1
 
     chk("LTK" in _BOND_VALUES, "_BOND_VALUES 里必须含 LTK —— 否则这项检查形同虚设")
-    t1 = "\n".join(bond_verdict([]))
-    chk("🔴" in t1 and "没有 LTK" in t1, "空材料 → 判成缺 LTK")
-    t2 = "\n".join(bond_verdict(["LTK", "IRK"]))
-    chk("✅" in t2 and "🔴" not in t2, "有 LTK → 判成齐全")
-    t3 = "\n".join(bond_verdict(["IRK", "CSRK"]))
-    chk("🔴" in t3, "只有 IRK/CSRK、没有 LTK → 仍然判缺（LTK 加密必备）")
-    t4 = "\n".join(bond_verdict(None))
-    chk("🔴" in t4, "None → 也判缺（不许把 None 当齐全）")
-    # 反例：判词必须**跟着输入变**，不能是硬编码的一句话
-    chk(t1 != t2, "反例：两种输入的判词必须不一样（否则就是硬编码凑的）")
+    t_denied = "\n".join(bond_verdict([("p", READ_DENIED, [])]))
+    chk("无法判定" in t_denied and "🔴" not in t_denied,
+        "全部读不到 → 必须判「无法判定」，**不许**判成「没有密钥」（上一版就错在这）")
+    chk("LTK" in t_denied, "「无法判定」那段也要讲清在找什么（LTK）")
+    chk("元数据" in t_denied,
+        "「无法判定」那段要写明上一版错在哪（元数据键）—— 否则下次还会犯")
+    t_ok = "\n".join(bond_verdict([("p", READ_OK, ["LTK", "IRK"])]))
+    chk("✅" in t_ok and "🔴" not in t_ok, "读到 LTK → 判成齐全")
+    t_nolk = "\n".join(bond_verdict([("p", READ_OK, ["IRK", "CSRK"])]))
+    chk("🔴" in t_nolk, "读到了但没有 LTK → 仍判缺（LTK 是加密必备）")
+    t_empty = "\n".join(bond_verdict([("p", READ_EMPTY, [])]))
+    chk("🔴" in t_empty and "无法判定" not in t_empty,
+        "存在但空 → 判成「真的空」，必须与「读不到」分开说")
+    chk(len({t_denied, t_ok, t_nolk, t_empty}) == 4,
+        "反例：四种输入的判词必须两两不同（否则就是硬编码凑的）")
     print()
     print(f"SELFTEST {'PASS' if bad == 0 else f'FAIL（{bad} 项）'}")
     return 1 if bad else 0
 
 
 def bond_section(addr: str) -> dict:
-    """配对账本体检 → {record, present, missing, adapter, servicesfor, err}"""
-    reg_path = (r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices"
-                + "\\" + addr)
-    vals, err = _reg_read(reg_path)
+    """配对账本体检 → {'states': …, 'adapter': …}"""
     print("=" * 78)
-    print(" 配对账本：这台遥控器到底有没有 BLE 密钥材料？")
+    print(" 配对账本：这台遥控器到底有没有 BLE 密钥材料？（三态，不含糊）")
     print("=" * 78)
-    if err is not None:
-        print(f"  ⚠ 读不到 {reg_path}")
-        print(f"      Windows 错误：{err}")
-        print("      「读不到」不等于「没有」—— 要下结论请用提权后的会话再跑一次。")
-        return {"err": err}
-    if not vals:
-        print(f"  🔴 记录存在但**一个值都没有**：{reg_path}")
-        return {"err": None, "present": [], "missing": list(_BOND_VALUES)}
-
-    present = [n for n in _BOND_VALUES if n in vals]
-    missing = [n for n in _BOND_VALUES if n not in vals]
-    print(f"  记录：{reg_path}")
-    print(f"  找到的绑定材料：{present or '（一个都没有）'}")
-    print(f"  缺失的绑定材料：{missing or '（无）'}")
+    meta = (r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices"
+            + "\\" + addr)
+    adapter = _live_adapter_addr()
+    print(f"  当前在用的本地适配器地址：{adapter or '（没找到在场适配器）'}")
+    print()
+    states = bond_probe(adapter, addr)
+    mark = {READ_OK: "✅读到", READ_EMPTY: "🔴存在但空", READ_DENIED: "⚪读不到"}
+    for label, st, names in states:
+        print(f"  {mark[st]:<12}{label}")
+        if st == READ_OK:
+            bond = [n for n in _BOND_VALUES if n in names]
+            print(f"              绑定材料 = {bond or '（一个都没有）'}")
+            other = [n for n in names if n not in _BOND_VALUES]
+            if other:
+                print(f"              其它值   = {other}")
 
     # ServicesFor<本地地址>：配对记录是**按本地无线电地址**绑的
     import winreg
     subs = []
     try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as k:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, meta) as k:
             i = 0
             while True:
                 try:
@@ -388,23 +487,78 @@ def bond_section(addr: str) -> dict:
                 i += 1
     except OSError:
         pass
-    adapter = _live_adapter_addr()
     svcfor = [s[len("ServicesFor"):].lower() for s in subs
               if s.startswith("ServicesFor")]
     print(f"  ServicesFor（记录绑的本地地址）：{svcfor or '（无）'}")
-    print(f"  当前在用的本地地址            ：{adapter or '（没找到在场适配器）'}")
+    if adapter and svcfor and adapter not in svcfor:
+        print("  ⚠ 记录绑的本地地址与当前在用的**对不上** —— 这是 v1.0.10 那种老毛病：")
+        print("     跑 `python pairing.py --fix` 把记录迁到当前地址。")
 
     print()
-    for line in bond_verdict(present):
+    for line in bond_verdict(states):
         print(line)
 
-    if adapter and svcfor and adapter not in svcfor:
-        print()
-        print(f"  ⚠ 另外：记录绑的是 {svcfor}，当前本地地址是 {adapter} —— 对不上。")
-        print("     这是本项目 v1.0.10 处理过的老毛病（换 USB 口 → 本地地址变）：")
-        print("     跑 `python pairing.py --fix` 把记录迁到当前地址。")
-    return {"present": present, "missing": missing,
-            "adapter": adapter, "servicesfor": svcfor}
+    # ── 对照：元数据键。**特意打出来**，就是为了防止有人再拿它当证据 ──
+    mvals, merr = _reg_read(meta)
+    print()
+    print("  ── 对照：元数据键（**这里本来就不该有 LTK，别再拿它下结论**）")
+    if merr is not None:
+        print(f"     ⚠ 读不到 {meta}：{merr}")
+    else:
+        print(f"     {meta}")
+        print(f"     值名：{sorted(mvals)}")
+        print("     这些都是名字 / VID / PID / 外观 / 时间戳一类的**元数据**；")
+        print("     在本机它一个密钥值都没有 —— 这是**正常**的，不构成任何结论。")
+    return {"states": states, "adapter": adapter}
+
+
+def connection_section() -> dict:
+    """Windows 蓝牙栈**此刻**到底连没连着这台遥控器？
+
+    这一条能一眼否掉一整类解释：「没连上，所以收不到按键」。
+    实测口径：
+      Connected    ⇒ 链路是活的，收不到报告就得往上层找（不是蓝牙没连）
+      Disconnected ⇒ Windows 手里没有这条链路，HOGP 无处订阅，
+                     遥控器的按键报告**不可能**到达 Windows（与密钥无关）
+    """
+    print()
+    print("=" * 78)
+    print(" Windows 此刻连没连着这台遥控器？（WinRT ConnectionStatus）")
+    print("=" * 78)
+    try:
+        import asyncio
+        from winrt.windows.devices.bluetooth import (
+            BluetoothLEDevice, BluetoothConnectionStatus)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  （跳过：没有 winrt 环境 —— {e}）")
+        return {}
+    try:
+        target = int(ADDR_TAG, 16)
+    except ValueError:
+        print(f"  ⚠ ADDR_TAG 不是合法的十六进制地址：{ADDR_TAG!r}")
+        return {}
+
+    async def go():
+        d = await BluetoothLEDevice.from_bluetooth_address_async(target)
+        return None if d is None else int(d.connection_status)
+
+    try:
+        st = asyncio.run(go())
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  （跳过：查询失败 —— {e.__class__.__name__}: {e}）")
+        return {}
+    if st is None:
+        print("  ⚠ 拿不到设备对象（可能根本没配过对）。")
+        return {}
+    if st == int(BluetoothConnectionStatus.CONNECTED):
+        print("  ✅ Connected（连着）")
+        print("     含义：链路是活的 ⇒「因为没连上，所以收不到按键」**不成立**。")
+        print("           报告没到就得往「设备到底发不发」「落在哪一层」去找。")
+    else:
+        print("  🔴 Disconnected（没连）")
+        print("     含义：Windows 手里没有这条链路 ⇒ HOGP 无处订阅 ⇒")
+        print("           遥控器的按键报告不可能到达 Windows（与密钥无关）。")
+    return {"status": st}
 
 
 def paired_entries_section() -> list:
@@ -452,30 +606,77 @@ def paired_entries_section() -> list:
     return rows
 
 
-def fix_hint_section(bond: dict) -> None:
+def verdict_section(conn: dict, bond: dict) -> None:
+    """把「已确定 / 未确定 / 下一步」三件事一次说清。
+
+    ⚠ 上一版这里写的是「修法只有一条：重新配对」。那是**错的** ——
+    在「密钥读不到」和「报告可能落在厂商页」这两支都不排除之前，
+    重配既不是唯一的路，也不一定是路。
+    """
     print()
     print("=" * 78)
-    print(" 下一步怎么做（按顺序，做完一条跑一次 `python tools\\watch_all_channels.py`）")
+    print(" 综合判决：能确定什么、不能确定什么、下一步做什么")
     print("=" * 78)
-    print("  ① 【先做，1 分钟，零风险】把遥控器按进配对模式，让 Windows 重新绑定：")
-    print("       · 遥控器上**同时按住「返回」和「主页」约 3 秒**，")
-    print("         底部指示灯开始闪 = 已进入配对模式（这是 Google 官方口径）")
-    print("       · Windows：设置 → 蓝牙和其他设备 → 添加设备 → 蓝牙")
-    print("         （先把列表里旧的那条「Chromecast Remote」**删除**再添加）")
-    print("       · 等它连上，然后按遥控器的 确认 / 返回 / 主页")
-    print("     ⚠ 这一步要人手按遥控器，程序替不了。")
+    # ── 账本那一段的结论**算出来**，不写死 ──
+    # 上一版这里是写死的一句「未确定：有没有 LTK」，而账本那一节实测**读到了**
+    # LTK —— 写死的判词会和实测打架。本项目反复踩过这个坑（判词必须跟着输入变）。
+    states = (bond or {}).get("states") or []
+    have = set()
+    for _l, st, vals in states:
+        if st == READ_OK:
+            have |= set(vals)
+    if "LTK" in have:
+        bond_line = ("     · ✅ **已排除**：「没有密钥所以 HOGP 收不到报告」不成立 ——"
+                     "绑定材料是完整的\n"
+                     "       （LTK/IRK/CSRK/EDIV/ERand/KeyLength/Address/AddressType 都读到了）"
+                     "⇒ 链路能加密")
+    elif states and all(s[1] == READ_DENIED for s in states):
+        bond_line = ("     · ⚪ 未确定：绑定材料**读不到**（密钥键只放 SYSTEM）——"
+                     "这是「没权限看」，不许当成「没有」")
+    else:
+        bond_line = "     · 🔴 绑定材料不完整（读到了但缺 LTK）—— 明细见上面那一节"
+
+    print("  ✅ 已确定（每条都有测量方式，不是推断）：")
+    if (conn or {}).get("status") == 1:      # 1 = BluetoothConnectionStatus.CONNECTED
+        print("     · Windows 与遥控器之间有**活链路**（ConnectionStatus = Connected）")
+    else:
+        print("     · 连接状态见上面那一节 —— 若不是 Connected，下面几条要重读")
+    print("     · 设备侧节点齐全：服务节点在场已启动、HOGP 驱动绑着、5 路 HID 集合在")
+    print("     · 键盘钩子从未见过遥控器独有的键名")
+    print(bond_line)
     print()
-    print("  ② 【重配成功后】验证密钥有没有真的生成：")
-    print("       python tools\\probe_hogp_state.py      ← 看「找到的绑定材料」里有没有 LTK")
-    print("       有 LTK 才说明这次配对是**完整**的。")
+    print("  ⚪ 仍未定（不许再当成已定）：")
+    print("     · 遥控器到底**发不发**按键 HID 报告？发的话**落在哪一层**？")
     print()
-    print("  ③ 【验证按键】长窗口、带倒计时，别一边读说明一边按：")
-    print("       python tools\\watch_all_channels.py --seconds 90")
-    print("       （要听 ATVV 就先退出桥程序；带着它测加 --force）")
+    print("  🔑 还有一支没被排除，而且这一支**纯软件可修**：")
+    print("     键盘钩子**看不见**鼠标页（Col03）和厂商页（Col04 0xFF01 / Col05 0xFF80）。")
+    print("     如果按键发在厂商页，Windows 什么都不做、谁都收不到 ——")
+    print("     但本项目**可以自己去读那份报告**、自己映射成按键，不必重新配对。")
+    print("     （仪器现成：`hidwatch.ReportWatcher`，键盘钩子 + 鼠标钩子 +")
+    print("       5 路原始报告流三层同挂。）")
     print()
-    print("  ④ 【如果重配后还是没有 LTK】那就是这台机器上 Windows 的 HOGP 走不通，")
-    print("     退路是：把遥控器当**纯语音遥控器**用（语音键走 ATVV，一直好用），")
-    print("     按键就别指望了 —— 硬件/协议层面的限制，软件补不上。")
+    print("  下一步（按顺序做，别跳）：")
+    print("   ① 先**退出桥程序**（托盘右键「退出」），然后跑：")
+    print("        python tools\\watch_all_channels.py --seconds 90")
+    print("      它有 3-2-1 倒计时；**倒计时结束再开始按**，按 确认 / 返回 / 主页。")
+    print("      同一次按键出现在哪一层，就是结论：")
+    print("        键盘层     → 问题在我们这层的映射/注入（纯软件能修）")
+    print("        鼠标层     → Windows 当鼠标了（要另外处理）")
+    print("        厂商页     → Windows 不翻译 ⇒ 自己读报告（纯软件能修）")
+    print("        哪层都没有 → 报告根本没来，才轮到下面两步")
+    print()
+    print("   ② 一层都没有 ⇒ 先看体检（只读、不改任何东西）：")
+    print("        python tools\\takeover_hid_reports.py")
+    print("      确认要试再 --go（需管理员，非破坏性：临时停 HOGP 节点，")
+    print("      然后自己订 0x1812）—— 它能把「遥控器到底发不发按键报告」一次说死。")
+    print()
+    print("   ③ 只有到「确实一条都不发」、或「必须读一次 SYSTEM 密钥才能落定」时，")
+    print("      才走**重新配对**：遥控器上**同时按住「返回」和「主页」约 3 秒**，")
+    print("      底部指示灯开始闪 = 已进入配对模式（Google 官方口径）；")
+    print("      Windows 那边先把旧的「Chromecast Remote」删掉，")
+    print("      再「添加设备 → 蓝牙」。")
+    print("      ⚠ 这一步必须人手按遥控器，程序替不了。")
+    print("      ⚠ 重配会换掉地址 ⇒ 语音那边可能要重跑一次配对接管，先记着。")
 
 
 def main() -> int:
@@ -493,8 +694,9 @@ def main() -> int:
     # 放在最前面：它比 devnode 在场判定更靠近根因。设备节点全都"已启动"
     # 也可以照样一个报告都收不到 —— 只要链路加不了密。
     bond = bond_section(ADDR_TAG)
+    conn = connection_section()
     paired_entries_section()
-    fix_hint_section(bond)
+    verdict_section(conn, bond)
 
     print()
     rows = registry_children()

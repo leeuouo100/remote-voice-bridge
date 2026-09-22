@@ -43,14 +43,14 @@ pause >nul
 
 :ready
 echo.
-echo  接下来 45 秒：
+echo  接下来 90 秒（脚本自己会先走 3-2-1 倒计时，倒计时结束再开始按）：
 echo    1) 手【不要碰键盘】—— 一碰就会混进物理键盘的按键
 echo    2) 只按遥控器，依次按：方向上下左右 -^> 确认 -^> 返回 -^> 主页
 echo       -^> 音量＋ -^> 音量－ -^> 静音 -^> 语音键
 echo.
 pause
 
-%PY% tools\watch_all_channels.py --seconds 45
+%PY% tools\watch_all_channels.py --seconds 90
 set RC=%ERRORLEVEL%
 
 echo.

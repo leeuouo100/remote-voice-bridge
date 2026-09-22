@@ -413,34 +413,102 @@ def read_aep_nodes() -> list[dict]:
     return out
 
 
+def _open_probe(path: str):
+    """打开一个注册表键，读出它的值名与子键名 → (能否打开, 值名, 子键名, 错误)。
+
+    ⚠ 必须自己写，不能用 `_values()`：后者把异常吞掉、返回 `{}`，
+    于是「打不开」和「打开了但是空」长得**一模一样** —— 本项目已经
+    因为这个区别把结论判反过一次（见 read_key_material 的注释）。
+    """
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
+            n_sub, n_val, _t = winreg.QueryInfoKey(k)
+            return (True,
+                    sorted(winreg.EnumValue(k, i)[0] for i in range(n_val)),
+                    sorted(winreg.EnumKey(k, i) for i in range(n_sub)),
+                    None)
+    except Exception as e:                      # noqa: BLE001
+        return False, [], [], e
+
+
 def read_key_material(remote: str) -> dict:
     """配对密钥材料在不在（`Parameters\\Keys` 下的内容）。
 
-    ⚠ 这个键默认连读都不给（ACL 只放 SYSTEM），所以非管理员拿到的永远是空 ——
-    **空 ≠ 没有**。只有提权之后读到的空才能当结论用。
-    这条决定了 restore/migrate 有没有可能成功：密钥没了就只能重新配对。
+    ⚠⚠ 2026-09-23 修一个**会造成误判**的 bug：以前是"先打开父键
+    `Parameters\\Keys`，打不开就 `return`"，而父键的 ACL **只放 SYSTEM**，
+    非管理员**永远**打不开 ⇒ 这里永远报 `readable=False`，上层于是打印
+    「读不到密钥材料（权限不足）」，甚至**据此建议 purge（重新配对）**。
+    （这个误报还把人带偏过一次：2026-09-23 凌晨据此下了"配对里没有密钥"
+    的错结论，详见 CHANGELOG v1.0.15 第六节。）
+
+    真相是：**父键打不开，但设备那一层的子键是读得到的** —— 真机实测
+    `Keys\\047f0ef2d294\\f196a263671c` 里躺着
+    `LTK / IRK / CSRK / EDIV / ERand / KeyLength / Address / AddressType`。
+
+    ⚠ 还有一个容易再踩的陷阱（第一版修复就踩了）：**适配器那一层
+    `Keys\\<适配器MAC>` 同样是 Access Denied**（每一层各有独立、拒绝继承的
+    DACL）。所以**不能**"先打开适配器键、再枚举出设备" —— 那样照样报读不到。
+    远端地址是已知的，直接拼 `Keys\\<适配器>\\<远端>` 去开。
+
+    返回里的 `enumerated` = "**确实列全了某个本地地址下的设备表**"，
+    只有它非空、而 `locals` 为空时才允许说「密钥丢了」——
+    猜错地址时 `locals` 也会空，但那是「没找到」，不是「没有」。
     """
-    import winreg
-    info: dict = {"readable": False, "locals": [], "detail": {}}
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, BTHPORT_KEYS) as k:
-            locals_ = [winreg.EnumKey(k, i) for i in range(winreg.QueryInfoKey(k)[0])]
-        info["readable"] = True
-    except Exception as e:                      # noqa: BLE001
-        info["detail"]["error"] = f"{e.__class__.__name__}: {getattr(e, 'winerror', e)}"
+    info: dict = {"readable": False, "locals": [], "enumerated": None,
+                  "detail": {}}
+    dev = (r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices"
+           + "\\" + remote.lower())
+
+    # ── 候选本地地址，按可信度排序 ──
+    # ① 配对记录自己写的 `ServicesFor<本地地址>`（语义上最对：这条记录就绑在它下面）
+    # ② 父键能打开时它列出的全部本地地址（只有 SYSTEM 才有这个待遇）
+    # ③ WinRT 问出来的当前无线电地址 ④ 注册表退路（多颗在场适配器时故意返回空）
+    cands: list[str] = []
+    for s in _subkeys(dev):
+        if s.lower().startswith(SERVICES_FOR):
+            cands.append(hex12(s[len(SERVICES_FOR):]))
+    pok, _pn, psubs, perr = _open_probe(BTHPORT_KEYS)
+    if pok:
+        info["detail"]["via"] = "父键（可列全所有本地地址）"
+        cands += [hex12(s) for s in psubs]
+    else:
+        info["detail"]["parent_error"] = repr(perr)
+    for c in (hex12(live_addr_winrt()), hex12(live_addr_registry())):
+        if c:
+            cands.append(c)
+
+    seen: set[str] = set()
+    cands = [c for c in cands if c and not (c in seen or seen.add(c))]
+    info["detail"]["candidates"] = cands
+    if not cands:
+        info["detail"]["via"] = "连候选的本地地址都拿不到，无法下钻"
         return info
 
-    for loc in locals_:
-        peers = _subkeys(f"{BTHPORT_KEYS}\\{loc}")
-        if remote.lower() in [p.lower() for p in peers]:
-            sub = f"{BTHPORT_KEYS}\\{loc}\\{remote.lower()}"
-            info["locals"].append({
-                "local": hex12(loc),
-                "peers": peers,
-                "remote_values": sorted(_values(sub).keys()),
-                "remote_subkeys": _subkeys(sub),
-            })
-    info["detail"]["all_locals"] = locals_
+    for loc in cands:
+        sub = f"{BTHPORT_KEYS}\\{loc}\\{remote.lower()}"
+        ok, names, subs, err = _open_probe(sub)
+        if ok:
+            info["readable"] = True
+            info["locals"].append({"local": hex12(loc), "peers": [],
+                                   "remote_values": names,
+                                   "remote_subkeys": subs})
+            info["detail"]["via"] = f"直接下钻 {sub}"
+            continue
+        info["detail"].setdefault("remote_key_errors", {})[loc] = repr(err)
+        # 这一台的密钥键打不开 ⇒ 退一步：适配器那一层能不能列？
+        # **只有真能列**（说明我们有权看这张设备表）才允许得出「没有密钥」。
+        aok, _an, asubs, aerr = _open_probe(f"{BTHPORT_KEYS}\\{loc}")
+        if aok:
+            info["readable"] = True
+            if remote.lower() not in [s.lower() for s in asubs]:
+                info["enumerated"] = hex12(loc)
+                info["detail"]["via"] = f"枚举 Keys\\{loc}（设备表里没有本设备）"
+            else:
+                info["detail"]["via"] = (f"Keys\\{loc} 里有本设备，"
+                                         f"但它的密钥子键打不开")
+        else:
+            info["detail"].setdefault("unreadable_locals", {})[loc] = repr(aerr)
     return info
 
 
@@ -692,17 +760,21 @@ def format_report(d: dict) -> str:
 
     k = d.get("keys") or {}
     A("── 配对密钥材料（Parameters\\Keys）────────────────────────────────")
-    if not k.get("readable"):
-        A("  ⚠ 读不到（这个键只放 SYSTEM，非管理员一律 Access Denied）——")
-        A("    **不代表没有**，要用管理员身份再跑一次才算数。")
-    elif k["locals"]:
+    if k["locals"]:
         for x in k["locals"]:
             A(f"  ✅ 本地 {pretty(x['local'])} 下有本设备的密钥："
               f"{x['remote_values'] or x['remote_subkeys'] or '（空）'}")
+    elif k.get("enumerated"):
+        A(f"  ❌ 已经列全本地地址 {pretty(k['enumerated'])} 下的设备表，"
+          f"里面**没有**本设备的密钥条目。")
+        A("     → 这才是「密钥丢了」，restore / migrate 都没用，只能重新配对。")
+    elif not k.get("readable"):
+        A("  ⚠ 读不到（父键只放 SYSTEM，非管理员一律 Access Denied）——")
+        A("    **不代表没有**。跑 `python tools\\probe_hogp_state.py`：它按适配器")
+        A("    地址**直接下钻**到子键，通常就能读到（真机就是这样读到的）。")
     else:
-        A(f"  ❌ 提到了所有本地地址下的记录，都没有本设备的密钥条目："
-          f"{k.get('detail', {}).get('all_locals')}")
-        A("     → 密钥已经丢了，restore / migrate 都没用，只能重新配对。")
+        A("  ⚠ 无法判定：没能读到任何一个本地地址下的设备表 ——")
+        A("    「没找到」不等于「没有」，所以这里**不给结论**。")
     A("")
 
     if d.get("openable") is not None:
@@ -1793,13 +1865,19 @@ def main(argv: list[str] | None = None) -> int:
         A("")
         k = d.get("keys") or {}
         if target:
-            if k.get("readable") and k.get("locals"):
+            if k.get("locals"):
                 A(f"结论：当前地址下有本设备的密钥 ✅ —— 遥控器醒来就能握上手，不用重新配对。")
-            elif k.get("readable"):
+            elif k.get("enumerated"):
+                # ⚠ 判据是 `enumerated`（真的列全过某个本地地址的设备表）。
+                #   不能只看 `readable` —— 下钻时猜错适配器地址，它也会为真，
+                #   那时 `locals` 空只是「没找到」，拿它劝用户 purge 是白重配一次。
                 A("结论：★ 当前地址下**没有**本设备的密钥 → 等它重建也没用，")
                 A("      只能重新配对：python pairing.py --fix --method purge --yes --take-ownership")
             else:
-                A("结论：读不到密钥材料（权限不足），无法判断。")
+                A("结论：无法判定（没能读到任何一个本地地址下的设备表）——")
+                A("      「没找到」不等于「没有」。跑 `python tools\\probe_hogp_state.py`，")
+                A("      它按适配器地址**直接下钻**到子键，真机实测读得到")
+                A("      LTK/IRK/CSRK/EDIV/ERand（父键读不到不代表子键读不到）。")
         A("（本模式**没有改动任何东西**。）")
         txt = "\n".join(L)
         print(txt)
@@ -1902,9 +1980,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # restore / migrate 能不能成，先看密钥还在不在
     k = d.get("keys") or {}
-    if k.get("readable") and not k.get("locals"):
-        print("⚠ 配对密钥材料已经不在了 —— restore / migrate 都不会成功，"
-              "只能重新配对。直接走 purge。\n")
+    # ⚠ 判据必须是 `enumerated`（真的列全过某个本地地址的设备表），
+    #   不能只看 `readable` —— 后者在"下钻时猜错适配器地址"的情况下也会为真，
+    #   那时 `locals` 空只是「没找到」，拿它去 purge 会白让用户重配一次。
+    if k.get("enumerated") and not k.get("locals"):
+        print("⚠ 已列全本机适配器下的设备表，里面确实没有本设备的密钥 ——")
+        print("  restore / migrate 都不会成功，只能重新配对。直接走 purge。\n")
         method = "purge"
 
     order = [method] if method else ["migrate", "rebuild"]

@@ -244,7 +244,9 @@ async def _run(listen: int) -> None:
             #                               典型就是某个驱动"占"着这个服务
             #     · protocol_error == 5    → ATT 0x05 Insufficient Authentication
             #                               对端要求**加密/认证链路**，而我们这条链路
-            #                               没加密（多半是没有 LTK）
+            #                               没加密（⚠ 这一位**只能**说明"链路没加密"，
+            #                               推不出"密钥缺失"——本机实测密钥是齐的，
+            #                               2026-09-23 就是在这儿多推了一步）
             #     · protocol_error == 15   → ATT 0x0F Insufficient Encryption
             #                               同上，加密不足
             #   前者的修法是"让占用方放手"，后者是"把配对（密钥）修好" ——
