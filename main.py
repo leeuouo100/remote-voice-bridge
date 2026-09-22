@@ -37,7 +37,19 @@ VOICE_MAX_SECONDS = 600
 # 松手后自动重开麦 → 遥控器多半会回一个 audio_start。
 # 这段时间内收到的 audio_start 是**我们自己触发的**，不是用户"第二次按下"，
 # 绝不能当成结束信号，否则会"刚开立刻被关"。
-MIC_REOPEN_GRACE = 1.5
+#
+# ⚠ 窗口宽度是**双向**代价，不能随手调大（v1.0.13 血的教训）：
+#   · 太窄 → 回响漏过去 → 落到结束分支 → 会话被自己关掉（v1.0.12 的病）
+#   · 太宽 → 真按键被当成回响吞掉 → **用户当场用不了**（v1.0.13 的病）
+# 真机实测的时间尺度：
+#   · 回响：紧跟我们的 MIC_OPEN，实测 +17ms / +90ms / +300ms / +320ms 都有，
+#           最长不超过 ~350ms（2026-09-22 22:43 与 23:34 两段日志）
+#   · 用户真按键：最早也在"松手那次重开麦"之后 1 秒以上（人不可能 0.8s 内
+#     松手、再想好、再按下）
+# ⇒ 0.8s 落在 ~350ms 与 1s 之间，两边都留了余量：回响全盖住，真按键放过去。
+#   吞掉真按键的代价 = "多听一会儿，再按一下结束"（无害，往不做那边倒）；
+#   吞掉回响的代价 = "用户当场用不了"（不可逆）。
+MIC_REOPEN_GRACE = 0.8
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 # 必须写到用户目录而不是程序目录：打包成 exe 后程序目录是 PyInstaller 的
@@ -742,23 +754,31 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 logger.info("▶ Audio START")
                 state.clear_audio()          # 清掉上一次的波形，UI 从空开始画
                 state.update(streaming=True, last_event="语音中…")
-                # ⚠ 必须补发 MIC_OPEN。
-                # 遥控器按语音键时只会上报 AUDIO_START(0x04)，从不发 START_SEARCH(0x08)，
-                # 而开麦命令原先只挂在 start_search 分支 → 遥控器永远收不到 MIC_OPEN
-                # → 一帧音频都不推，日志表现就是连续「本次共收到 0 个音频帧」。
+                # ── 先判「这一下是不是我们自己引来的回声」，**再**决定补不补开麦 ──
+                # ⚠⚠ 顺序绝对不能反 —— v1.0.13 就是在这儿翻的车：
+                #   那一版把这句补发**无条件**挂在 audio_start 分支的顶上，而
+                #   `ensure_mic_open()` 真的发出 MIC_OPEN 时，调用方会顺手记
+                #   `mic_reopen_at = 现在` → 紧接着的判定拿这个**刚写下的时刻**去比
+                #   → **这一次（真按键）自己把自己判成了回声**、当场吞掉，热键不注入。
+                #   光吞一次还不至于全废，致命的是它每次都会重来：
+                #   松手(audio_stop)会把相位打回 CLOSED、`mic_open_sent` 复位
+                #   → **下一次按键**又补发一次、又刷新一次窗口
+                #   → 每一次按键都落在窗口内 → **一次都启动不了**。
+                #   真机证据（2026-09-22 23:34:36~47，武哥连按 10 次）：
+                #     `Audio START → 补发 MIC_OPEN → Audio START(回声+17ms)`
+                #     `→ 17 帧 → Audio STOP`  原地循环 1.3s 一轮，
+                #   **一行 `🎤 voice hotkey TAP` 都没有** —— 热键一次都没注入，
+                #   输入法从头到尾没被叫起来。用户感受＝"语音输入完全用不了"。
+                #   （这是**静默失效**：不崩、不报错，UI 波形还在跳那 17 帧，
+                #     所以只能靠日志里"少了哪一行"来发现，不能靠崩溃提示。）
                 #
-                # ⚠⚠ 补发成功后**必须**顺手记一次 mic_reopen_at。
-                #   遥控器收到 MIC_OPEN 会立刻回一个 audio_start（意思是"我开始推流了"），
-                #   那是我们要来的回响，**不是用户按了第二次**。不挡掉它会一路向下走到
-                #   else 分支，后果是连环的：
-                #     ① 立刻 voice_hotkey_up() → 输入法那边的语音键被松开
-                #     ② voice_active 变 False → 等真松手(audio_stop)时不再补开麦
-                #     ③ 遥控器保持停推流 → 「本次共收到 0 个音频帧」
-                #   用户看到的就是「混音卡在等待录音 / 转文字逐字卡 / 一松手就不再调用输入法」。
-                #   2026-09-15 真机日志正是这个时序：补发 36.944s → 回响 36.995s，
-                #   只隔 51ms，远在 MIC_REOPEN_GRACE(1.5s) 之内 —— 只要这里记了就能挡住。
-                if session.ensure_mic_open():
-                    mic_reopen_at = time.time()
+                # 判据 = 距离**我们上一次发 MIC_OPEN** 过了多久：
+                #   · 回声一定紧跟我们的 MIC_OPEN：真机实测 +17ms、+90ms、
+                #     +300ms、+320ms 都是；最长不超过 ~350ms
+                #   · 用户真按键最早也在"松手那次重开麦"之后 1 秒以上
+                #   窗口给 MIC_REOPEN_GRACE(0.8s)：两种回声都盖住，真按键放过去。
+                now = time.time()
+                is_echo = bool(mic_reopen_at) and (now - mic_reopen_at) < MIC_REOPEN_GRACE
                 # ── 语音会话状态机：**每一次按下 = 一次翻转** ──────────────
                 #   第 1 次按下 → 开始   第 2 次按下 → 结束
                 # 松手（audio_stop）不参与翻转，见下面那个分支的注释。
@@ -770,28 +790,20 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 # ⚠ 防自激：刚自动重开麦后，遥控器多半会回一个 audio_start。
                 #   那是我们自己触发的，不是用户"第二次按下" —— 当成结束就会
                 #   "刚开立刻被关"，必须在这里挡掉。
-                if mic_reopen_at and (time.time() - mic_reopen_at) < MIC_REOPEN_GRACE:
-                    # ⚠⚠ 这里**绝不能**把 mic_reopen_at 清零。
-                    #
-                    # 回响**不止一个**。2026-09-22 真机日志：松手补发 MIC_OPEN 之后，
-                    # 遥控器在 19ms 内回了两个 audio_start
-                    # （22:44:53.515 与 .534）。老写法"挡掉一个就把 mic_reopen_at
-                    # 清零"→ 第二个回响落到下面的 else → 当成"用户第二次按下"
-                    # → 注入热键（把输入法的语音输入**关掉**）+ 结束会话。
-                    # 用户看到的是「按一下、刚开口，一个字都出不来」。
-                    # 那天 22:00 之后的 10 次会话里，4 次在 1.2~1.6 秒内被结束。
-                    #
-                    # 代价方向（按项目定案）：少吞一个真按键＝"多听一会儿，再按一下
-                    # 就结束"（无害）；多吞一个回响＝"用户当场用不了"。拿不准就往
-                    # "不做"那边倒 —— 所以窗口内**全部**吞掉，不设次数上限。
+                if is_echo:
+                    # 不是用户按的 → 吞掉。⚠ 这里**既不清零、也不刷新** mic_reopen_at：
+                    #   · 清零 = 只挡一次 → 第 2 个回响落进下面的结束分支，会话被自己关掉
+                    #   · 刷新 = 窗口永不过期 → 按键全被吞（v1.0.13 的下场）
+                    #   窗口只靠**时间**过期：任何事件都**不许**改它。
                     _echo_swallowed += 1
                     if _echo_swallowed <= 3:
                         logger.info(
-                            f"↩ 忽略自动重开麦的回响 audio_start（{MIC_REOPEN_GRACE}s "
-                            f"窗口内第 {_echo_swallowed} 次）"
+                            f"↩ 忽略自动重开麦引来的回声 audio_start"
+                            f"（距上次 MIC_OPEN {now - mic_reopen_at:.2f}s"
+                            f" < {MIC_REOPEN_GRACE}s，本段第 {_echo_swallowed} 次）"
                         )
                     else:
-                        logger.debug("↩ 又是自动重开麦的回响，已忽略")
+                        logger.debug("↩ 又是自动重开麦引来的回声，已忽略")
                 elif not voice_active:
                     # 用户又开始说下一段了 → 上一条「待发送」显然不该再发出去。
                     # 例：说完一句觉得不对，紧接着按一下重说 —— 若不等这一下就
@@ -814,6 +826,23 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     voice_started_at = time.time()
                     state.update(streaming=True, last_event="语音中…")
                     logger.info("🎙️ 语音会话【开始】—— 可以松手了，会一直听着")
+                    # ── 补发 MIC_OPEN：**必须在判完回声、确认是真按键之后** ──────
+                    # 遥控器按语音键只上报 AUDIO_START(0x04)，**从不发
+                    # START_SEARCH(0x08)**，而开麦命令原先只挂在 start_search 分支
+                    # → 遥控器永远收不到 MIC_OPEN → 一帧音频都不推，
+                    # 日志表现就是连续「本次共收到 0 个音频帧」。
+                    #
+                    # ⚠⚠ 位置铁律：这一段**只能**待在 is_echo 判定**之后**。
+                    #   v1.0.13 把它放在判定之前（无条件、每次 audio_start 都发），
+                    #   而 ensure_mic_open() 成功时顺手记 mic_reopen_at=现在 →
+                    #   **这一次（真按键）自己就落进了回声窗口**、当场被吞掉。
+                    #   于是热键一次都没注入，输入法从头到尾没被叫起来。
+                    #
+                    # 补发成功才记时刻 —— 这个时刻是给**下一个** audio_start
+                    # （遥控器收到 MIC_OPEN 后回的那声"我开始推流了"）用的，
+                    # 不是给这一次用的。顺序颠倒一次就再次踩同一个坑。
+                    if session.ensure_mic_open():
+                        mic_reopen_at = time.time()
                 else:
                     voice_hotkey_up()        # tap=再点按结束 / hold=松开结束
                     voice_active     = False

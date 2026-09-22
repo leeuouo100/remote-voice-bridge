@@ -47,13 +47,43 @@
 ## 这道闸钉什么
 
 1. 防自激分支**不许**出现"挡掉后把 `mic_reopen_at` 清零"（＝只挡一次）。
+1'. 防自激分支**也不许**刷新 `mic_reopen_at` —— 窗口**只能靠时间过期**，
+   任何事件都不许改它。（清零与刷新是同一个坑的两个方向，见下。）
+1''. **顺序铁律：先算 `is_echo`，再补发 MIC_OPEN。** 补开麦成功时调用方会顺手
+   记 `mic_reopen_at = 现在`；它一旦排在判定之前，**这一次（真按键）自己就落进了
+   回声窗口**、当场被吞掉。返回值**区间**也要管：窗口宽度 `MIC_REOPEN_GRACE`
+   必须落在 [0.5, 1.2] 秒（实测回响 +22ms/+300ms，真按键 ≥1s）。
 2. 挡掉的事件**不许静默**（挡了多少次要能看见 —— 不然这次排查根本看不见它）。
 3. **松手（audio_stop）绝不结束会话** —— 它只能"结算统计 + 补开麦"。
    `voice_hotkey_up()` 只允许出现在 `audio_start` 的结束分支里。
-4. 帧计数不在 `audio_start` 分支顶部清零（v1.0.13 的老账，见
-   `check_send_after_voice.py`；这条在这里再钉一遍，因为它是同一个状态机）。
+4. 帧计数不在 `audio_start` 分支顶部清零，**且必须在判回声之后**
+   （回响也是 audio_start；放它前面就把本段帧数抹成 0 → 又变成零帧误触）。
 
-带 2 条反例自证。
+## v1.0.13 的回归：把"只挡一次"改成了"永不过期"
+
+前一轮为了修"第 2 个回响把会话关掉"，把清零去掉了 —— 方向对，但**顺序**没动：
+补开麦仍在 `is_echo` 判定**之前**，并顺手 `mic_reopen_at = time.time()`。
+于是：
+
+```
+第 1 次按键 → Audio START → 补发 MIC_OPEN（mic_reopen_at = 现在）
+                        └→ 紧接着判窗口：now - mic_reopen_at ≈ 0ms < 1.5s
+                           ⇒ **这一次（真按键）自己把自己判成回声、当场吞掉**
+吞掉时又不清零 → 遥控器每 ~1.3s 一个 audio_start 都把窗口续上
+                ⇒ mic_reopen_at 永不失效 ⇒ **每一次按键全被吞**
+```
+
+真机证据（2026-09-22 23:34–23:35）：日志里只剩
+`Audio START →(17 帧)→ Audio STOP` 原地循环，**一行 `🎤 voice hotkey TAP` 都没有**
+—— 热键一次都没注入，输入法从头到尾没被叫起来。用户的原话：
+
+> 「怎么又有问题，连语音输入都用不了，」
+
+⚠ 这是一种**静默失效**：不崩、不报错、UI 上波形还在跳（那 17 帧），
+用户却一个字都输不进去。所以顺序必须由闸门钉死，不能靠自觉。
+
+带 3 条反例自证：①把"挡一次就清零"加回去 ②让松手也结束会话
+③把补开麦挪到判回声之前（＝ v1.0.13 的真 bug）。
 
 用法： python tools/check_voice_session.py
 """
@@ -100,16 +130,41 @@ def audit(src: str) -> list[tuple[bool, str]]:
 
     # ── ① 防自激：窗口内必须能吞**多个**回响 ──────────────────────
     c.append(("MIC_REOPEN_GRACE" in src, "① 有 MIC_REOPEN_GRACE 窗口常量"))
-    m_echo = re.search(
-        r"if mic_reopen_at and \(time\.time\(\) - mic_reopen_at\) < MIC_REOPEN_GRACE:(.*?)elif not voice_active:",
-        code, re.S)
+    m_grace = re.search(r"^MIC_REOPEN_GRACE\s*=\s*([0-9.]+)", src, re.M)
+    grace = float(m_grace.group(1)) if m_grace else 0.0
+    # 窗口宽度是**双向**代价（真机实测）：回响 +22ms/+300ms，真按键 ≥1s。
+    #   < 0.5  → 回响漏过去 → 会话被自己关掉
+    #   > 1.2  → 真按键被当成回响吞掉 → 用户当场用不了（v1.0.13 的 1.5 就是这样）
+    c.append((0.5 <= grace <= 1.2,
+              f"① 窗口宽度在安全区间 [0.5, 1.2] 秒（实测 {grace}s）"
+              "—— 太窄漏回响、太宽吞真按键"))
+    m_echo = re.search(r"if is_echo:(.*?)elif not voice_active:", code, re.S)
     c.append((bool(m_echo), "① 找得到「挡自动重开麦回响」这个分支"))
     echo_body = m_echo.group(1) if m_echo else ""
-    c.append(("mic_reopen_at = 0.0" not in echo_body,
-              "① 挡掉回响后**没有**把 mic_reopen_at 清零"
-              "（清零＝只挡一次 → 第 2 个回响落进结束分支 → 会话被自己关掉）"))
+    c.append((not re.search(r"mic_reopen_at\s*=", echo_body),
+              "① 回声分支里**从不**改 mic_reopen_at"
+              "（清零＝只挡一次 → 第 2 个回响落进结束分支 → 会话被自己关掉；"
+              "刷新＝窗口永不过期 → 按键全被吞 → v1.0.13）"))
     c.append(("_echo_swallowed" in echo_body,
               "① 挡掉的事件记了数（吞了多少次要看得见，不然排查时它是个黑洞）"))
+
+    # ── ①' 顺序铁律：**先判回声，再补开麦** ─────────────────────────
+    # 这是 v1.0.13 翻车的地方，也是本轮回归的病根，必须单独钉死：
+    # 补开麦成功时 `ensure_mic_open()` 会顺手让调用方记 `mic_reopen_at = 现在`。
+    # 一旦它排在 `is_echo` 判定**之前**，**这一次（真按键）自己就落进了回声窗口**、
+    # 当场被吞掉 → 热键一次都不注入 → 输入法从头到尾没被叫起来
+    # → 用户感受就是"语音输入完全用不了"。
+    m_asblk = _block(code, r'elif event\["type"\] == "audio_start":',
+                     r'elif event\["type"\] == "audio_stop":')
+    i_echo_calc = m_asblk.find("is_echo =")
+    i_micopen = m_asblk.find("ensure_mic_open()")
+    c.append((i_micopen >= 0,
+              "①' audio_start 分支里补发了 MIC_OPEN"
+              "（遥控器按语音键只发 AUDIO_START、从不发 START_SEARCH；"
+              "少了它遥控器一帧都不推 → 连续「0 个音频帧」）"))
+    c.append((i_echo_calc >= 0 and i_micopen > i_echo_calc,
+              "①' 顺序：先算 is_echo，**再**补发 MIC_OPEN"
+              "（顺序反了＝真按键把自己判成回声，当场吞掉 → v1.0.13 的「用不了」）"))
 
     # ── ② 松手不许结束会话 ────────────────────────────────────────
     m_stop = _block(code, r'elif event\["type"\] == "audio_stop":',
@@ -137,6 +192,13 @@ def audit(src: str) -> list[tuple[bool, str]]:
         c.append((i_reset >= 0 and i_down >= 0 and i_reset < i_down,
                   "④ 帧计数零在「开始新一段」里、且在往下按热键之前"
                   "（否则收尾那次读到 0 → 零帧误触保护把每次发送都拦掉）"))
+        # 还得在**判回声之后**：回响也是 audio_start，会先走到这里。
+        # 若清零在它前面，回响那一下就把本段的帧数抹成 0 —— 于是收尾时
+        # 传给零帧保护的永远是 0，自动发送永远不触发（老病换个由头复发）。
+        c.append((i_reset >= 0 and m_as.find("is_echo =") >= 0
+                  and i_reset > m_as.find("is_echo ="),
+                  "④ 帧计数清零也在判回声**之后**"
+                  "（否则回响那一下把本段帧数抹成 0）"))
         c.append(("cancel_voice_send(" in m_as,
                   "④ 开始新一段时取消上一条待发送"))
     else:
@@ -207,7 +269,30 @@ def main() -> int:
         print("  ❌ 反例 2 没构造出来（找不到松手分支）")
         ok = False
 
-    if n_red < 2:
+    # 反例 3：把补开麦挪到判回声**之前** —— 这就是 v1.0.13 的真 bug。
+    # 补发成功后顺手记的 mic_reopen_at 会让**这一次（真按键）**自己落进
+    # 回声窗口、当场被吞掉：热键一次不注入 → 输入法从头到尾没被叫起来
+    # → 用户看到的「语音输入完全用不了」。
+    anchor = "                now = time.time()\n                is_echo ="
+    if anchor in src:
+        bad3 = src.replace(
+            anchor,
+            "                if session.ensure_mic_open():\n"
+            "                    mic_reopen_at = time.time()\n"
+            + anchor, 1)
+        n = sum(1 for g, _ in audit(bad3) if not g)
+        if n:
+            n_red += 1
+            print(f"  ✅ 反例：把补开麦挪到判回声**之前**"
+                  f"（＝ v1.0.13 真按键把自己判成回声、当场吞掉） → 报了 {n} 项红")
+        else:
+            print("  ❌ 反例：顺序颠倒了居然全绿 —— 这道闸拦不住它复发")
+            ok = False
+    else:
+        print("  ❌ 反例 3 没构造出来（锚点没找到）")
+        ok = False
+
+    if n_red < 3:
         ok = False
 
     print()
