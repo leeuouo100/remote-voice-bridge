@@ -421,12 +421,19 @@ def _selftest() -> int:
                  "desc": "", "enabled": True}],
     }
 
-    def _fake_watch(kb_n: int, vendor_n: int):
-        """假监听器：只填计数，不碰真实句柄。"""
+    def _fake_watch(kb_n: int, vendor_n: int, inj_n: int = 0):
+        """假监听器：只填计数，不碰真实句柄。
+
+        ⚠ 元组是 5 元 `(ts, kind, name, scan, injected)`。最后一格是"非注入"
+          标志：判读**只认 False 的那批**（见 hidwatch.summary_lines）。
+          以前这里是 4 元、没有这一格，于是本程序自己注入的语音热键会被
+          当成遥控器的按键 —— 09-19 那份报告就是这么做出的假结论。
+        """
         if hidwatch is None:
             return None
         w = hidwatch.ReportWatcher()
-        w.key_events = [(now, "keyboard", "enter", 0x1C)] * kb_n
+        w.key_events = ([(now, "keyboard", "enter", 0x1C, False)] * kb_n
+                        + [(now, "keyboard", "left windows", 0x5B, True)] * inj_n)
         c = hidwatch.HidCollection(r"\\?\hid#…col04#a&1&0&0003",
                                    0x18D1, 0x9450, 0xFF01, 0x01, 21)
         c.opened = True
@@ -435,8 +442,13 @@ def _selftest() -> int:
         return w
 
     def run(*, ok_scan: int, rm_scan: int,
-            kb_n: int = 1, vendor_n: int = 0) -> tuple[int, str]:
-        """同一批数据、只换扫描码，分别走「无法区分」和「可以区分」两条分支。"""
+            kb_n: int = 1, vendor_n: int = 0,
+            inj_n: int = 0) -> tuple[int, str]:
+        """同一批数据、只换扫描码，分别走「无法区分」和「可以区分」两条分支。
+
+        `kb_n` = **真实**（非注入）键盘事件数，`inj_n` = 注入事件数。两者必须分开
+        传：判读只认前者，混在一起就又会得出"遥控器按键到了 Windows"的假结论。
+        """
         fake = [
             # 阶段 0：物理键盘 Enter
             (now, 0, "enter", ok_scan, False),
@@ -453,15 +465,19 @@ def _selftest() -> int:
             (now, 6, "media play pause", 0x22, False),
         ]
         rc = _write_report(fake, quiet=True, snap=fake_snap,
-                           watcher=_fake_watch(kb_n, vendor_n))
+                           watcher=_fake_watch(kb_n, vendor_n, inj_n))
         return rc, REPORT.read_text(encoding="utf-8")
 
     old, REPORT = REPORT, Path(os.environ.get("TEMP", ".")) / "_rvb_diag_selftest.txt"
     try:
         rc_same, text_same = run(ok_scan=0x1C, rm_scan=0x1C)
         rc_diff, text_diff = run(ok_scan=0x1C, rm_scan=0x2C)
-        # 键盘有事件 → 判读应落到"按键能到达 Windows"
+        # 键盘有**真实**事件 → 判读应落到"按键能到达 Windows"
         _rc_k, text_kbd = run(ok_scan=0x1C, rm_scan=0x1C, kb_n=2, vendor_n=0)
+        # ⚠ 只有**注入**事件（= 本程序自己的语音热键）时，判读**绝不能**说按键
+        #   到了 Windows。09-19 那份真机报告就是这么误判的，所以要反着测一条。
+        _rc_i, text_inj = run(ok_scan=0x1C, rm_scan=0x1C,
+                              kb_n=0, vendor_n=0, inj_n=33)
         # 键盘 0 事件、厂商页有报告 → 判读应落到"Windows 看不见它"
         _rc_v, text_vendor = run(ok_scan=0x1C, rm_scan=0x1C, kb_n=0, vendor_n=1)
     finally:
@@ -480,8 +496,10 @@ def _selftest() -> int:
          "报告含 HID 硬件身份（结论 0）"),
         ("厂商自定义" in text_same, "厂商自定义集合被点名（Windows 不处理）"),
         ("按键落点" in text_same, "报告含按键落点（结论 4）"),
-        ("键盘事件收到了" in text_kbd,
-         "键盘有事件 → 判读指向程序层"),
+        ("真实" in text_kbd and "确实进了 Windows" in text_kbd,
+         "键盘有**真实**（非注入）事件 → 判读指向程序层"),
+        ("确实进了 Windows" not in text_inj and "一个都没到" in text_inj,
+         "只有**注入**事件 → 判读说「一个都没到」，不冒充遥控器按键"),
         ("只出现在厂商自定义页" in text_vendor,
          "只有厂商页有报告 → 判读指向「要自己解报告」（关键分支）"),
     ]

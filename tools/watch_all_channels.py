@@ -142,6 +142,8 @@ def main() -> int:
     # ── 静态：GATT 服务 + HID 服务能否订阅 ──────────────────────────
     static_report: list[str] = []
     live_hits: dict[str, list] = {}
+    subs: list[str] = []
+    subs_ok: list[str] = []
     stop = threading.Event()
 
     async def gatt_part() -> None:
@@ -166,6 +168,8 @@ def main() -> int:
             ble = await BluetoothLEDevice.from_id_async(tgt.id)
         except OSError as e:
             say(f"\n❌ 连接失败：{e}")
+            say("   带着桥程序跑（--force）时，蓝牙连接常被它占着；"
+                "退出桥程序后重跑通常就好。")
             return
         if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
             say("\n⚠ BLE 未连接，等遥控器醒来（按任意键）最多 10 秒…")
@@ -223,7 +227,10 @@ def main() -> int:
                         if cu == ATVV_CTL and data:
                             op = data[0]
                             note = f"  ← op 0x{op:02X} {ATVV_OPS.get(op, '【认不出】')}"
-                        print(f"  🔵 {tag}  {data.hex(' ')}{note}", flush=True)
+                        # 走 say（进报告文件），别用 print：不然报告里只有计数、
+                        # 没有原始字节，事后没法二次判读。
+                        say(f"  🔵 [{time.time() - _t_start:7.2f}s] "
+                            f"{tag}  {data.hex(' ')}{note}")
                     return cb
 
                 try:
@@ -231,6 +238,7 @@ def main() -> int:
                     await ch.write_client_characteristic_configuration_descriptor_async(
                         GattClientCharacteristicConfigurationDescriptorValue.NOTIFY)
                     subs.append((key, ch, tok))
+                    subs_ok.append(key)
                     say(f"     ✅ 已订阅 {key}")
                 except Exception as e:              # noqa: BLE001
                     say(f"     ❌ 订阅 {key} 失败：{e.__class__.__name__}: {e}")
@@ -256,10 +264,24 @@ def main() -> int:
                 pass
 
     # HID 集合的原始报告读取（后台线程，和 GATT 并行）
-    w = hidwatch.ReportWatcher(only_google=True)
+    _t_start = time.time()
+
+    def _on_watch_event(item) -> None:
+        # ⚠ 这里以前**只 print、不进报告文件** —— 于是报告里只剩一个干巴巴的
+        #   "33"，看不到键名，谁也没法判断那 33 个到底是什么键（09-19 就是这样）。
+        ts, _kind, name, scan, injected = item
+        tag = {True: "注入", False: "真实", None: "分不出"}[injected]
+        say(f"  ⌨ [{ts - _t_start:7.2f}s] 键盘事件[{tag}] "
+            f"name={name!r} scan={scan}")
+
+    w = hidwatch.ReportWatcher(only_google=True, on_event=_on_watch_event)
     n_open = w.start(with_hooks=True)
-    say(f"\n【静态】HID 集合打开 {n_open} 路，"
-        f"键盘钩子{'已挂' if w._hooks else '没挂上'}")
+    _hook_kind = ("低级钩子（能分「注入/真实」）" if w._kb_hook is not None
+                  else "退路钩子（只有键名，分不出注入）" if w._hooks
+                  else "⚠ 没挂上")
+    say(f"\n【静态】HID 集合打开 {n_open} 路，键盘钩子：{_hook_kind}")
+    if w.hook_error:
+        say(f"  ⚠ {w.hook_error}")
 
     def run_gatt():
         try:
@@ -278,38 +300,57 @@ def main() -> int:
     say("\n" + "=" * 78)
     say("【结论】各通道收到多少次")
     say("=" * 78)
-    kb_n = len([1 for e in w.key_events if e[1] == "keyboard"])
+    real = [e for e in w.key_events if e[4] is False]
+    inj = [e for e in w.key_events if e[4] is True]
+    unk = [e for e in w.key_events if e[4] is None]
     say(f"  {'通道':<46}{'次数':>6}")
     say("  " + "-" * 60)
-    say(f"  {'⌨ 键盘钩子（Windows 键盘事件）':<44}{kb_n:>6}")
+    say(f"  {'⌨ 键盘钩子 · 真实（非注入）':<44}{len(real):>6}   ← 只有这行能作证")
+    say(f"  {'⌨ 键盘钩子 · 注入（本程序自己发的）':<44}{len(inj):>6}")
+    if unk:
+        say(f"  {'⌨ 键盘钩子 · 分不出是否注入':<44}{len(unk):>6}")
     for c in w.collections:
         say(f"  {'📦 HID ' + c.key:<44}{len(c.reports):>6}")
-    for k in sorted(live_hits):
-        say(f"  {'🔵 ' + k:<44}{len(live_hits[k]):>6}")
+    # ⚠ 用 set(subs_ok) | set(live_hits)：**订上了但 0 条**的通道也必须进表。
+    #   只列 live_hits 的话，报告里看不到 ae42 / d343bfc5 这两路到底听了没有 ——
+    #   09-19 那份报告就是这个形态，事后谁也判断不出「私有服务是 0」还是「没测」。
+    for k in sorted(set(subs_ok) | set(live_hits)):
+        n_k = len(live_hits.get(k, []))
+        mark = "" if n_k else "（已订阅，0 条）"
+        say(f"  {'🔵 ' + k + mark:<44}{n_k:>6}")
+    if w.hook_error:
+        say(f"  （键盘钩子备注：{w.hook_error}）")
 
     say("")
-    say("【判读】")
-    hid_n = sum(len(c.reports) for c in w.collections)
-    gatt_n = sum(len(v) for v in live_hits.values())
-    if kb_n:
-        say("  → 键盘事件收到了：按键**能**到 Windows，问题在我们这层的映射/注入。")
-    elif hid_n:
-        say("  → 🎯 按键报告出现在 HID 集合上：Windows 的 HOGP 能送报告，")
-        say("     之前 0 条是**读法/时机**的问题（对不对、够不够早）。")
-        for c in w.collections:
-            if c.reports:
-                say(f"     · {c.key} 样本 {c.reports[0][1].hex(' ')}")
-    elif any(k.startswith(("0000ae40", "d343bfc0")) for k in live_hits):
-        say("  → 🎯 按键报告落在**私有服务**上（不是 HID、也不是 ATVV）！")
-        say("     这就是「改映射表永远没用」的真正原因。")
-        say("     修法：本项目订阅这些私有特征，按它们自己的格式解按键。")
-    elif gatt_n:
-        say("  → 只有 ATVV/其它服务有流量，HID 集合仍然 0 条。")
-        say("     说明遥控器的按键**确实不走 HID**（或 Windows 的 HOGP 彻底不工作），")
-        say("     下一步要按上面亮起来的那个通道去解。")
-    else:
-        say("  → ⚠ 一条都没收到。请确认：遥控器已连接、刚才**确实按了键**、")
-        say("     并且桥程序已退出（否则 ATVV 被它占着）。")
+    # ⚠ 判读**只此一处**（`hidwatch.ReportWatcher.summary_lines`），这里不再自己
+    #   抄一份 —— 抄一份的下场就是两边慢慢跑偏。09-19 那份报告里 HID 五路全 0，
+    #   结论却写着"按键能到 Windows"：就因为判读用的是 `if kb_n:` 这个**恒真**
+    #   条件，把本程序自己注入的语音热键当成了遥控器的按键。
+    _sl = w.summary_lines()
+    try:
+        _i = next(n for n, ln in enumerate(_sl) if ln.startswith("【判读】"))
+    except StopIteration:                                   # noqa: BLE001
+        _i = 0
+    for ln in _sl[_i:]:
+        say(ln)
+
+    if not subs_ok:
+        say("")
+        say("  ⚠ 这一轮**一个 GATT 特征都没订阅上**（原因见上面）——")
+        say("     私有服务 ae42 / d343bfc5 等于**没测**，")
+        say("     不能当成「它们也是 0」。带着桥程序跑就属于这种情形。")
+
+    # 私有服务的光是 hidwatch 看不到的（它只管 HID 集合），单独补一段。
+    priv = sorted(k for k in live_hits
+                  if k.startswith("0000ae40") or k.startswith("d343bfc0"))
+    if priv:
+        say("")
+        say("  → 🎯 **私有服务**上有流量（不是 HID、也不是 ATVV）：")
+        for k in priv:
+            d = live_hits[k]
+            say(f"     · {k} 收到 {len(d)} 条，样本 {d[0][1].hex(' ')}")
+        say("     按键很可能走这里。修法：本项目订阅这些私有特征、")
+        say("     按它们自己的格式解出按键 —— 改映射表永远碰不到它。")
 
     text = "\n".join(lines) + "\n"
     try:

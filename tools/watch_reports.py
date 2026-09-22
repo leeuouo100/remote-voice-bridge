@@ -145,8 +145,10 @@ def main() -> int:
         "",
     ]
     merged: list[tuple[float, str]] = []
-    for ts, kind, name, scan in w.key_events:
-        merged.append((ts, f"⌨ 键盘事件  name={name!r} scan={scan}"))
+    for ts, kind, name, scan, injected in w.key_events:
+        # 注入标志必须写进明细：不然这份报告又变成"33 个事件"那种没法读的数
+        tag = {True: "注入", False: "真实", None: "分不出"}[injected]
+        merged.append((ts, f"⌨ 键盘事件[{tag}]  name={name!r} scan={scan}"))
     for c in w.collections:
         for ts, data in c.reports:
             merged.append((ts, f"📦 {c.key}  {data.hex(' ')}"))

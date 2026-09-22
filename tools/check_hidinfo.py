@@ -72,11 +72,19 @@ def _fake_snap(vendor_handled: bool = False) -> dict:
     }
 
 
-def _fake_watch(kb_n: int, vendor_n: int) -> hidwatch.ReportWatcher:
+def _fake_watch(kb_n: int, vendor_n: int,
+                inj_n: int = 0) -> hidwatch.ReportWatcher:
+    """假监听器。
+
+    `kb_n` = **真实**（非注入）键盘事件，`inj_n` = 本程序自己注入的语音热键。
+    两者必须分开：判读只认前者。以前这里只有 kb_n 一个参数，把注入键也算成
+    "按键到了 Windows"，于是反例永远测不出那个假结论。
+    """
     import time
     now = time.time()
     w = hidwatch.ReportWatcher()
-    w.key_events = [(now, "keyboard", "enter", 0x1C)] * kb_n
+    w.key_events = ([(now, "keyboard", "enter", 0x1C, False)] * kb_n
+                    + [(now, "keyboard", "left windows", 0x5B, True)] * inj_n)
     c = hidwatch.HidCollection(r"\\?\hid#…col04", 0x18D1, 0x9450, 0xFF01, 0x01, 21)
     c.opened = True
     c.reports = [(now, b"\x01\x00\x00" + b"\x00" * 18)] * vendor_n
@@ -141,7 +149,24 @@ def main() -> int:
 
     w_kbd = _fake_watch(kb_n=2, vendor_n=0)
     t_kbd = "\n".join(w_kbd.summary_lines())
-    A("键盘事件收到了" in t_kbd, "有键盘事件 → 判读指向程序层")
+    A("真实" in t_kbd and "确实进了 Windows" in t_kbd,
+      "有**真实**（非注入）键盘事件 → 判读指向程序层")
+
+    # ⚠ 本轮最要紧的两条断言：只有注入事件时，判读**绝不能**说"按键到了 Windows"。
+    #   2026-09-19 真机跑出来的报告就是：33 个键盘事件（绝大部分是语音热键注入的）
+    #   + 5 路 HID 集合全 0，却被判读成"按键能到 Windows、问题在我们这层"，
+    #   于是连着两轮排查方向都是错的。这里把那个假结论钉死。
+    w_inj = _fake_watch(kb_n=0, vendor_n=0, inj_n=33)
+    t_inj = "\n".join(w_inj.summary_lines())
+    A("确实进了 Windows" not in t_inj and "一个都没到" in t_inj,
+      "只有注入事件 → 判读说「一个都没到」，不再冒充遥控器按键")
+    A("全是本程序自己注入的" in t_inj and "left windows" in t_inj,
+      "判读点名注入事件、并列出键名（一眼看出那是语音热键）")
+
+    # 反例（关键）：把「注入」这一列从判读里拿掉，上面两段判读必须变得一模一样 ——
+    # 所以这条测的是"标志真的参与了判定"，而不是在看它碰巧印出来的字。
+    A(t_kbd != t_inj,
+      "反例：真实/注入标志真的参与判读（拿掉它两段判读会变得一样）")
 
     w_ven = _fake_watch(kb_n=0, vendor_n=1)
     t_ven = "\n".join(w_ven.summary_lines())

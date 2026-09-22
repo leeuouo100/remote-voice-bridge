@@ -21,3 +21,7 @@ _tmp*
 _w.txt
 _ci.log
 _chk.txt
+
+# 本机 agent 的工作记忆（.workbuddy/memory/*.md）—— 属于工作区数据，不是项目源码。
+# 显式忽略：它就在仓库目录里躺着，一次 `git add -A` 就会连人带事一起提交出去。
+.workbuddy/
