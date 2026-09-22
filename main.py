@@ -68,6 +68,14 @@ _pending_samples = deque()
 _audio_frames = 0
 _audio_peak   = 0
 
+# 被当成"自动重开麦回响"而吞掉的 audio_start 次数。
+#
+# 为什么要有这个数：这类"吞掉"以前只有一行 logger.debug，正式版日志级别是 INFO
+# —— 等于**一声不响地把遥控器的事件扔了**（本项目"静默丢弃"的老毛病）。
+# 2026-09-22 排查「按一下、刚开口就说不成」时，最关键的那两个 audio_start
+# 在日志里根本不存在，只能靠时序反推。吞掉多少、什么时候吞，必须看得见。
+_echo_swallowed = 0
+
 # 输出流（喂给 CABLE Input 那一路）的存活证据。
 #
 # 为什么非要这两个数：输出流是"建一次、start 一次"的，之后**没有任何监护** ——
@@ -698,7 +706,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
         nonlocal mic_reopen_at
-        global _audio_frames, _audio_peak
+        global _audio_frames, _audio_peak, _echo_swallowed
         last_ble_activity = time.time()
         try:
             data = bytes(args.characteristic_value)
@@ -763,8 +771,27 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 #   那是我们自己触发的，不是用户"第二次按下" —— 当成结束就会
                 #   "刚开立刻被关"，必须在这里挡掉。
                 if mic_reopen_at and (time.time() - mic_reopen_at) < MIC_REOPEN_GRACE:
-                    mic_reopen_at = 0.0
-                    logger.debug("↩ 忽略自动重开麦触发的 audio_start（非用户第二次按下）")
+                    # ⚠⚠ 这里**绝不能**把 mic_reopen_at 清零。
+                    #
+                    # 回响**不止一个**。2026-09-22 真机日志：松手补发 MIC_OPEN 之后，
+                    # 遥控器在 19ms 内回了两个 audio_start
+                    # （22:44:53.515 与 .534）。老写法"挡掉一个就把 mic_reopen_at
+                    # 清零"→ 第二个回响落到下面的 else → 当成"用户第二次按下"
+                    # → 注入热键（把输入法的语音输入**关掉**）+ 结束会话。
+                    # 用户看到的是「按一下、刚开口，一个字都出不来」。
+                    # 那天 22:00 之后的 10 次会话里，4 次在 1.2~1.6 秒内被结束。
+                    #
+                    # 代价方向（按项目定案）：少吞一个真按键＝"多听一会儿，再按一下
+                    # 就结束"（无害）；多吞一个回响＝"用户当场用不了"。拿不准就往
+                    # "不做"那边倒 —— 所以窗口内**全部**吞掉，不设次数上限。
+                    _echo_swallowed += 1
+                    if _echo_swallowed <= 3:
+                        logger.info(
+                            f"↩ 忽略自动重开麦的回响 audio_start（{MIC_REOPEN_GRACE}s "
+                            f"窗口内第 {_echo_swallowed} 次）"
+                        )
+                    else:
+                        logger.debug("↩ 又是自动重开麦的回响，已忽略")
                 elif not voice_active:
                     # 用户又开始说下一段了 → 上一条「待发送」显然不该再发出去。
                     # 例：说完一句觉得不对，紧接着按一下重说 —— 若不等这一下就
@@ -779,6 +806,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     #   自己把计数器清零造成的。）
                     _audio_frames = 0
                     _audio_peak   = 0
+                    # 回响计数按会话归零：这样每一段的前 3 次"吞掉"都会以 INFO
+                    # 出现在日志里，一眼能看出这一段有没有被回响干扰。
+                    _echo_swallowed = 0
                     voice_hotkey_down()      # tap=点按开始 / hold=按下并保持
                     voice_active     = True
                     voice_started_at = time.time()

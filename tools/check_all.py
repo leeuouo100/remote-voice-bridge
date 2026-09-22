@@ -38,6 +38,7 @@ STEPS = [
                   "tools/probe_devnode_binding.py",
                   "tools/takeover_hid_reports.py",
                   "tools/check_takeover_guard.py",
+                  "tools/check_voice_session.py",
                   "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -115,6 +116,11 @@ STEPS = [
     # 禁错那个就是白测一场 + 错判「软件到头了」）、禁用与恢复在同一条
     # PowerShell 命令里。带 2 条反例自证。
     ("接管 0x1812 的安全护栏", [PY, "tools/check_takeover_guard.py"]),
+    # 语音会话状态机是最反复出问题的地方（v1.0.7 / v1.0.13 都在这儿翻过车）。
+    # 这道闸钉「会话不许自己把自己关掉」：防自激窗口内要能吞下**多个**回响
+    # （2026-09-22 真机：两个 audio_start 隔 19ms，第 2 个把会话关了）、
+    # 松手不许结束会话、吞掉的事件不许静默。带 2 条反例自证。
+    ("语音会话状态机", [PY, "tools/check_voice_session.py"]),
 ]
 
 STEP_DEFAULTS = {"settle": 0.0, "retries": 0, "retry_hint": ""}
