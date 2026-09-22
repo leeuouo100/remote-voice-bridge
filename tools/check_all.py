@@ -36,6 +36,8 @@ STEPS = [
                   "tools/probe_gatt_hid.py", "tools/probe_hid_claim.py",
                   "tools/watch_all_channels.py",
                   "tools/probe_devnode_binding.py",
+                  "tools/takeover_hid_reports.py",
+                  "tools/check_takeover_guard.py",
                   "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -107,6 +109,12 @@ STEPS = [
     #   settle/retries 只加在它身上，别的步骤该红就红。
     ("按键注入自检", [PY, "tools/check_injection.py"],
      {"settle": 2.0, "retries": 1, "retry_hint": "钩子没收到"}),
+    # 接管 0x1812 的那个工具是**本项目唯一会改系统设备状态**的东西。
+    # 这道闸钉三件事：默认只读（不带 --go 一个字节都不改）、
+    # 目标必须是 BTHLEDEVICE 父节点（0x1812 底下还有 5 个 HID 子集合，
+    # 禁错那个就是白测一场 + 错判「软件到头了」）、禁用与恢复在同一条
+    # PowerShell 命令里。带 2 条反例自证。
+    ("接管 0x1812 的安全护栏", [PY, "tools/check_takeover_guard.py"]),
 ]
 
 STEP_DEFAULTS = {"settle": 0.0, "retries": 0, "retry_hint": ""}

@@ -176,6 +176,58 @@
 > `c_byte*24` 凑数，x64 上 `sizeof(INPUT)` 会算成 28 而不是 40，
 > `SendInput` 直接 `err=87`（ERROR_INVALID_PARAMETER）拒收，现象是"按键发不出去"。
 
+### 七、`0x1812` 底下不是一个节点 —— 「禁错一个」本来会得出**反的**结论
+
+武哥把硬件那条路直接否了：
+
+> 「P32我是不打算去做的，因为又要加个硬件，就完全违背了我用这个遥控器做语音输入
+>   或者是 Vibe Coding 遥控器的初衷了。」
+
+（他说的 P32 就是 ESP32。那个方案的前提"软件层已经不可能"从来没被验证过，
+`NullHidGatt.inf` 还是**未签名**的、注定装不上。）于是只剩最后一条纯软件的路：
+把 Windows 那个 HOGP 节点临时停掉、让 `0x1812` 空出来，我们自己订阅 Report(`0x2A4D`),
+**直接看遥控器到底发不发按键报告**。
+
+写这个工具时差点栽在一个地方：`0x1812` 底下**不是一个节点，是一父 + 5 个 HID 子集合**。
+
+```
+BTHLEDEVICE\…\9&1DC2FEEB&2&0023   HIDClass  mshidumdf   ← 握着 ATT/GATT 会话的
+HID\…&COL01\…                     Keyboard  kbdhid
+HID\…&COL03\…                     Mouse     mouhid
+HID\…&COL02/04/05\…               HIDClass  (无服务)
+```
+
+第一版写的是 `Get-PnpDevice | Where InstanceId -like '*00001812*' | Select-Object -First 1`.
+`-First 1` 拿到的是枚举顺序里第一个，真机上实测是 **`COL05`**（一个无服务的空集合）。
+禁掉它，会话还在父节点手里 → **一条报告也收不到** → 工具会理直气壮地判
+"遥控器确实不发按键，软件层到头了"。
+
+**那就是拿一个假阴性去关掉最后一条路。** 差一点。
+
+| 改哪 | 改成什么 |
+|---|---|
+| `PS_FIND` | ① 把 6 个节点**全列出来**（免得再"测的不是你以为的那个"）② 目标**只认** `BTHLEDEVICE*`，找不到就输出 `TARGETKIND=NONE`，Python 侧直接 `return 3`，**不退而求其次** |
+| 顺带修 | `$d.Service` 在 PS 5.1 的 `Get-PnpDevice` 对象上不一定有值（空得看不出来），改成显式取 `DEVPKEY_Device_Service`；读不到就印 `(读不到这个属性)`,不印空白 |
+| 顺带修 | 中文 Windows 的 PowerShell 往管道写的是 **CP936**，Python 按 UTF-8 解全是乱码 → 每条命令前置 `[Console]::OutputEncoding=[Text.Encoding]::UTF8` |
+
+判读是**二值**的，不许含糊：**收到报告** ⇒ 按键走 `0x1812`，本项目可以自己解码（纯软件就能做按键映射）；
+**订上了但 0 条** ⇒ 遥控器确实不往 HID 送按键数据，软件层没有可做的事了（也**不会再买硬件去试**）。
+
+安全设计三条（都写进闸里了）：默认只读（不带 `--go` 一个字节都不改）；
+禁用与恢复在**同一条** PowerShell 命令里（禁用→睡→启用），Python 这边崩了/Ctrl+C 也照样恢复；
+收尾**回读**节点状态，不是 `OK` 就喊人。
+
+闸：`tools/check_takeover_guard.py`（含 2 条反例自证 —— 改回
+`Get-PnpDevice | Select-Object -First 1` 必须报红）。
+
+> 这道闸自己第一版也栽在同一个坑上：判据用字面量匹配，而 `BTHLEDEVICE` 和
+> `Disable-PnpDevice` 恰好都写在**注释和说明文字**里 → 反例报不出红、只读分支被误判成"在禁用"。
+> 加 `_ps_code()` / `_code_only()` 先剥掉注释与 `say(...)` 输出行再判。
+> （`check_audio_watchdog.py` 的 `except queue.Full` 栽的是同一件事，已记在那边。）
+>
+> 一般规律：**判据会被"说明这段代码在干什么"的文字污染。** 注释里复述一遍老写法
+> 是人类的好习惯，却是字面量判据的毒药。
+
 ---
 
 ## v1.0.12：修「波形在动、输入法却没声音」；并推翻 v1.0.11 对按键的结论
