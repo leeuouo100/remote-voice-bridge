@@ -8,7 +8,7 @@
 ;     tag 就是唯一真源 —— 避免"tag 打的是 1.0.3、装出来的还是 1.0.2"这种事故。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.16"
+  #define MyAppVersion "1.0.17"
 #endif
 
 #define MyAppName "Remote Voice Bridge"
@@ -47,7 +47,7 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 
 [Languages]
-; 语言包随仓库提供：GitHub runner 自带�� Inno Setup 没有中文包，
+; 语言包随仓库提供：GitHub runner 自带的 Inno Setup 没有中文包，
 ; 直接引用 compiler:Languages\ChineseSimplified.isl 会编译失败。
 Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -65,7 +65,7 @@ Source: "{#MyFixBatName}"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\遥控器诊断（按键没反应时跑这个）"; Filename: "{app}\{#MyDiagExeName}"
 ; 换过 USB 口之后「程序说没连接、Windows 说已配对」——开始菜单直接修，不用找日志
-Name: "{group}\修复蓝牙配对（换过USB口/连不上时跑这个）"; Filename: "{app}\{#MyDiagExeName}"; Parameters: "--fix-pairing"
+Name: "{group}\修复蓝牙配对（换过USB口、连不上时跑这个）"; Filename: "{app}\{#MyDiagExeName}"; Parameters: "--fix-pairing"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 

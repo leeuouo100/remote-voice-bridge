@@ -14,7 +14,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.16"
+APP_VERSION = "1.0.17"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
