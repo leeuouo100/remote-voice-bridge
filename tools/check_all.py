@@ -149,6 +149,14 @@ STEPS = [
     # 免得假红逼人乱改文件；`--selftest` 里 7 条反例专门验这个。
     ("bat 的 Python 与编码一致性", [PY, "tools/check_bat_env.py"]),
     ("bat 一致性闸的自检", [PY, "tools/check_bat_env.py", "--selftest"]),
+    # 监听窗口**不许被某一路的成败绑住** —— 2026-09-23 真机翻车：
+    # 窗口原先长在 `gatt_part()` 函数体里，而那个函数有一条「BLE 连不上就
+    # return」的路。于是「遥控器连不上」这一个失败，把整个 90 秒窗口一起
+    # 带走了 —— 武哥双击 bat 看到的是「跑一下就结束，都没等我按按钮」，
+    # 而报告里只剩静态段（全是 0），读起来像「测过、0 条」，**其实没测**。
+    # 这条闸**人为制造当初那个条件**（把 gatt_part 换成立刻返回的假货），
+    # 再断言窗口照样跑满。反例实测过：掐掉窗口循环 → 立刻红。
+    ("监听窗口不被 GATT 成败绑住", [PY, "tools/watch_all_channels.py", "--selftest"]),
 ]
 
 STEP_DEFAULTS = {"settle": 0.0, "retries": 0, "retry_hint": ""}

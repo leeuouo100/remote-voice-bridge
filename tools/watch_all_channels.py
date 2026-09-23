@@ -87,23 +87,39 @@ ATVV_OPS = {
 }
 
 
-def bridge_running() -> bool:
+def bridge_probe() -> tuple:
+    """桥程序在不在跑 + **依据**。
+
+    ⚠ 判读私有服务那两路的前提就是这个（桥占着 ATVV）。而 09-23 那份报告
+      里**没有这一行** ⇒「桥在跑但它没被检出」与「桥真的没跑」两件事，
+      事后完全分不开。所以这里必须把依据也说出来，不能只回一个 bool。
+    """
     try:
         p = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq RemoteVoiceBridge.exe", "/NH"],
-            capture_output=True, text=True, timeout=6,
+            capture_output=True, text=True, timeout=6, errors="replace",
             creationflags=0x08000000)
-        return "RemoteVoiceBridge.exe" in (p.stdout or "")
-    except Exception:                                   # noqa: BLE001
-        return False
+        out = (p.stdout or "").strip()
+        if "RemoteVoiceBridge.exe" in out:
+            pid = next((t for t in out.split() if t.isdigit()), "?")
+            return True, f"在跑（PID≈{pid}）"
+        return False, f"没在跑（tasklist 回：{out[:40]!r}）"
+    except Exception as e:                              # noqa: BLE001
+        return False, f"查不出来：{e.__class__.__name__}: {e}（按「没在跑」继续）"
 
 
-def main() -> int:
+def bridge_running() -> bool:
+    return bridge_probe()[0]
+
+
+def main(argv: list | None = None) -> int:
     # 默认 90 秒：测 "遥控器按键有没有到 Windows" 要按 11 个键，
     # 45 秒太赶（一边读说明一边按），而窗口不够长时读到的 "0 条"
     # 会被当成"按键没来"—— 那是**测量误差**冒充结论（09-22 就误读过一次）。
     seconds = 90
-    a = sys.argv[1:]
+    # argv 可注入：--selftest 要在同一个进程里跑 main（下面直接调），
+    # 不能靠改 sys.argv。可测性也是这次的教训之一。
+    a = list(sys.argv[1:] if argv is None else argv)
     for i, x in enumerate(a):
         if x == "--seconds" and i + 1 < len(a):
             try:
@@ -123,9 +139,12 @@ def main() -> int:
     say("=" * 78)
     say(" remote-voice-bridge · 全通道监听（一次按键，看它走哪条路）")
     say(f" 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  版本：v{APP_VERSION}")
+    # 把「桥在不在跑」和它的依据一起写进报告 —— 上次缺这行，事后分不开。
+    _br, _br_why = bridge_probe()
+    say(f" 桥程序：{_br_why}")
     say("=" * 78)
 
-    if bridge_running() and not force:
+    if _br and not force:
         say("\n⛔ 桥程序（RemoteVoiceBridge.exe）在跑，它占着 ATVV，")
         say("   会让我们听不到 CTL 通道。请托盘右键「退出」后重跑；")
         say("   确实要带着它测就加 --force。")
@@ -158,22 +177,40 @@ def main() -> int:
 
         sel = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
         devs = await DeviceInformation.find_all_async_aqs_filter(sel)
-        tgt = None
-        for d in devs:
-            n = (d.name or "").lower()
-            if "remote" in n or "chromecast" in n:
-                tgt = d
-                break
-        if tgt is None:
-            say("\n❌ 没找到已配对的遥控器（BLE）")
+        cands = [d for d in devs
+                 if "remote" in (d.name or "").lower()
+                 or "chromecast" in (d.name or "").lower()]
+        say(f"\n  ▸ 已配对 BLE 设备 {len(devs)} 个，名字像遥控器的 {len(cands)} 个：")
+        for d in cands:
+            say(f"     · {d.name!r}  id={d.id}")
+        if not cands:
+            say("❌ 没找到已配对的遥控器（BLE）—— 下面那几路**仍然照测**。")
             return
-        try:
-            ble = await BluetoothLEDevice.from_id_async(tgt.id)
-        except OSError as e:
-            say(f"\n❌ 连接失败：{e}")
-            say("   带着桥程序跑（--force）时，蓝牙连接常被它占着；"
-                "退出桥程序后重跑通常就好。")
+
+        # ⚠ 配对列表里**不止一个条目**（一个在用、一个幽灵，见 09-19 的配对代数
+        #   记录）。旧代码"名字像就取第一个"⇒ 经常抓到幽灵，报
+        #   `[WinError -2147024809] 提供的设备 ID 不是有效的 BluetoothLEDevice 对象`，
+        #   而当时的提示文案还把它猜成"蓝牙被桥程序占着"——方向全错。
+        #   改成**逐个真打开、按连接状态挑**，并把每个条目的结果打进报告。
+        opened: list = []
+        for d in cands:
+            try:
+                b = await BluetoothLEDevice.from_id_async(d.id)
+            except Exception as e:                      # noqa: BLE001
+                say(f"     ❌ 打开失败（大概率是幽灵条目）："
+                    f"{e.__class__.__name__}: {e}")
+                continue
+            st = b.connection_status
+            say(f"     ✅ 打开成功，连接状态={int(st.value)}"
+                + ("" if st == BluetoothConnectionStatus.CONNECTED
+                   else "  ← 没连上（遥控器在睡，或这条是幽灵）"))
+            opened.append((b, st))
+        if not opened:
+            say("❌ 这些条目一个都打不开 —— GATT 这几路这次测不了。")
+            say("   但**下面的实时监听照跑**（键盘钩子 + HID 原始报告流不依赖 GATT）。")
             return
+        ble = next((b for b, st in opened
+                    if st == BluetoothConnectionStatus.CONNECTED), opened[0][0])
         if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
             say("\n⚠ BLE 未连接，等遥控器醒来（按任意键）最多 10 秒…")
             for _ in range(20):
@@ -246,60 +283,16 @@ def main() -> int:
                 except Exception as e:              # noqa: BLE001
                     say(f"     ❌ 订阅 {key} 失败：{e.__class__.__name__}: {e}")
 
-        # ── 实时监听 ──────────────────────────────────────────────
-        say("\n" + "=" * 78)
-        say(f" 现在开始 {seconds} 秒实时监听 —— 按**下面出现的提示**按键。")
-        say(" 分四段，每段**只按一个键**：确认 → 返回 → 主页 → 方向/音量。")
-        say(" （语音键走 ATVV，这里会看到 op 0x04；其它键看落在哪条通道）")
-        say("=" * 78)
-        # ⚠ 倒计时不是装饰：这一段以前是"打印完立刻开始计时"，
-        #   用户还在读说明、手还没伸到遥控器上，窗口已经烧掉一截，
-        #   最后看到"0 条"还以为按键没来 —— 其实是**没来得及按**。
-        #   这也是本工具上最容易被误读成"结论"的地方（09-22 那次就是这么读的）。
-        for n in (3, 2, 1):
-            say(f"   ⏳ {n} 秒后开始，把手放到遥控器上…")
-            await asyncio.sleep(1.0)
-        say("   🟢 开始！（下面会实时跳秒，跳满就是结束）")
-        # ── 分键提示（2026-09-23 加）────────────────────────────────
-        # ⚠ 为什么必须要它：08:53 那份报告里，**唯一能证明「人真按了键」的证据
-        #   是两条语音键**（20.6s / 46.0s 各一次 audio_start）。而 确认/返回/主页
-        #   到底按下去过没有，**报告里没有任何证据**。
-        #   于是「一条都没收到」就有了两种读法：「键没来」还是「他只按了语音键」
-        #   —— 分不出来。这和「窗口不够长」是同一类错误：**测量误差冒充结论**。
-        #   切成几段、每段只让按一个键之后，报告里带时间戳的那几行就能
-        #   直接对上「哪个键、在哪个窗口」，不再需要猜。
-        # ⚠ 段长按窗口算：--seconds 改小时自动缩短，不会出现"提示还没说完窗口就结束"。
-        seg = max(8, seconds // 4)
-        cues = [
-            (0,       "现在**只按【确认 OK】** 2~3 次，然后停手 5 秒"),
-            (seg,     "现在**只按【返回 ←】** 2~3 次，然后停手 5 秒"),
-            (seg * 2, "现在**只按【主页 ⌂】** 2~3 次，然后停手 5 秒"),
-            (seg * 3, "现在按**方向键 / 音量＋ / 音量－**（可选，不作结论）"),
-        ]
-        _said: set = set()
-        t0 = time.time()
-        last_tick = -1
-        while time.time() - t0 < seconds and not stop.is_set():
-            await asyncio.sleep(0.2)
-            el = time.time() - t0
-            tick = int(el)
-            for at, txt in cues:
-                if tick >= at and at not in _said:
-                    _said.add(at)
-                    # 先把实时那行顶下去，别和提示糊在同一行上
-                    print()
-                    # ⚠ 提示行**必须带实际秒数**：报告里的事件行是 `[ 20.64s] 键盘事件…`，
-                    #   只有提示行也带秒数，"哪一段是按哪个键"才能直接对照。
-                    #   否则两行都在报告里、却对不上号 —— 又是"顺序耦合看不见"。
-                    say(f"  ⏱ [第 {tick}s] 👉 {txt}")
-                    say(f"       （本段到第 {at + seg if at + seg <= seconds else seconds}s 为止）")
-            # 每秒刷**一次**（原来是 int(el) % 5 == 0 → 同一秒里刷 5 遍，白屏）
-            if tick != last_tick:
-                last_tick = tick
-                tot = sum(len(v) for v in live_hits.values())
-                print(f"  ⏱ 还剩 {seconds - tick:3d}s ｜ 已收到 {tot} 条  "
-                      f"（键盘事件会直接打印在下面）", end="\r", flush=True)
-        say("")
+        # ⚠⚠ 实时监听窗口**不在这里** —— 它在 main() 的 listen_window()。
+        #    2026-09-23 真机上翻过车：窗口原先是写在这个函数体里的，
+        #    而本函数**有一条提前 return 的路**（BLE 连不上时，见上面
+        #    `from_id_async` 的 except）。于是「遥控器连不上」这一个失败，
+        #    就把整个 90 秒窗口一起吞掉了 —— 用户双击 bat 看到的是
+        #    「跑一下就跑完了，都没等我按按钮」，报告里也只剩静态段，
+        #    看起来像「测了、0 条」，**实际是根本没测**。
+        #    ⇒ 铁律：**窗口是主循环的事，不是某一路的从属物**。
+        #      键盘钩子与 HID 原始报告流本来就不依赖 GATT，
+        #      GATT 挂掉只该让「少几路」，不该让「整场测试消失」。
         for key, ch, tok in subs:
             try:
                 ch.remove_value_changed(tok)
@@ -334,7 +327,71 @@ def main() -> int:
 
     th = threading.Thread(target=run_gatt, daemon=True, name="gatt")
     th.start()
-    th.join(timeout=seconds + 25)
+
+    # ── 实时监听窗口（**主线程，无条件跑满**）────────────────────────────
+    # ⚠ 这一段以前长在 gatt_part() 里面 —— BLE 一连不上就跟着被 return 掉，
+    #   真机上的表现是「双击 bat，跑一下就结束了，都没等我按按钮」，
+    #   而报告里只剩静态段，看上去像「测过、0 条」，**其实是根本没测**。
+    #   ⇒ GATT 订得上就多几路证据；**订不上也必须把窗口跑满** ——
+    #     键盘钩子和 HID 原始报告流本来就不依赖它。
+    say("\n" + "=" * 78)
+    say(f" 现在开始 {seconds} 秒实时监听 —— 按**下面出现的提示**按键。")
+    say(" 分四段，每段**只按一个键**：确认 → 返回 → 主页 → 方向/音量。")
+    say(" （语音键走 ATVV，这里会看到 op 0x04；其它键看落在哪条通道）")
+    say("=" * 78)
+    # ⚠ 倒计时不是装饰：这一段以前是"打印完立刻开始计时"，
+    #   用户还在读说明、手还没伸到遥控器上，窗口已经烧掉一截，
+    #   最后看到"0 条"还以为按键没来 —— 其实是**没来得及按**。
+    #   这也是本工具上最容易被误读成"结论"的地方（09-22 那次就是这么读的）。
+    for n in (3, 2, 1):
+        say(f"   ⏳ {n} 秒后开始，把手放到遥控器上…")
+        time.sleep(1.0)
+    say("   🟢 开始！（下面会实时跳秒，跳满就是结束）")
+    # ── 分键提示（2026-09-23 加）────────────────────────────────
+    # ⚠ 为什么必须要它：08:53 那份报告里，**唯一能证明「人真按了键」的证据
+    #   是两条语音键**（20.6s / 46.0s 各一次 audio_start）。而 确认/返回/主页
+    #   到底按下去过没有，**报告里没有任何证据**。
+    #   于是「一条都没收到」就有了两种读法：「键没来」还是「他只按了语音键」
+    #   —— 分不出来。这和「窗口不够长」是同一类错误：**测量误差冒充结论**。
+    #   切成几段、每段只让按一个键之后，报告里带时间戳的那几行就能
+    #   直接对上「哪个键、在哪个窗口」，不再需要猜。
+    # ⚠ 段长按窗口算：--seconds 改小时自动缩短，不会出现"提示还没说完窗口就结束"。
+    #   下界取 5 而不是 8：实测 `--seconds 8` 时 `max(8, 8//4)=8`，四段全挤在
+    #   同一秒上（第 0s 提示「确认」、第 8s 才提示「返回」而窗口已经结束）。
+    seg = max(5, seconds // 4)
+    cues = [
+        (0,       "现在**只按【确认 OK】** 2~3 次，然后停手 5 秒"),
+        (seg,     "现在**只按【返回 ←】** 2~3 次，然后停手 5 秒"),
+        (seg * 2, "现在**只按【主页 ⌂】** 2~3 次，然后停手 5 秒"),
+        (seg * 3, "现在按**方向键 / 音量＋ / 音量－**（可选，不作结论）"),
+    ]
+    _said: set = set()
+    t0 = time.time()
+    last_tick = -1
+    while time.time() - t0 < seconds:
+        time.sleep(0.2)
+        el = time.time() - t0
+        tick = int(el)
+        for at, txt in cues:
+            if tick >= at and at not in _said:
+                _said.add(at)
+                # 先把实时那行顶下去，别和提示糊在同一行上
+                print()
+                # ⚠ 提示行**必须带实际秒数**：报告里的事件行是 `[ 20.64s] 键盘事件…`，
+                #   只有提示行也带秒数，"哪一段是按哪个键"才能直接对照。
+                #   否则两行都在报告里、却对不上号 —— 又是"顺序耦合看不见"。
+                say(f"  ⏱ [第 {tick}s] 👉 {txt}")
+                say(f"       （本段到第 {at + seg if at + seg <= seconds else seconds}s 为止）")
+        # 每秒刷**一次**（原来是 int(el) % 5 == 0 → 同一秒里刷 5 遍，白屏）
+        if tick != last_tick:
+            last_tick = tick
+            tot = sum(len(v) for v in live_hits.values())
+            print(f"  ⏱ 还剩 {seconds - tick:3d}s ｜ 已收到 {tot} 条  "
+                  f"（键盘事件会直接打印在下面）", end="\r", flush=True)
+    say("")
+
+    # 窗口跑完了才让 GATT 收尾（它要么早已结束，要么在做收尾订阅）
+    th.join(timeout=10)
     stop.set()
     time.sleep(0.5)
     w.stop()
@@ -419,5 +476,67 @@ def main() -> int:
     return 0
 
 
+def selftest() -> int:
+    """反例自证：**GATT 挂掉时，监听窗口仍然必须跑满**。
+
+    为什么必须有这条：
+      2026-09-23 真机上翻车 —— 窗口原先长在 `gatt_part()` 函数体里，而那个
+      函数有一条「BLE 连不上就 return」的路。于是「遥控器连不上」这一个失败，
+      把整个 90 秒窗口一起带走了。用户看到的是「双击 bat，跑一下就结束，
+      都没等我按按钮」，而报告里只剩静态段 —— 静态段里全是 0，读起来像
+      「测过、0 条」，**其实是根本没测**。
+
+    本测试**人为制造当初那个条件**（把 gatt_part 换成立刻返回的假货），
+    再断言窗口照样跑满。谁要是把窗口搬回 GATT 里，这里立刻红。
+    """
+    import contextlib
+    import tempfile
+
+    secs = 4
+    tmp = Path(tempfile.gettempdir()) / "rvb-watch-selftest.txt"
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+
+    globals()["OUT"] = tmp
+    globals()["bridge_probe"] = lambda: (False, "selftest：假装没在跑")
+
+    async def _dead_gatt() -> None:
+        # 历史条件的复现：BLE 连不上 ⇒ 老代码就在这儿 return 掉了
+        pass
+
+    globals()["gatt_part"] = _dead_gatt
+
+    with open(os.devnull, "w", encoding="utf-8") as _null, \
+            contextlib.redirect_stdout(_null):
+        t0 = time.time()
+        rc = main(["--seconds", str(secs)])
+        el = time.time() - t0
+    txt = tmp.read_text(encoding="utf-8") if tmp.exists() else ""
+
+    checks = [
+        # ⚠ 反例实测过：把窗口循环掐成 `while False:` 之后，**只有下面第二条会红** ——
+        #   「🟢 开始」那行打在循环之前，掐掉窗口它照样是绿的。
+        #   ⇒ **别把耗时断言当冗余删掉**，它是这条闸门唯一真正起作用的判据。
+        ("窗口真的跑起来了（报告里有「🟢 开始」）", "🟢 开始" in txt),
+        (f"窗口跑满（{el:.1f}s ≥ {3 + secs}s = 3s 倒计时 + {secs}s 窗口）",
+         el >= 3 + secs),
+        ("GATT 失败不影响退出码", rc == 0),
+        ("报告里有「桥程序：」那行证据", "桥程序：" in txt),
+        ("报告跑到底（有【结论】段，不是半路断掉）", "【结论】" in txt),
+    ]
+    for n, ok in checks:
+        print(f"  {'✅' if ok else '❌'} {n}")
+    bad = [n for n, ok in checks if not ok]
+    if bad:
+        print(f"\nSELFTEST FAIL：{len(bad)} 项没过 —— 监听窗口又被 GATT 的成败绑住了？")
+        return 1
+    print("\nSELFTEST PASS —— GATT 挂掉时监听窗口仍跑满")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(selftest())
     sys.exit(main())
