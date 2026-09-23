@@ -135,6 +135,20 @@ STEPS = [
     # 所以它脱离注册表单独可测，带 8 项自检（含"四种输入的判词必须两两不同"
     # 这条反例 —— 防止硬编码凑）。
     ("按键不通的判词", [PY, "tools/probe_hogp_state.py", "--selftest"]),
+    # 仓库根目录 .bat 的两条一致性 —— 都是 2026-09-23 真机上踩到的，
+    # 而且**都会让「用户双击一下」失败，而失败的往往正是他此刻最需要的那一步**。
+    #   ① 四个 bat 各写各的 Python 探测：只有一部分去找 WorkBuddy 托管环境那个
+    #      （本机唯一装齐 bleak/winsdk/keyboard 的解释器），而本机**没有** .venv
+    #      ⇒ 同一台机器上「一个工具能跑、另一个报当前 Python 跑不起来」。
+    #      这两件事看起来无关，其实在同一个用户路径上一前一后（先修复、再复测）。
+    #   ② .bat 的字节编码和它自己声明的 chcp 打架：`diag-remote.bat` / `run.bat`
+    #      是 UTF-8 字节却没写 chcp，中文 echo 在 936 控制台上必然是乱码。
+    #      我还犯过反向的错：按「中文 Windows 一律 GBK」把一个 chcp 65001 的
+    #      文件转了编码，框线字符直接编不出来 ⇒ **文件自己的 chcp 才是准的**。
+    # 两条边界都按实测收窄过（只算非注释行／只算自己挑解释器的 bat），
+    # 免得假红逼人乱改文件；`--selftest` 里 7 条反例专门验这个。
+    ("bat 的 Python 与编码一致性", [PY, "tools/check_bat_env.py"]),
+    ("bat 一致性闸的自检", [PY, "tools/check_bat_env.py", "--selftest"]),
 ]
 
 STEP_DEFAULTS = {"settle": 0.0, "retries": 0, "retry_hint": ""}

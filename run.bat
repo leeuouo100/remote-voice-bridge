@@ -1,6 +1,11 @@
 @echo off
+chcp 65001 >nul
 cd /d "%~dp0"
 
+REM ── 本文件是 UTF-8 字节，所以必须自己 chcp 65001 ─────────────────────────────
+REM    2026-09-23 补：以前没写，而下面有十几行中文 echo + 框线，
+REM    中文 Windows 的 cmd 默认 936，那些字全是乱码。
+REM    ⚠ 不要因为"中文 Windows 就用 GBK"把它转编码 —— 文件自己的 chcp 才是准的。
 REM ── Check Python ──────────────────────────────────────────────────────────────
 python --version >nul 2>&1
 if errorlevel 1 (

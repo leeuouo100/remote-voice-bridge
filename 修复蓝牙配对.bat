@@ -39,13 +39,21 @@ if exist "%~dp0RemoteVoiceBridgeDiag.exe" (
     exit /b
 )
 
-set PY=python
-if exist ".venv\Scripts\python.exe" set PY=.venv\Scripts\python.exe
+REM ⚠ 找 Python 的顺序必须与「测遥控器按键通道.bat」一致：
+REM   本机真正能跑的是 WorkBuddy 托管环境里的那个（**不在 PATH 上**）。
+REM   只写 set PY=python 时，从源码目录双击会直接报「当前 Python 跑不起来」——
+REM   而这一步正是「重配之后必须跑的那一步」，卡在这里最浪费时间。
+set PY=
+if exist "%USERPROFILE%\.workbuddy\binaries\python\envs\rvb\Scripts\python.exe" set "PY=%USERPROFILE%\.workbuddy\binaries\python\envs\rvb\Scripts\python.exe"
+if not defined PY if exist ".venv\Scripts\python.exe" set PY=.venv\Scripts\python.exe
+if not defined PY set PY=python
 
 %PY% -c "import winreg" >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo  [ERROR] 当前 Python 跑不起来。先跑一次 run.bat 让它把依赖装好。
+    echo  [ERROR] 当前 Python 跑不起来。
+    echo          试过：%%USERPROFILE%%\.workbuddy\binaries\python\envs\rvb\ 、.venv\ 、PATH 上的 python
+    echo          都不行。安装版请直接双击安装目录里的本文件（那边走 Diag exe，不需要 Python）。
     echo.
     pause & exit /b 1
 )
