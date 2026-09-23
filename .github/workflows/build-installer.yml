@@ -93,6 +93,17 @@ jobs:
       - name: Packaging entry check
         run: python tools/check_packaging.py
 
+      # 仓库根目录 .bat 的两条一致性：① 凡"自己挑解释器"的 bat，Python 候选必须逐项同序
+      # ② 会打印非 ASCII 的行必须自己声明 chcp。两条都会让「用户双击一下」直接失败，
+      # 而失败的往往正是他此刻最需要的那一步（先 `修复蓝牙配对.bat`、再 `测遥控器按键通道.bat`）。
+      # v1.0.15 真机踩到：四个 bat 各写各的探测，而本机没有 .venv、PATH 上那个 python
+      # 又没装 bleak/winsdk ⇒ 同一台机器上「一个工具能跑、另一个报当前 Python 跑不起来」。
+      # 连 --selftest 一起跑：7 条反例验证这道闸自己会不会红（含 2 条专门防假红）。
+      - name: Bat env consistency check
+        run: |
+          python tools/check_bat_env.py
+          python tools/check_bat_env.py --selftest
+
       - name: Build with PyInstaller
         run: pyinstaller remote-voice-bridge.spec --noconfirm
 
