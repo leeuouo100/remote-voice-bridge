@@ -74,10 +74,26 @@ OUT = CONFIG_DIR / "watch-all-channels.txt"
 
 ATVV_CTL = "ab5e0004-5a21-4f05-bc7d-af01f617b664"
 ATVV_AUD = "ab5e0003-5a21-4f05-bc7d-af01f617b664"
-SKIP_SERVICES = {
+# ⚠ 这里以前叫 `SKIP_SERVICES`、里面装的是**特征** UUID，判断时却拿
+#   **服务** UUID 去比（`if su in SKIP_SERVICES`）⇒ 永远不成立，音频流特征
+#   一直被订上（09-23 的报告里就能看到 `已订阅 ab5e0001/ab5e0003`）。
+#   那次没出事只因为当时没有音频流；一旦真有流，它会灌进来海量字节、
+#   把按键证据全淹掉。**"跳过名单"和"被跳过的对象"必须是同一层的东西。**
+SKIP_CHARS = {
     # 音频流特征：订阅了会灌进来海量字节，淹掉按键证据
     ATVV_AUD,
 }
+# 阳性对照用的 key：订阅表里的 key 形如「服务前 8 位/特征前 8 位」
+CTL_KEY = "ab5e0001/ab5e0004"
+
+# ── 测试注入点（只给 --selftest 用）─────────────────────────────────
+# ⚠ 为什么必须是**模块级**变量：`gatt_part` 是 main() 的**局部**函数，
+#   所以 `globals()["gatt_part"] = 假货` **一点用都没有** —— Python 解析这个名字时
+#   先在 main 的局部作用域里就把它找到了。2026-09-24 实测踩到：
+#   自检自称"人为制造 GATT 失败"，实际上**真的 gatt_part 一直在跑**
+#   （真枚举、真订阅、还真花了十几秒）—— 一个永远不生效的替身等于没测，
+#   那道闸门测的根本不是它声称的东西。
+GATT_RUNNER = None
 HOGP = "00001812-0000-1000-8000-00805f9b34fb"
 
 # ATVV CTL 上已知的 opcode（用来把"认不出的"标出来）
@@ -127,6 +143,15 @@ def main(argv: list | None = None) -> int:
             except ValueError:
                 pass
     force = "--force" in a
+    # 阳性对照的等待上限：这一步要人从"读说明"到"按下去"，给足但别无限等
+    # （它占的是窗口之前的时间，等太久会让人以为程序卡住）。
+    control_wait = 15.0
+    for i, x in enumerate(a):
+        if x == "--control-wait" and i + 1 < len(a):
+            try:
+                control_wait = max(3.0, min(120.0, float(a[i + 1])))
+            except ValueError:
+                pass
 
     lines: list[str] = []
     lock = threading.Lock()
@@ -244,7 +269,10 @@ def main(argv: list | None = None) -> int:
             say(f"  ▸ {su}  特征 {len(cr.characteristics)} 个，"
                 f"其中可 notify {len(notify_chars)} 个")
             for ch in cr.characteristics:
-                if su in SKIP_SERVICES:
+                cu_skip = str(ch.uuid).lower()
+                if cu_skip in SKIP_CHARS:
+                    say(f"     ⏭ 跳过 {su[:8]}/{cu_skip[:8]}"
+                        f"（音频流特征，订上会淹掉按键证据）")
                     continue
                 v = int(getattr(ch.characteristic_properties, "value",
                                 ch.characteristic_properties))
@@ -320,13 +348,57 @@ def main(argv: list | None = None) -> int:
         say(f"  ⚠ {w.hook_error}")
 
     def run_gatt():
+        # 走注入点：自检要能真的把 GATT 那一路换掉（见模块顶部 GATT_RUNNER）
+        runner = GATT_RUNNER or gatt_part
         try:
-            asyncio.run(gatt_part())
+            asyncio.run(runner())
         except Exception as e:                          # noqa: BLE001
             say(f"\n❌ GATT 部分异常：{e.__class__.__name__}: {e}")
 
     th = threading.Thread(target=run_gatt, daemon=True, name="gatt")
     th.start()
+
+    # ── 🎤 阳性对照（2026-09-23 加）─────────────────────────────────────
+    # ⚠ 这东西为什么必须有：这案子最反复的失败**不是"没收到"**，而是**收到 0
+    #   的时候读不出「是没来」还是「没测」** —— 人没按、按晚了、订阅还没建立、
+    #   链路断了，在报告里**长得一模一样**。09-22 把它读成"按键没来"，
+    #   09-23 又读成"测过了、0 条"，两次都是**测量误差冒充结论**。
+    #
+    #   语音键是这个设备上**唯一已知能到**的通道（ATVV CTL op 0x04，桥程序
+    #   天天在用）⇒ 拿它当**阳性对照**：
+    #     收到了 ⇒ 设备能发、工具在听、你确实按了 ⇒ 后面的 0 才是「真 0」；
+    #     没收到 ⇒ 这一轮**没测成**，报告里必须这么写，不许把 0 当结论。
+    #   这是本工具第一条**能自证"这次到底测成没测成"**的机制。
+    ctl_before = len(live_hits.get(CTL_KEY, []))
+    _tw = time.time() + 8.0
+    while time.time() < _tw:
+        if CTL_KEY in subs_ok:
+            break
+        # GATT 线程已结束、又一个都没订上 ⇒ 立刻跳过，别白等
+        # （--selftest 走的就是这条路：假 gatt 立刻返回）
+        if not th.is_alive() and not subs_ok:
+            break
+        time.sleep(0.2)
+    if CTL_KEY not in subs_ok:
+        control = "unavailable"
+    else:
+        print()
+        say("=" * 78)
+        say(" 🎤 先做一次【链路自检】：请**按一次【语音键】**（麦克风那个键）")
+        say("    目的只是证明「设备能发 + 工具在听 + 你确实按了」。")
+        say("    收到了就往下走；没收到也照测，但结果只能读成「没测成」。")
+        say("=" * 78)
+        control = "missed"
+        _tc = time.time() + control_wait
+        while time.time() < _tc:
+            if len(live_hits.get(CTL_KEY, [])) > ctl_before:
+                control = "ok"
+                break
+            print("  ⏳ 等你按语音键… 还剩 %2ds   " % int(_tc - time.time()),
+                  end="\r", flush=True)
+            time.sleep(0.2)
+        say("    → " + ("✅ 收到了 —— 链路是通的，下面那些 0 才算数"
+                       if control == "ok" else "❌ 一条都没来（见后面判读）"))
 
     # ── 实时监听窗口（**主线程，无条件跑满**）────────────────────────────
     # ⚠ 这一段以前长在 gatt_part() 里面 —— BLE 一连不上就跟着被 return 掉，
@@ -409,6 +481,10 @@ def main(argv: list | None = None) -> int:
     say(f"  {'⌨ 键盘钩子 · 注入（本程序自己发的）':<44}{len(inj):>6}")
     if unk:
         say(f"  {'⌨ 键盘钩子 · 分不出是否注入':<44}{len(unk):>6}")
+    _n_ctl = len(live_hits.get(CTL_KEY, []))
+    say(f"  {'🎤 阳性对照 · 语音键（ATVV CTL）':<44}{_n_ctl:>6}   "
+        + ("← 收到 ⇒ 设备能发/工具在听/你确实按了" if _n_ctl
+           else "← 见下面的判读"))
     # ⚠ 这里**必须**把 `c.status` 一起打出来（`hidwatch.summary_lines` 就是这么做的）。
     #   2026-09-23 真机上踩了这个坑：只打数字时，`打开 3 路` 而表里 5 行全 0 ——
     #   读报告的人会把「这一路我们**根本没打开**、什么都没观测到」当成
@@ -447,6 +523,27 @@ def main(argv: list | None = None) -> int:
         _i = 0
     for ln in _sl[_i:]:
         say(ln)
+
+    # ── 🎤 阳性对照的判读 ────────────────────────────────────────────
+    #   ✅ 通过：设备能发 + 工具在听 + 人确实按了 ⇒ 上面那些 0 是**真 0**。
+    #   ❌ 没通过：**不许**把 0 读成「按键没来」—— 这一轮是「没测成」。
+    #   ⚠ 不可用：ATVV 被占着（多半是桥程序在跑）⇒ 只能读成「没观测到」。
+    say("")
+    if control == "ok":
+        say("  → 🎤 阳性对照：**✅ 通过**（语音键的 CTL 通知收到了）")
+        say("     · 设备能往这台 PC 发通知、工具在听、你确实按了")
+        say("     · ⇒ 上面那些 0 是**真 0**：按键没有到达这台 PC，")
+        say("       既不是「没测」，也不是「没来得及按」。")
+    elif control == "missed":
+        say("  → 🎤 阳性对照：**❌ 没通过**（语音键的 CTL 一条都没来）")
+        say("     ⇒ 这一轮**没测成**：可能是你没按/按晚了，")
+        say("       也可能是设备真的没发 —— 这两种从报告里分不开。")
+        say("     ⚠ **这份报告里的 0 不能读成「按键没来」**，重跑一次，")
+        say("       等屏幕出现提示之后再按。")
+    else:
+        say("  → 🎤 阳性对照：**⚠ 不可用**（ATVV CTL 没订上，多半是桥程序占着）")
+        say("     ⇒ 这一轮**无法自证**「测成没测成」：0 只能读成")
+        say("       「我们没观测到」，不能读成「按键没来」。")
 
     if not subs_ok:
         say("")
@@ -502,11 +599,15 @@ def selftest() -> int:
     globals()["OUT"] = tmp
     globals()["bridge_probe"] = lambda: (False, "selftest：假装没在跑")
 
+    # ⚠ 必须走模块级注入点：`gatt_part` 是 main() 的局部函数，
+    #   `globals()["gatt_part"] = ...` 拦不住它（09-24 实测确认）。
+    _ran: list = []
+
     async def _dead_gatt() -> None:
         # 历史条件的复现：BLE 连不上 ⇒ 老代码就在这儿 return 掉了
-        pass
+        _ran.append(1)          # 留下"替身真的跑过"的证据
 
-    globals()["gatt_part"] = _dead_gatt
+    globals()["GATT_RUNNER"] = _dead_gatt
 
     with open(os.devnull, "w", encoding="utf-8") as _null, \
             contextlib.redirect_stdout(_null):
@@ -514,6 +615,7 @@ def selftest() -> int:
         rc = main(["--seconds", str(secs)])
         el = time.time() - t0
     txt = tmp.read_text(encoding="utf-8") if tmp.exists() else ""
+    globals()["GATT_RUNNER"] = None
 
     checks = [
         # ⚠ 反例实测过：把窗口循环掐成 `while False:` 之后，**只有下面第二条会红** ——
@@ -523,7 +625,15 @@ def selftest() -> int:
         (f"窗口跑满（{el:.1f}s ≥ {3 + secs}s = 3s 倒计时 + {secs}s 窗口）",
          el >= 3 + secs),
         ("GATT 失败不影响退出码", rc == 0),
+        # ⚠ 这条是"闸门的闸门"：替身要是没生效，上面所有断言都是在真 GATT
+        #   还活着的情况下过的 —— 等于什么都没证明（09-24 之前就是这样）。
+        ("替身真的生效了（假 gatt_part 确实跑过）", bool(_ran)),
         ("报告里有「桥程序：」那行证据", "桥程序：" in txt),
+        # 阳性对照是"这次到底测成没测成"的唯一凭据，报告里必须留痕。
+        ("报告里有「🎤 阳性对照」的判读", "🎤 阳性对照" in txt),
+        # 反例：对照逻辑要是写成"无条件等满 control_wait"，窗口就被拖长了。
+        # selftest 里 GATT 是假的 ⇒ 对照必须是"不可用"⇒ 一步都不等。
+        (f"阳性对照没拖长窗口（{el:.1f}s ≤ {3 + secs + 8}s）", el <= 3 + secs + 8),
         ("报告跑到底（有【结论】段，不是半路断掉）", "【结论】" in txt),
     ]
     for n, ok in checks:

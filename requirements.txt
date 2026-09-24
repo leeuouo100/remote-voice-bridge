@@ -11,6 +11,8 @@ winrt-Windows.Devices.Enumeration==3.2.1
 winrt-Windows.Storage.Streams==3.2.1
 winrt-Windows.Foundation==3.2.1
 winrt-Windows.Foundation.Collections==3.2.1
+# 可选：tools\radio_cycle.py 用它开关蓝牙（缺了那个脚本会打印手动步骤，不崩）
+winrt-Windows.Devices.Radios==3.2.1
 
 # 合成按键（Interception 不可用时的降级路径）
 keyboard==0.13.5
