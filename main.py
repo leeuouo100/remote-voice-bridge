@@ -543,6 +543,65 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
     )
 
 
+# ── BLE 链路建立 ───────────────────────────────────────────────────────────────
+async def _hold_ble_connection(ble, timeout: float = 20.0):
+    """主动把 BLE 链路拉起来，并尽量维持住。
+
+    为什么不能只"看一眼 connection_status"：
+    WinRT 的 `BluetoothLEDevice.from_id_async()` **只取回设备对象，不发起连接**。
+    链路要等下面三件事之一发生才会真的建立：
+      ① 遥控器自己醒来广播（用户按键）；
+      ② 我们访问一次 GATT（get_gatt_services_async）；
+      ③ 建一个 GattSession。
+
+    老代码只依赖 ①，而且只等 10×0.5s = **5 秒**。2026-09-28 实测：这台机器上
+    从"设备对象就绪"到 connection_status 变成 1 需要约 **10 秒** —— 5 秒窗口
+    必然判失败，于是每轮重连都在半路放弃、下一轮又重新 from_id_async 把进度清零，
+    日志里只剩「Connection failed」，看着像"遥控器没醒"，其实是**等得不够久**。
+
+    返回 (是否已连接, GattSession 或 None)。
+    ⚠ 调用方**必须持有**返回的 GattSession —— 它被 GC 回收时链路会跟着断。
+    """
+    from winrt.windows.devices.bluetooth import BluetoothConnectionStatus
+
+    sess = None
+
+    # ① 先建 GattSession 并声明「我要维持连接」。
+    #    这是 WinRT 里唯一能让 Windows 主动保持 BLE 链路的手段：
+    #    没有它，系统空闲时会把链路断掉，遥控器随即进入睡眠
+    #    —— 也正是老代码注释里那个「ATVV 静默 ≠ 链路断了」的老问题。
+    try:
+        from winrt.windows.devices.bluetooth.genericattributeprofile import GattSession
+        bdid = getattr(ble, "bluetooth_device_id", None)
+        if bdid is not None:
+            sess = await GattSession.from_device_id_async(bdid)
+            if sess is not None and getattr(sess, "can_maintain_connection", False):
+                sess.maintain_connection = True
+                logger.info("🔗 已请求维持 BLE 连接（GattSession.maintain_connection）")
+    except Exception as e:                       # noqa: BLE001
+        # 拿不到 GattSession 不影响后面 ②③ —— 降级即可，不要因此中断连接。
+        logger.warning("⚠️  建立 GattSession 失败（降级继续）：%r", e)
+
+    if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
+        return True, sess
+
+    # ② 触发一次 GATT 访问 —— 只读 connection_status 不会让系统去连。
+    try:
+        await ble.get_gatt_services_async()
+    except Exception as e:                       # noqa: BLE001
+        logger.debug("触发连接时 get_gatt_services_async 抛异常（可忽略）：%r", e)
+
+    # ③ 等链路真正建起来。实测约 10 秒，这里给 20 秒余量。
+    waited = 0.0
+    while waited < timeout:
+        if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
+            return True, sess
+        await asyncio.sleep(0.5)
+        waited += 0.5
+
+    return ble.connection_status == BluetoothConnectionStatus.CONNECTED, sess
+
+
 # ── Main bridge ────────────────────────────────────────────────────────────────
 async def run_bridge(device_type: str | None = None, name_hint: str | None = None):
     cfg = Config.load()
@@ -593,17 +652,22 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     ble = await _open_ble_device(dev_info)
     if ble is None:
         return False
+
+    # ⚠ 必须把 GattSession 存成局部变量：run_bridge 的栈一直活着，
+    #   它就不会被 GC 回收，链路也就能一直维持住。
+    ble_session = None
     if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
         logger.warning("⚠️  Not connected yet — remote may be sleeping. Press any button to wake.")
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
-                break
-        if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
-            logger.error("❌ Connection failed")
-            # 让托盘/控制台说真话，而不是继续显示「按遥控器任意键唤醒」
-            state.update(last_event="连接超时（遥控器可能没醒）")
-            return False
+    connected, ble_session = await _hold_ble_connection(ble)
+    if not connected:
+        logger.error(
+            "❌ Connection failed —— 20 秒内没能建立 BLE 链路。\n"
+            "   处置：按一下遥控器上任意一个键把它唤醒（别只按一次就等），\n"
+            "   然后点托盘菜单里的「重新连接」。"
+        )
+        # 让托盘/控制台说真话，而不是继续显示「按遥控器任意键唤醒」
+        state.update(last_event="连接超时（遥控器可能没醒）")
+        return False
     logger.info(f"✅ Connected  status={ble.connection_status}")
     state.update(connected=True, device=dev_info.name or "", last_event="已连接")
 
@@ -1720,6 +1784,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         try: hotkey_up()
         except Exception: pass
         state.reset()
+        # 松开「维持连接」的请求，让 Windows 可以正常休眠这条链路；
+        # 不显式清掉的话，托盘退出后遥控器会被系统一直拽着不放。
+        if ble_session is not None:
+            try: ble_session.maintain_connection = False
+            except Exception: pass
+            try: ble_session.close()
+            except Exception: pass
         if sysmic is not None:
             try: sysmic.stop()
             except Exception: pass

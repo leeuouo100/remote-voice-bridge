@@ -7,6 +7,71 @@
 
 ---
 
+## v1.0.19：连接窗口 5 秒 → 20 秒，并主动把链路拉起来
+
+### 一、老代码只等 5 秒，而 `from_id_async()` 根本不发起连接
+
+`run_bridge()` 里的连接判定是：
+
+```python
+if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
+    for _ in range(10):            # 10 × 0.5s = 5 秒
+        await asyncio.sleep(0.5)
+        if ble.connection_status == CONNECTED:
+            break
+```
+
+两个问题叠在一起：
+
+1. **`BluetoothLEDevice.from_id_async()` 只取回设备对象，不发起连接。**
+   链路要等 ① 遥控器自己醒来广播 ② 我们访问一次 GATT ③ 建一个 `GattSession`
+   三者之一发生才会真的建立 —— 而老代码只依赖 ①。
+2. **5 秒太短。** 真机实测（2026-09-28）从「设备对象就绪」到
+   `connection_status` 变成 1 需要约 **10 秒**。
+
+相乘的结果是：每轮重连都在半路放弃 → 下一轮又 `from_id_async` 把进度清零 →
+日志里只剩 `❌ Connection failed`，**看着像"遥控器没醒"，其实是等得不够久**。
+真机日志（2026-09-28 14:05:18）：
+
+```
+14:05:18,584 🔗 Connecting...
+14:05:18,820 ⚠️  Not connected yet — remote may be sleeping. Press any button to wake.
+14:05:23,934 ❌ Connection failed          ← 只隔了 5.1 秒
+```
+
+### 二、新增 `_hold_ble_connection()`：建会话 → 主动触发 → 等 20 秒
+
+- 先建 `GattSession` 并置 `maintain_connection = True` —— 这是 WinRT 里唯一
+  能让 Windows 主动保持 BLE 链路的手段（没有它，系统空闲时会把链路断掉，
+  遥控器随即进入睡眠，也就是老注释里那个「ATVV 静默 ≠ 链路断了」的老问题）；
+- 主动调一次 `get_gatt_services_async()` 触发连接 ——
+  **只读 `connection_status` 不会让系统去连**；
+- 等待窗口放宽到 **20 秒**（比实测的 10 秒留一倍余量）。
+
+调用方必须用**局部变量**持有返回的 `GattSession`：**它被 GC 回收时链路会跟着断**。
+`finally` 里回置 `maintain_connection = False` 并 `close()` ——
+不显式清掉的话，托盘退出后遥控器会被系统一直拽着不放。
+
+> ⚠ 代价要说清楚：`maintain_connection` 期间遥控器会被**持续保持连接**（耗电略增）。
+> 所以退出路径上的那两行清理**不是可选项**。
+
+### 三、失败时把话说清楚
+
+超时日志从一句 `❌ Connection failed` 改成带处置的三行：告诉用户
+**按一下遥控器上的键**把它唤醒，再去托盘点「重新连接」。
+
+### 四、诚实说明：这一版没解决什么
+
+这一版**没有**解决「遥控器按键报告一条都不来」那件事
+（见 [docs/遥控器按键-结论与下一步.md](docs/遥控器按键-结论与下一步.md)）。
+它解决的是**更前面的一环**：遥控器已经醒着的时候，程序能不能连上它。
+
+真机上「叫醒一个已经睡着的遥控器」**仍然只能靠物理按键** ——
+`maintain_connection` 和 `radio_cycle.py`（无线电复位）都试过，叫不醒。
+BLE 外设进入深度睡眠后只会响应自己的按键，这是协议层面的事，不是代码能补的。
+
+---
+
 ## v1.0.18：让报告能自证「这次到底测成没测成」+ 蓝牙无线电复位
 
 这一版回应的是一件更根本的事：**报告里出现 0 时，读不出「没来」还是「没测」**。
