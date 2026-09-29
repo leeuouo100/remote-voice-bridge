@@ -88,6 +88,44 @@ class SessionCoordinator:
             self._try_close()
         # toggle: close on next audio_stop
 
+    def close(self, reason: str = "session end") -> bool:
+        """**无条件**收尾：发 MIC_CLOSE + 相位归 CLOSED（幂等）。返回是否真发了命令。
+
+        ⚠⚠ 为什么不能拿 `voice_key_up()` / `_try_close()` 当收尾入口 ——
+        这是 2026-09-29 审查报告 P0-1 的核心，也是真机上「会话结束了、
+        遥控器还在推流」的直接原因。那两条路各有一道门槛：
+
+            voice_key_up()  → 只在 `_mode == "hold"` 时才调 `_try_close()`
+                              （toggle 模式干脆什么都不做）
+            _try_close()    → 开头就 `if self.state.phase != Phase.OPEN: return`
+
+        而会话收尾有 **6 条**路径（再按语音键 / 键盘确认键 / 厂商页确认键 /
+        超时 / 断连 / 退出），其中"确认键""超时""断连""退出"这几条走到这里时，
+        相位往往**已经不是 OPEN** 了（audio_stop 早就把它打回 CLOSED）。
+        于是这两道门槛一起把它挡在外面 → MIC_CLOSE 一次都没发出去 →
+        遥控器那头以为会话还在，**继续推流**。
+        真机实证（2026-09-29 11:26:34 结束）：日志里再没有任何 MIC_CLOSE，
+        音频帧从 600 一路涨到 3761，多推了 52 秒。
+
+        ⇒ 收尾必须有一条**不看模式、不看相位、必定发命令**的路，就是这里。
+        """
+        self._held = False
+        for t in (self._open_timer, self._close_timer):
+            if t:
+                t.cancel()
+        self._open_timer = None
+        self._close_timer = None
+
+        sent = False
+        try:
+            sent = bool(self._on_mic_close(self.state.stream_id))
+        except Exception as e:                      # noqa: BLE001
+            logger.error(f"MIC_CLOSE 发送失败：{e}")
+        # 相位归 CLOSED —— 顺带把 `mic_open_sent` 复位（见 _set），
+        # 否则下一段语音的 `ensure_mic_open()` 会以为已经发过而直接返回。
+        self._set(Phase.CLOSED, reason)
+        return sent
+
     def ensure_mic_open(self) -> bool:
         """确保本次语音会话已经发出过 MIC_OPEN（幂等，已发过就跳过）。
 

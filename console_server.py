@@ -251,44 +251,32 @@ def _resolve_out_device(cfg: Config, out_list: list[str]) -> str:
     return cfg.audio_output
 
 
-def _resolve_in_device(cfg: Config, in_list: list[str]) -> tuple[str, bool]:
-    """返回（实际使用的输入设备名, 是否可用）。
+def _resolve_in_device(cfg: Config) -> tuple[str, bool, str]:
+    """返回（电脑麦克风会用的设备名, 是否可用, 原因码）。
 
-    注意：这里判断的是"系统里到底有没有这只麦克风"，而不是"桥接程序当前是否
-    已经把它打开了"。桥接没连遥控器时麦克风本来就是关的，用后者会让检查项
-    一直显示红叉，属于误报。
+    注意：这里判断的是"程序到底会用哪只麦克风"，与"当前是否已经打开"无关 ——
+    桥接没连遥控器时麦克风本来就是关的，用后者会让检查项一直红叉，属于误报。
+
+    ⚠⚠ 这里**必须**和运行时走同一个函数（`mixer.resolve_input_device`）。
+
+       历史上这里是**独立实现**的，而且用 `sd.default.device[0]` 取默认设备 ——
+       它的类型是 `_InputOutputPair` 而**不是 list/tuple**，于是
+       `isinstance(dev, (list, tuple))` 判 False → 整段静默掉到 `in_list[0]`，
+       报出 `Microsoft Sound Mapper - Input` 并打了**绿勾**；
+       而运行时实际打开的是 `CABLE Output`（＝本程序自己的输出，闭环）。
+
+       用户看到的就是「检查项全绿，语音却一个字都识别不出来」。
+       2026-09-29 真机实测：系统那一路比遥控器**响 24 dB**。
+
+       同一份判断只能有一个出处 —— 别再在这里写第二份。
     """
-    try:
-        import sounddevice as sd
-    except Exception:  # noqa: BLE001
-        # 音频后端缺失/装坏时不能把整个 /api/state 带崩 —— 检查项退化成
-        # "列出来的设备里找一找"，其余功能照常（浏览器的 500 对用户毫无信息量）。
-        sd = None
+    from mixer import resolve_input_device, INPUT_OK
 
-    want = (cfg.system_mic_device or "").strip()
-    if not want:
-        if sd is not None:
-            try:
-                dev = sd.default.device
-                idx = dev[0] if isinstance(dev, (list, tuple)) else dev
-                if isinstance(idx, int) and idx >= 0:
-                    name = (sd.query_devices(idx).get("name") or "").strip()
-                    if name:
-                        return name, True
-            except Exception:  # noqa: BLE001
-                pass
-        return (in_list[0] if in_list else "未找到输入设备"), bool(in_list)
-
-    low = want.lower()
-    for n in in_list:
-        if low in n.lower():
-            return n, True
-    return want, False
+    idx, label, reason = resolve_input_device(getattr(cfg, "system_mic_device", "") or "")
+    return (label or "未找到输入设备"), (reason == INPUT_OK), reason
 
 
 def _checklist(cfg: Config, s) -> list[dict]:
-    from mixer import list_input_devices
-
     out_dev_ok = False
     try:
         import sounddevice as sd
@@ -300,8 +288,25 @@ def _checklist(cfg: Config, s) -> list[dict]:
     except Exception:  # noqa: BLE001
         pass
 
-    in_list = list_input_devices()
-    mic_name, mic_ok = _resolve_in_device(cfg, in_list)
+    mic_name, mic_ok, mic_reason = _resolve_in_device(cfg)
+    mic_value = mic_name + ("（系统默认）" if not (cfg.system_mic_device or "").strip() else "")
+    if mic_reason == "loopback":
+        # 这一条以前是**绿的** —— 因为那时显示的是另一只（根本没被使用的）设备名。
+        # 报红并把后果说清楚，否则用户只会看到"检查项全绿、却识别不出字"。
+        mic_value = (f"⚠「{mic_name}」是本程序**自己的输出**，采回来会形成自听自的闭环"
+                     f"（实测比遥控器响 24 dB、语音识别时好时坏）→ 已拒绝打开。"
+                     f"请到「音频」页显式选一只真实麦克风")
+    elif mic_reason == "alias":
+        mic_value = (f"⚠「{mic_name}」是 Windows 的别名设备，指向「当前系统默认」，"
+                     f"而默认可能就是 CABLE Output（＝本程序自己的输出）→ 已拒绝打开。"
+                     f"请到「音频」页显式选一只真实麦克风")
+    elif mic_reason == "missing":
+        mic_value = f"⚠ 配置里的「{mic_name}」在系统里找不到 → 请到「音频」页重选"
+    elif mic_reason == "none":
+        mic_value = "系统里没有可用的真实麦克风（混音只保留遥控器一路）"
+        mic_ok = not bool(getattr(cfg, "system_mic_enabled", True))
+    elif not bool(getattr(cfg, "system_mic_enabled", True)):
+        mic_value += "（未参与混音）"
 
     keys = cfg.trigger_keys_windows()
     return [
@@ -317,7 +322,7 @@ def _checklist(cfg: Config, s) -> list[dict]:
          "value": (f"{cfg.audio_output} 可用" if out_dev_ok else f"未找到 {cfg.audio_output}"),
          "ok": out_dev_ok, "mono": False},
         {"name": "电脑麦克风",
-         "value": mic_name + ("（系统默认）" if not (cfg.system_mic_device or "").strip() else ""),
+         "value": mic_value,
          "ok": mic_ok, "mono": False},
         {"name": "语音触发键",
          "value": f"{hotkey_label(keys) or '未设置'}（{'按住说话' if cfg.hotkey_mode == 'hold' else '按一下切换'}）",
@@ -427,6 +432,9 @@ def build_live() -> dict:
             "frame_bytes": s.frame_bytes,
             "last_audio_ago": (round(time.time() - s.audio_last_at, 1)
                                if s.audio_last_at else None),
+            # 混合输出里被软限幅的采样占比（%），-1 = 还没统计。
+            # 「增益开太大」的唯一客观依据 —— 顶格就是这个数在涨。
+            "mix_limit_pct": round(s.mix_limit_pct, 1),
         },
     }
 
@@ -453,6 +461,9 @@ def build_state(force_devices: bool = False) -> dict:
     keys = cfg.trigger_keys_windows()
 
     in_list, out_list = _device_lists(force_devices)
+    # 解析一次，给 devices 与 checklist 共用（_checklist 内部还会再算一次，
+    # 但两者走的是**同一个函数**，不会出现两个结论）。
+    _mic_resolved = _resolve_in_device(cfg)
 
     buttons = []
     for bid, meta in ordered_buttons():
@@ -506,7 +517,13 @@ def build_state(force_devices: bool = False) -> dict:
             "hid_vendor_keys": bool(getattr(cfg, "hid_vendor_keys", True)),
         },
         "devices": {
+            # `system_mic` 是**程序真正打开**的那只（由 SystemMic.start 写入 state），
+            # 而 `system_mic_resolved/reason` 是**解析出来应该用**的那只。
+            # 两者都吐出来：以前只有前者，检查项却自己另算一份，于是"面板说 A、
+            # 日志说 B"，用户只能靠猜（2026-09-29 真机就是这个局面）。
             "system_mic": s.sys_mic_name or "",
+            "system_mic_resolved": _mic_resolved[0],
+            "system_mic_reason": _mic_resolved[2],
             "input_list": in_list,
             "output": cfg.audio_output,
             "output_list": out_list,

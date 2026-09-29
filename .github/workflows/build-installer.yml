@@ -97,6 +97,30 @@ jobs:
       - name: Frida tap decode check
         run: python tools/check_frida_tap.py
 
+      # 语音会话 + 音频链路（v1.0.22 补进 CI）。
+      #
+      # ⚠ 这四道以前**只在本地 check_all 里跑**，而 CI 是"用户能不能拿到"的唯一守门人 ——
+      #   本地绿、CI 不跑 = 发出去的包没人验。这正是审查报告 P1-10 指出的
+      #   "CI 与声称的闸门不一致"。
+      #
+      # 四道各钉一件事，全都是**静默失效**（不崩、不报错，只是不工作）：
+      #   · check_voice_session  ：会话收尾归一 —— 6 条收尾路径必须都发 MIC_CLOSE、
+      #                            撤 stream_active。漏一条 = 遥控器继续推流
+      #                            （真机实测：结束后又多推了 52 秒）。
+      #   · check_mixer_read     ：混音取数不许丢样本 —— 老写法每块丢 76%，
+      #                            房间里那一路变成约 67Hz 的嗡嗡声，语音识别直接崩。
+      #   · check_atvv_decode    ：v0.4 分支的 logger 必须存在（否则 NameError
+      #                            把该版本的所有音频帧全吃掉）。
+      #   · check_send_after_voice：语音结束后的自动发送（默认关，不许替用户发话）。
+      # 都是纯静态 / 行为级 + 反例自证，不需要真遥控器、不需要声卡。
+      - name: Voice session & audio checks
+        run: |
+          python tools/check_voice_session.py
+          python tools/check_mixer_read.py
+          python tools/check_atvv_decode.py
+          python tools/check_send_after_voice.py
+          python tools/check_input_device.py
+
       # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
       # 以前只在本地 check_all 里跑，挪进 CI —— 它是"用户能不能拿到"的唯一守门人。
       # --selftest 一起跑：4 条反例验证这道闸自己会不会红（含"漏收 frida_tap.js"

@@ -13,10 +13,13 @@
   ③ 「要抹掉原生动作的 usage」算法（只抹已映射的键）
   ④ .js 与 .py 的 IOCTL 常量不许漂移（改一边忘一边 = 一个字节都收不到）
   ⑤ 反例自证：把解码写反，上面几条必须变红
+  ⑥ **nullify() 行为闸**：把 frida_tap.js 里那份函数源码抠出来，配假 ptr 在
+     node 里真跑一遍，比对改写后的字节 —— 测的是"会不会把报告 ID 抹掉"
+     这种**只断言词存在看不出来**的错（2026-09-29 审查报告 P0-4）
 
 用法
 ----
-    python tools/check_frida_tap.py             # 纯静态，不需要遥控器/frida
+    python tools/check_frida_tap.py             # 纯静态 + node 行为闸，不需要遥控器/frida
     python tools/check_frida_tap.py --watch 20  # 额外注入 WUDFHost 实时监听（要真机）
 
 退出码 0 = 通过；1 = 失败。
@@ -178,6 +181,201 @@ def run_decode_tests() -> bool:
             return False
     print("   OK 抹除分支覆盖两种格式")
 
+    # ⚠⚠ 光"词存在"是不够的 —— 见下面第 6 段：这里只做**便宜的静态**提示，
+    #   真正的判决交给"把 nullify 真跑一遍"的行为闸。
+    if not re.search(r"ptr\.add\(1\)\.writeByteArray", js):
+        print("   ❌ 抹除分支里没有 `ptr.add(1).writeByteArray(...)` —— "
+              "从 ptr 开始写会把**报告 ID** 一起抹掉（2026-09-29 审查报告 P0-4）")
+        return False
+    print("   OK 抹除从 ptr.add(1) 起（不动报告 ID）")
+
+    return True
+
+
+# ── 6. 把 frida_tap.js 里的 nullify() 真跑一遍（行为闸）─────────────────────
+#
+# 为什么非要行为级：2026-09-29 审查报告 P0-4 —— 消费类页那条分支写的是
+# `ptr.writeByteArray([0x00, 0x00])`，**从 ptr[0] 开始写**，于是把报告 ID
+# 0x02 自己抹成了 0x00、usage_hi 还原封不动留着：
+#     02 42 00  →  00 00 00
+# 驱动收到 report ID = 0（未定义）的报文，等于把整条报告作废。
+# 而**旧的检查只断言 `writeByteArray` 这个词存在** ⇒ 这个错一直绿着。
+# 这是"假绿"的教科书案例：看它出现过 ≠ 它做对了。
+#
+# 做法：把 `function nullify(...) {...}` 的源码原样抠出来，配一个假的 ptr
+# 在 Node 里执行，比对**改写后的字节**。测的是**真正会装进安装包的那份代码**，
+# 不是另写一份等价实现。
+_JS_CASES = [
+    # (名字, 抹除表, 改前, 改后, 说明)
+    ("消费类页 已映射的键", "cc", [0x02, 0x42, 0x00], [0x02, 0x00, 0x00],
+     "报告 ID 0x02 必须留着，只清 usage_lo/hi"),
+    ("消费类页 未映射的键", "cc", [0x02, 0xFF, 0x00], [0x02, 0xFF, 0x00],
+     "没映射过的键一个字节都不许动"),
+    ("消费类页 空闲帧", "cc", [0x02, 0x00, 0x00], [0x02, 0x00, 0x00],
+     "空闲帧不动"),
+    ("厂商页 已映射的键", "vp", [0x01, 0x03, 0x00], [0x01, 0x00, 0x00],
+     "报告 ID 0x01 必须留着"),
+    ("厂商页 未映射的键", "vp", [0x01, 0x99, 0x00], [0x01, 0x99, 0x00],
+     "没映射过的键一个字节都不许动"),
+    ("厂商页 空闲帧", "vp", [0x01, 0x00], [0x01, 0x00], "空闲帧不动"),
+]
+
+
+def _extract_js_function(src: str, name: str) -> str | None:
+    """按大括号配对，把 `function <name>(...) {...}` 整段抠出来。"""
+    m = re.search(rf"function\s+{re.escape(name)}\s*\(", src)
+    if not m:
+        return None
+    i = src.index("{", m.end() - 1)
+    depth = 0
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[m.start():j + 1]
+    return None
+
+
+def _find_node() -> str | None:
+    """找一个能用的 node：先 PATH，再本机托管/系统常见路径。"""
+    import shutil
+    p = shutil.which("node")
+    if p:
+        return p
+    for c in (
+        r"C:\Users\leeway\.workbuddy-ai\binaries\node\versions\22.22.2-3\node.exe",
+        r"C:\Program Files\nodejs\node.exe",
+        "/usr/bin/node",
+        "/usr/local/bin/node",
+    ):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _run_nullify_harness(fn_src: str, node: str) -> tuple[int, str, str, list]:
+    """把一段 nullify() 源码配假 ptr 在 node 里跑，返回 (退出码, stdout, stderr, 失败明细)。"""
+    import json
+    import subprocess
+    import tempfile
+
+    cc = [0x0042, 0x0041, 0x00E2]      # 已映射：上 / 确认 / 静音
+    vp = [0x03, 0x07, 0x0B]            # 已映射：上 / 确认 / 返回
+    cases = [{"name": n, "tbl": t, "before": b, "after": a, "note": d}
+             for (n, t, b, a, d) in _JS_CASES]
+
+    harness = """
+let blocked = 0;
+let blockCC = {};
+let blockVendor = {};
+%s
+function mkPtr(buf, off) {
+  off = off || 0;
+  return {
+    isNull: function () { return false; },
+    readByteArray: function (n) {
+      const out = new ArrayBuffer(n);
+      new Uint8Array(out).set(buf.subarray(off, off + n));
+      return out;
+    },
+    add: function (k) { return mkPtr(buf, off + k); },
+    writeByteArray: function (arr) { buf.set(arr, off); }
+  };
+}
+const CC = %s, VP = %s;
+const cases = %s;
+const fails = [];
+let changed = 0;
+for (const c of cases) {
+  blockCC = {}; blockVendor = {}; blocked = 0;
+  for (const u of CC) blockCC[u] = true;
+  for (const u of VP) blockVendor[u] = true;
+  const buf = Uint8Array.from(c.before);
+  nullify(mkPtr(buf, 0), buf.length);
+  const got = Array.prototype.slice.call(buf);
+  const same = got.length === c.after.length &&
+               got.every(function (v, i) { return v === c.after[i]; });
+  if (!same) {
+    fails.push({name: c.name, got: got, want: c.after, note: c.note});
+  } else if (JSON.stringify(got) !== JSON.stringify(c.before)) {
+    changed++;
+  }
+}
+if (fails.length) {
+  console.log("FAIL " + JSON.stringify(fails));
+  process.exit(1);
+}
+console.log("OK cases=" + cases.length + " changed=" + changed);
+""" % (fn_src, json.dumps(cc), json.dumps(vp), json.dumps(cases))
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "harness.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(harness)
+        try:
+            r = subprocess.run([node, path], capture_output=True, text=True,
+                               timeout=60)
+        except Exception as e:                 # noqa: BLE001
+            return 127, "", str(e), []
+
+    fails: list = []
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("FAIL "):
+            try:
+                fails = json.loads(line[5:])
+            except Exception:                  # noqa: BLE001
+                fails = []
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip(), fails
+
+
+def _report_js_fails(fails: list) -> None:
+    for f_ in fails:
+        print(f"      · {f_.get('name')}：{f_.get('note')}")
+        print(f"        实际改成了 {f_.get('got')}，期望 {f_.get('want')}")
+    print("      ⚠ 最典型的一种：从 ptr（而不是 ptr.add(1)）开始写 → "
+          "把报告 ID 0x02 自己抹掉（审查报告 P0-4）")
+
+
+def run_js_behavior_tests() -> bool:
+    print("\n── 6. nullify() 行为闸（真的把 frida_tap.js 里那份跑一遍）──")
+    js = (ROOT / "frida_tap.js").read_text(encoding="utf-8")
+    fn = _extract_js_function(js, "nullify")
+    if not fn:
+        print("   ❌ frida_tap.js 里抠不出 nullify()（函数被改名/删掉了？）")
+        return False
+
+    node = _find_node()
+    if not node:
+        print("   ❌ 找不到 node —— 这一关需要 node 才能跑"
+              "（CI 的 runner 自带；本机请确认 node 在 PATH 里）")
+        return False
+
+    rc, out, err, fails = _run_nullify_harness(fn, node)
+    if rc != 0:
+        print(f"   ❌ nullify() 行为不符预期（node 退出码 {rc}）")
+        _report_js_fails(fails)
+        for line in err.splitlines()[-5:]:
+            print(f"      {line}")
+        return False
+
+    print(f"   OK {out}")
+    print("   OK 已映射的键被清、未映射的一个字节不动，且**报告 ID 始终保留**")
+
+    # ── 反例自证：把 ptr.add(1) 改回 ptr，必须变红 ────────────────────────
+    broken = fn.replace("ptr.add(1).writeByteArray", "ptr.writeByteArray")
+    if broken == fn:
+        print("   ❌ [反例] 抠出来的 nullify() 里没有 ptr.add(1).writeByteArray，"
+              "反例构造不出来 → 说明这条检查认错了代码")
+        return False
+    rc2, _out2, _err2, _fails2 = _run_nullify_harness(broken, node)
+    if rc2 == 0:
+        print("   ❌ [反例] 改回 `ptr.writeByteArray`（抹掉报告 ID）后检查仍然绿 "
+              "→ 这条行为闸是无效的")
+        return False
+    print("   OK [反例] 改回 `ptr.writeByteArray` → 行为闸变红 ⇒ 检查有效"
+          "（这就是 P0-4 那个真 bug 的形状）")
     return True
 
 
@@ -189,7 +387,7 @@ def run_counter_examples() -> bool:
     """
     import frida_hid
 
-    print("\n── 6. 反例自证 ──")
+    print("\n── 7. 反例自证 ──")
     ok = True
 
     orig = frida_hid.decode_tap_report
@@ -238,7 +436,7 @@ def watch(seconds: float) -> bool:
     """真机：注入 WUDFHost 实时监听（需要遥控器在线 + 装了 frida）。"""
     import frida_hid
 
-    print(f"\n── 7. 实时监听按键旁路 {seconds:.0f} 秒（请按遥控器上的键）──")
+    print(f"\n── 8. 实时监听按键旁路 {seconds:.0f} 秒（请按遥控器上的键）──")
     seen: list[tuple[float, str, bool]] = []
 
     def _on(btn: str, down: bool) -> None:
@@ -276,6 +474,7 @@ def main() -> int:
     print("=" * 60)
 
     ok = run_decode_tests()
+    ok = run_js_behavior_tests() and ok
     ok = run_counter_examples() and ok
     if args.watch:
         ok = watch(args.watch) and ok

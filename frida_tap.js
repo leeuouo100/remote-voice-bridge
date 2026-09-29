@@ -66,7 +66,16 @@ function nullify(ptr, len) {
     if (len === 3 && b[0] === 0x02) {
       const usage = b[1] | (b[2] << 8);
       if (usage && blockCC[usage]) {
-        ptr.writeByteArray([0x00, 0x00]);          // usage_lo / usage_hi = 0
+        // ⚠⚠ 必须从 **ptr.add(1)** 开始写，不能从 ptr 开始。
+        //   报告是 [0x02][usage_lo][usage_hi] —— 第 0 字节是**报告 ID**。
+        //   旧写法 `ptr.writeByteArray([0x00, 0x00])` 从 ptr[0] 开始写，
+        //   把报告 ID 0x02 自己抹成了 0x00，usage_hi 还原封不动留在那儿：
+        //      02 42 00  →  00 00 00
+        //   驱动收到 report ID = 0（未定义）的报文，等于把整条报告作废；
+        //   而下面厂商页那条分支写的是 ptr.add(1)，**两条分支不一致**本身就是信号。
+        //   （2026-09-29 审查报告 P0-4；旧的 check_frida_tap.py 只断言
+        //    "writeByteArray 这个词存在"，所以这个错一直绿着。）
+        ptr.add(1).writeByteArray([0x00, 0x00]);   // usage_lo / usage_hi = 0
         blocked++;
       }
     } else if (b[0] === 0x01) {

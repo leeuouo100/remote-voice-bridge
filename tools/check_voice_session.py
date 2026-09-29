@@ -231,12 +231,16 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
     else:
         c.append((False, "④ 找得到 audio_start 分支"))
 
-    # ── ⑤ 结束分支要真的松开热键并登记发送 ───────────────────────
-    m_end = re.search(r"else:\s*\n\s*voice_hotkey_up\(\)(.*?)\n            elif ",
-                      code, re.S)
-    c.append((bool(m_end), "⑤ 结束分支（第二次按下）里有 voice_hotkey_up()"))
-    c.append((bool(m_end) and "request_voice_send(" in (m_end.group(1) if m_end else ""),
-              "⑤ 结束分支登记了发送（含帧数，供零帧保护判断）"))
+    # ── ⑤ 结束分支：必须走唯一的收尾入口 ─────────────────────────
+    # ⚠ 原先这里是 `else:\n voice_hotkey_up()` 那个形态。收尾归一之后
+    #   （2026-09-29 审查报告 P0-1）分支里改成调 end_voice_session() ——
+    #   松热键/发 MIC_CLOSE/撤 stream_active/清记账 都在它内部。
+    #   断言跟着改，但**要求更严**：不只是"松了热键"，而是"走了唯一入口"。
+    m_end = re.search(r'end_voice_session\("第二次按下语音键"', code)
+    c.append((bool(m_end), "⑤ 结束分支（第二次按下）走了 end_voice_session()"))
+    c.append((bool(m_end) and "send=True" in code[
+        code.find('end_voice_session("第二次按下语音键"'):][:60],
+        "⑤ 结束分支登记了发送（含帧数，供零帧保护判断）"))
 
     # ── ⑥ 「关了还在显示收音中」这一族（2026-09-29 武哥报的）─────────
     #
@@ -293,6 +297,88 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
         c.append(("_wave_sys" not in es,
                   "⑥' end_session **不碰**电脑麦克风那一路"
                   "（它是独立采集的，混音器还在跑，别越权去擦）"))
+
+    # ── ⑦ 会话收尾归一：6 条路径必须走同一个入口（P0-1）──────────
+    #
+    # 2026-09-29 审查报告 P0-1 的核心，也是真机"已经关了、遥控器还在收音"的
+    # 直接原因：收尾原先有 6 条路径、各写各的，而**让遥控器停止推流**
+    # （发 MIC_CLOSE + 撤 `atvv.state.stream_active`）**一处都没做**。
+    # 真机实证：会话 2026-09-29 11:26:34 结束，遥控器一路推到 11:27:25
+    # （多推 52 秒 / 3161 帧），全程没有任何 MIC_CLOSE；用户看到的正是
+    # 「输入法早关了，波形还在动、还在显示在收音」。
+    c.append(("def end_voice_session(" in code,
+              "⑦ main.py 里有唯一的收尾入口 end_voice_session()"))
+
+    evs = _indent4_block(src, "    def end_voice_session")
+    c.append((bool(evs), "⑦ 找得到 end_voice_session 的函数体"))
+    c.append(("session.close(" in evs,
+              "⑦ 收尾会调 session.close() 发 MIC_CLOSE"
+              "（⚠ 不能用 voice_key_up/_try_close：它们有「模式」和「相位」两道门槛，"
+              "确认键/超时/断连那几条路径根本进不去 → 遥控器永远收不到关麦命令）"))
+    c.append(("atvv.state.stream_active = False" in evs,
+              "⑦ 收尾立刻撤 atvv 的推流许可"
+              "（只发 MIC_CLOSE 不够：on_audio/decode_audio 都先看这个标志，"
+              "不撤的话后续帧照样喂进 UI 和混音队列 → 波形还在动）"))
+    c.append(("state.end_session(" in evs, "⑦ 收尾撤 UI 状态"))
+    c.append(("pending_mic_echo = 0" in evs,
+              "⑦ 收尾清 pending_mic_echo"
+              "（留着它 → 下一段的第一下真按键被当回声吞掉）"))
+    c.append(("voice_active = False" in evs and "voice_started_at = 0.0" in evs,
+              "⑦ 收尾清会话记账（voice_active / voice_started_at）"))
+    c.append(("voice_hotkey_up()" in evs,
+              "⑦ 收尾释放输入法热键（放在最前面：下面任何一步抛异常"
+              "也不能把 Ctrl/Win 按着不放）"))
+    c.append(("if send:" in evs and "request_voice_send(" in evs
+              and "cancel_voice_send(" in evs,
+              "⑦ 自动发送按策略「登记或取消」（两条路都要有）"))
+
+    # 6 条路径都要接上 —— 漏一条等于没有（本项目反复踩的坑）
+    for reason in ("第二次按下语音键", "确认键", "厂商页确认键",
+                   "超时自动收尾", "断开或退出"):
+        c.append((f'end_voice_session("{reason}"' in code,
+                  f"⑦ 收尾路径「{reason}」走的是同一个入口"))
+    c.append((len(re.findall(r"end_voice_session\(", code)) >= 6,
+              "⑦ 至少 5 处调用 + 1 处定义（漏一条路径 = 那条路静默失效）"))
+
+    # 旧写法不许复活：各写各的正是"漏掉 MIC_CLOSE"的根源
+    c.append((re.search(r"voice_hotkey_up\(\)\s*\n\s*state\.end_session\(", code) is None,
+              "⑦ 不再有「自己松热键 + 自己撤 UI」的老形态"
+              "（那样写就绕过了 MIC_CLOSE / stream_active，遥控器不会停）"))
+    c.append((re.search(r'state\.end_session\("语音结束（确认键）"\)', code) is None,
+              "⑦ 确认键那条不再自己写 state.end_session"
+              "（收尾机制只留一份，改一处就全对）"))
+
+    # 策略断言：只有"用户明确说完了"的两条才登记自动发送
+    c.append(('end_voice_session("确认键", send=swallow)' in code,
+              "⑦ 键盘确认键那条按 swallow 决定发不发"
+              "（swallow=False 时这一下 OK 自己就变 Enter，补了就是连发两下）"))
+    c.append(('end_voice_session("超时自动收尾", send=False)' in code,
+              "⑦ 超时收尾**不**自动发送"
+              "（麦克风可能开着 10 分钟，里面可能是环境音/旁人的话）"))
+
+    # 断连/退出那条：必须**自己 await** 一次写入。
+    # ⚠ end_voice_session 的 _send_tx 只是"投递到事件循环"，而我们此刻就在
+    #   那个循环的 finally 里 —— run_bridge 一返回、循环一关，那条还没跑到的
+    #   写入就被取消了：MIC_CLOSE 静默丢失，日志上还写着"已发出"。
+    m_fin = _block(src, r"    finally:", r"\n        state\.reset\(\)")
+    c.append(("mic_close_cmd(" in m_fin and "await asyncio.wait_for(" in m_fin,
+              "⑦ 退出/断连那条**自己 await** 写入 MIC_CLOSE"
+              "（只靠 _send_tx 投递的话，循环一关就被取消 → 命令静默丢失）"))
+    c.append(('end_voice_session("断开或退出"' in m_fin,
+              "⑦ 退出/断连那条也走同一个入口"))
+
+    # 残留推流自愈：程序认为没会话、遥控器却还在推 → 补发 MIC_CLOSE。
+    c.append(("_remote_frame_last_at" in code,
+              "⑦ 有「遥控器最后推帧时刻」这个证据（_remote_frame_last_at）"))
+    c.append(("session.close(\"残留推流自愈\")" in code,
+              "⑦ 有「残留推流自愈」：没有会话却在收帧 → 补发 MIC_CLOSE"))
+    oa = _indent4_block(src, "    def on_audio")
+    i_stamp = oa.find("_remote_frame_last_at = time.time()")
+    i_gate = oa.find("if not atvv.state.stream_active:")
+    c.append((i_stamp >= 0 and i_gate >= 0 and i_stamp < i_gate,
+              "⑦ 那个时刻必须在 stream_active 那道门**之前**记"
+              "（记在门后 → 要抓的情形里它永远不刷新 → 自愈条件永远不成立，"
+              "代码在、永远跑不到）"))
     return c
 
 
@@ -421,7 +507,53 @@ def main() -> int:
                           "        _state.remote_level_db = -96.0\n",
                           "        _state.last_event      = last_event\n", 1))
 
-    if n_red < 10:
+    # ── 反例 12~17：P0-1 收尾归一（2026-09-29 审查报告）─────────────
+    # 这几条都是"改回旧行为"的形状 —— 旧版就是这样，于是遥控器收不到
+    # MIC_CLOSE、会话结束后又推了 52 秒。
+
+    # 反例 12：收尾不发 MIC_CLOSE（＝旧版真机行为）
+    _expect_red("收尾不调 session.close()（＝遥控器收不到关麦命令，继续推流）",
+                src.replace('closed = session.close(f"会话收尾：{reason}")',
+                            "closed = False", 1))
+
+    # 反例 13：收尾不撤 atvv 的推流许可
+    #（＝ on_audio 继续把帧喂进 UI，波形还在动）
+    _expect_red("收尾不撤 atvv.state.stream_active"
+                "（＝后续帧照样喂进 UI 和混音队列 → 波形还在动）",
+                src.replace("        atvv.state.stream_active = False\n",
+                            "        pass\n", 1))
+
+    # 反例 14：收尾不清 pending_mic_echo（＝下一段第一下被当回声吞掉）
+    _expect_red("收尾不清 pending_mic_echo"
+                "（＝下一段的第一下真按键被当回声吞掉，按一下没反应）",
+                src.replace("        pending_mic_echo = 0\n", "        pass\n", 1))
+
+    # 反例 15：超时收尾改成自动发送（＝把环境音/旁人的话替用户发出去）
+    _expect_red("超时收尾改成 send=True"
+                "（＝把可能全是环境音的 10 分钟内容自动发进聊天框）",
+                src.replace('end_voice_session("超时自动收尾", send=False)',
+                            'end_voice_session("超时自动收尾", send=True)', 1))
+
+    # 反例 16：断连/退出那条路径不接入口
+    #（＝程序关了遥控器还在推流，只能等它自己超时）
+    _expect_red("断连/退出那条不调 end_voice_session"
+                "（＝程序都关了，遥控器还在收音）",
+                src.replace('end_voice_session("断开或退出", send=False)',
+                            "pass", 1))
+
+    # 反例 17：把"遥控器还在推流"的证据记在 stream_active 那道门**之后**
+    #（＝要抓的情形里它永远不刷新 → 自愈条件永远不成立，代码在、跑不到）
+    _expect_red("把 _remote_frame_last_at 挪到 stream_active 门**之后**"
+                "（＝残留推流时它永远不刷新 → 自愈永远不触发）",
+                src.replace(
+                    "        _remote_frame_last_at = time.time()\n"
+                    "        if not atvv.state.stream_active:\n"
+                    "            return",
+                    "        if not atvv.state.stream_active:\n"
+                    "            return\n"
+                    "        _remote_frame_last_at = time.time()", 1))
+
+    if n_red < 15:
         ok = False
 
     print()

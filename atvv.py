@@ -4,9 +4,20 @@ Supports v0.4 (per-frame sync) and v1.0 (continuous + AUDIO_SYNC).
 """
 
 from __future__ import annotations
+import logging
 from dataclasses import dataclass
 from typing import Optional
 from adpcm import IMAADPCMDecoder
+
+# ⚠ 这个 logger **不能省**。`decode_audio()` 的 v0.4 分支里有一句
+#   `logger.debug(...)`（帧长不符时丢弃），而本模块原先既没 import logging
+#   也没定义 logger —— 一旦走到那条分支就是 `NameError`，
+#   而它发生在 BLE 通知回调线程上、被外层 try 吞成一行 error。
+#   后果：**所有 v0.4 的音频帧全部解不出来**，现象是"按了没声音"，
+#   而日志里只有一句语焉不详的异常（2026-09-29 审查报告 P0-3）。
+#   本机遥控器协商的是 v1.0，所以这条一直没被触发 —— 属于"潜伏"，
+#   换一台 v0.4 的遥控器（或上游改协商）当场就炸。
+logger = logging.getLogger("rvb.atvv")
 
 
 # ── UUIDs ─────────────────────────────────────────────────────────────────────

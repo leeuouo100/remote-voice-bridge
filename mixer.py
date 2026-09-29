@@ -34,6 +34,12 @@ logger = logging.getLogger("rvb.mixer")
 _QUEUE_HEADROOM_SEC = 2.0
 
 
+def _empty():
+    """空的 float32 采样数组（统一的"没有数据"表示）。"""
+    import numpy as np
+    return np.zeros(0, dtype=np.float32)
+
+
 def resample_linear(x, src_rate: int, dst_rate: int):
     """线性插值重采样。
 
@@ -70,12 +76,198 @@ def _downsample_points(mono, n: int = 4) -> list[int]:
     return (out + [0] * n)[:n]
 
 
+# ── 回环设备 / 别名设备 ───────────────────────────────────────────────────────
+# 本程序把混音结果**写进** `audio_output`（默认 `CABLE Input`），而 VB-CABLE 会把
+# `CABLE Input` 上的东西原样送到 `CABLE Output`。如果"电脑麦克风"解析到
+# `CABLE Output`，就等于**把自己的输出采回来再混进去** —— 一个闭环。
+#
+# 🔴 2026-09-29 真机实测（不是推测）：
+#     程序实际打开的就是 `CABLE Output (VB-Audio Virtual )`，于是
+#         levels.sys = -10.4 dBFS    而    levels.remote = -34.3 dBFS
+#     系统麦克风那一路比遥控器**响 24 dB**，送到输入法的信号里绝大部分是
+#     延迟的自听自。用户报的正是「语音输入时好时坏、识别不出字」。
+#
+# 为什么原来没挡住：`list_input_devices()` 里**有**这个过滤，但它只喂给设置页的
+# 下拉框；真正决定"开哪只设备"的 `find_input_device("")` 走的是
+# `sd.query_devices(kind="input")` 这条**默认设备**分支，完全没经过过滤。
+# 守卫写在了"选择器"上而不是"解析器"上 —— 本项目反复踩的"代码在、跑不到"。
+_LOOPBACK_MARKERS = (
+    "cable input", "cable output", "cable 2", "vb-audio", "vb-cable",
+    "virtual cable", "voicemeeter",
+)
+
+# Windows 的"别名设备"：它们不指向某一只具体的麦克风，而是指向**当前系统默认**，
+# 而系统默认完全可能就是 `CABLE Output`（用户按本程序文档给输入法设的正是它）。
+# 留在下拉框里等于给用户第二个踩同一个坑的入口，所以一并剔除。
+_ALIAS_MARKERS = ("sound mapper", "主声音捕获驱动程序", "主声音驱动程序")
+
+
+def is_loopback_name(name: str) -> bool:
+    """这只设备会不会把本程序自己的输出喂回来（＝闭环）。"""
+    low = (name or "").strip().lower()
+    return bool(low) and any(m in low for m in _LOOPBACK_MARKERS)
+
+
+def is_alias_name(name: str) -> bool:
+    """这只设备是不是"指向当前默认"的 Windows 别名（而不是某只真实麦克风）。"""
+    low = (name or "").strip().lower()
+    return bool(low) and any(m in low for m in _ALIAS_MARKERS)
+
+
+def _device_name(idx) -> str:
+    """索引 → 设备名；查不到返回空串（绝不抛）。"""
+    try:
+        import sounddevice as sd
+        return (sd.query_devices(idx).get("name") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def default_input_index():
+    """系统默认输入设备的索引；拿不到返回 None。
+
+    ⚠⚠ 不要用 `sd.default.device[0]` 去取。
+
+      `sd.default.device` 的类型是 `_InputOutputPair`，**不是 list/tuple**，
+      `isinstance(dev, (list, tuple))` 判出来是 **False**。本项目历史上两处都这么写，
+      于是各自以不同方式静默跑偏：
+        · `find_input_device` 把整个对象拿去和 0 比大小 → `TypeError` → 被
+          `except Exception` 吞掉 → 退回 `query_devices(kind="input")`，
+          **恰好绕过了回环过滤**，把 `CABLE Output` 当成了电脑麦克风；
+        · `console_server._resolve_in_device` 静默掉到 `in_list[0]`，报了一只
+          **根本不是实际设备的**名字，还打了绿勾（"检查项全绿但识别不出字"）。
+
+      `sd.query_devices(kind="input")` 是唯一稳的写法：它返回的 dict 带 "index"。
+    """
+    try:
+        import sounddevice as sd
+        d = sd.query_devices(kind="input")
+        i = d.get("index")
+        return int(i) if i is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_usable_mic(idx) -> bool:
+    """这个索引能不能当"电脑麦克风"用（既非回环、也非别名）。"""
+    n = _device_name(idx)
+    return bool(n) and not is_loopback_name(n) and not is_alias_name(n)
+
+
+def _first_real_input():
+    """第一只**真实**麦克风的索引（跳过回环与别名设备）。没有则 None。"""
+    try:
+        import sounddevice as sd
+        cands = []
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            n = (d.get("name") or "").strip()
+            if not n or is_loopback_name(n) or is_alias_name(n):
+                continue
+            # 名字里带"麦克风 / mic"的排前面（本机就是 Realtek 麦克风阵列）
+            low = n.lower()
+            cands.append((0 if ("麦克风" in n or "microphone" in low) else 1, len(n), i))
+        if not cands:
+            return None
+        return min(cands)[2]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# 解析结果的原因码
+INPUT_OK = "ok"              # 正常
+INPUT_LOOPBACK = "loopback"  # 会把本程序自己的输出喂回来 → 必须拒绝
+INPUT_ALIAS = "alias"        # 指向"当前默认"的别名设备 → 拒绝
+INPUT_MISSING = "missing"    # 配置里写死的设备在系统里找不到
+INPUT_NONE = "none"          # 系统里没有任何可用的真实麦克风
+
+
+def resolve_input_device(name: str):
+    """**唯一**的"电脑麦克风用哪只设备"解析入口。返回 `(索引|None, 设备名, 原因码)`。
+
+    为什么要做成唯一入口：这段逻辑以前在 `find_input_device`（运行时真正开设备）
+    和 `console_server._resolve_in_device`（控制台检查项）**各写了一遍**，两边结论
+    不一致 —— 一个说 `CABLE Output`、另一个说 `Microsoft Sound Mapper` 并打绿勾，
+    用户看到的是"检查项全绿、却一个字都识别不出来"。同一份判断只能有一个出处。
+
+    `索引` 为 None 时调用方必须**不要**退回系统默认 —— 那正是要躲的闭环；
+    应当明确禁用"电脑麦克风"这一路并告警。
+    """
+    want = (name or "").strip()
+
+    if want:
+        idx = find_input_device_by_name(want)
+        if idx is None:
+            return None, want, INPUT_MISSING
+        nm = _device_name(idx) or want
+        if is_loopback_name(nm):
+            return None, nm, INPUT_LOOPBACK
+        if is_alias_name(nm):
+            return None, nm, INPUT_ALIAS
+        return idx, nm, INPUT_OK
+
+    # 配置为空 = 用系统默认。默认设备**必须**过一遍过滤：
+    # 本机的系统默认正是 `CABLE Output`，直接用就是闭环。
+    idx = default_input_index()
+    bad, reason = "", INPUT_NONE
+    if idx is not None:
+        nm = _device_name(idx)
+        if is_loopback_name(nm):
+            bad, reason = nm, INPUT_LOOPBACK
+        elif is_alias_name(nm):
+            bad, reason = nm, INPUT_ALIAS
+        else:
+            return idx, nm, INPUT_OK
+
+    # 默认设备不可用 → 退到第一只真实麦克风；一只都没有就明确返回 None。
+    alt = _first_real_input()
+    if alt is not None:
+        return alt, _device_name(alt), INPUT_OK
+    return None, bad, reason
+
+
+def find_input_device_by_name(name: str):
+    """按名字找输入设备索引（三级匹配：全名相等 → 前缀 → 子串）。找不到返回 None。"""
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    try:
+        import sounddevice as sd
+    except Exception:  # noqa: BLE001
+        return None
+    # 同一级里取**最短名**。
+    #
+    # ⚠ 别改成"谁先枚举到就用谁"：同一只声卡会在 MME / DirectSound / WASAPI /
+    #   WDM-KS 四套驱动下各出现一次（MME 还会把名字截断到 31 字符），
+    #   枚举顺序由驱动决定、不保证稳定。取最短名天然偏向没被截断、
+    #   后缀修饰最少的那一条，也就是用户在下拉框里看到的那个名字。
+    exact, prefix, contains = [], [], []
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            dn = (d.get("name") or "").lower()
+            if dn == target:
+                exact.append((len(dn), i))
+            elif dn.startswith(target):
+                prefix.append((len(dn), i))
+            elif target in dn:
+                contains.append((len(dn), i))
+    except Exception:  # noqa: BLE001
+        return None
+    for bucket in (exact, prefix, contains):
+        if bucket:
+            return min(bucket)[1]
+    return None
+
+
 # ── 设备枚举 ──────────────────────────────────────────────────────────────────
 def list_input_devices() -> list[str]:
-    """所有带输入通道的设备名（去重，剔除纯输出的虚拟声卡）。
+    """所有带输入通道的设备名（去重，剔除回环设备与 Windows 别名设备）。
 
-    剔除 `CABLE Input` 是必须的：它是本程序的**输出**目标，如果被选成"电脑麦克风"
-    就会形成一个闭环 —— 把混合结果又采回来再混进去，直接啸叫。
+    剔除的理由见上面 `_LOOPBACK_MARKERS` / `_ALIAS_MARKERS` 那段注释：
+    这两类设备被选成"电脑麦克风"都会形成闭环或等价于闭环。
     """
     names: list[str] = []
     try:
@@ -88,7 +280,7 @@ def list_input_devices() -> list[str]:
             if not n:
                 continue
             low = n.lower()
-            if "cable input" in low or "vb-audio" in low or "voicemeeter" in low:
+            if is_loopback_name(n) or is_alias_name(n):
                 continue
             raw.append(n)
         names = _dedupe_names(raw)
@@ -150,44 +342,13 @@ def list_output_devices() -> list[str]:
 
 
 def find_input_device(name: str) -> int | None:
-    """按名字找输入设备索引；name 为空则返回系统默认输入设备。"""
-    import sounddevice as sd
-    if not name:
-        try:
-            dev = sd.default.device
-            idx = dev[0] if isinstance(dev, (list, tuple)) else dev
-            if idx is None or idx < 0:
-                idx = None
-            d = sd.query_devices(idx) if idx is not None else sd.query_devices(kind="input")
-            return int(d["index"]) if "index" in d else idx
-        except Exception:  # noqa: BLE001
-            try:
-                d = sd.query_devices(kind="input")
-                return int(d["index"])
-            except Exception:  # noqa: BLE001
-                return None
-    target = name.strip().lower()
-    # 三级匹配：全名相等 → 前缀 → 子串；同一级里取**最短名**。
-    #
-    # ⚠ 别改成"谁先枚举到就用谁"：同一只声卡会在 MME / DirectSound / WASAPI /
-    #   WDM-KS 四套驱动下各出现一次（MME 还会把名字截断到 31 字符），
-    #   枚举顺序由驱动决定、不保证稳定。取最短名天然偏向没被截断、
-    #   后缀修饰最少的那一条，也就是用户在下拉框里看到的那个名字。
-    exact, prefix, contains = [], [], []
-    for i, d in enumerate(sd.query_devices()):
-        if d.get("max_input_channels", 0) <= 0:
-            continue
-        dn = (d.get("name") or "").lower()
-        if dn == target:
-            exact.append((len(dn), i))
-        elif dn.startswith(target):
-            prefix.append((len(dn), i))
-        elif target in dn:
-            contains.append((len(dn), i))
-    for bucket in (exact, prefix, contains):
-        if bucket:
-            return min(bucket)[1]
-    return None
+    """按名字/默认找输入设备索引；**保证不是回环设备**。找不到返回 None。
+
+    保留这个名字只是为了不破坏既有调用点；真正的判断全在 `resolve_input_device`，
+    这里只是取它的第一项。需要知道"为什么没有"（回环？别名？找不到？）时，
+    请直接调 `resolve_input_device`。
+    """
+    return resolve_input_device(name)[0]
 
 
 # ── 电脑麦克风采集 ────────────────────────────────────────────────────────────
@@ -207,14 +368,42 @@ class SystemMic:
         self.in_rate = self.out_rate
         self.device_label = ""
         self._peak_hold = 0.0
+        # 上一块取不完的**尾部余量**。
+        # ⚠ 没有它就会丢样本，见 read() 的注释 —— 这是 2026-09-29 审查报告 P0-2。
+        self._remainder = _empty()
 
     # ── 生命周期 ──
     def start(self) -> bool:
         import sounddevice as sd
 
-        dev = find_input_device(self.device_name)
+        dev, label, reason = resolve_input_device(self.device_name)
         if dev is None:
-            logger.warning("⚠ 找不到可用的电脑麦克风，混音只保留遥控器一路")
+            # ⚠⚠ 这里**绝不能**退回"系统默认设备" —— 系统默认可能正是本程序自己的
+            #     输出（`CABLE Output`），退回去就是闭环。宁可不混音。
+            #
+            #     这几种"没有可用麦克风"必须**分别说清**：以前统一报
+            #     「找不到可用的电脑麦克风」，而真机上的情况其实是"找到了、
+            #     但找到的是自己的输出"，日志一个字没提，只能靠猜。
+            if reason == INPUT_LOOPBACK:
+                logger.warning(
+                    "⚠ 电脑麦克风解析到「%s」—— 那是本程序**自己的输出**，"
+                    "采回来会形成自听自的闭环（真机实测：这一路比遥控器响 24 dB，"
+                    "送到输入法的信号里绝大部分是延迟回声，语音识别时好时坏）。\n"
+                    "   ⇒ 已**拒绝打开**，混音只保留遥控器一路。\n"
+                    "   处置：控制台 → 音频 → 把「电脑麦克风」显式选成**真实的**麦克风"
+                    "（别选 CABLE Output / Sound Mapper 这类虚拟或别名设备）。", label)
+            elif reason == INPUT_ALIAS:
+                logger.warning(
+                    "⚠ 电脑麦克风解析到「%s」—— 它是 Windows 的**别名设备**，"
+                    "指向「当前系统默认」，而默认可能就是 CABLE Output"
+                    "（＝本程序自己的输出）。已拒绝打开，混音只保留遥控器一路。\n"
+                    "   处置：控制台 → 音频 → 把「电脑麦克风」显式选成真实麦克风。", label)
+            elif reason == INPUT_MISSING:
+                logger.warning(
+                    "⚠ 配置里指定的电脑麦克风「%s」在系统里找不到，混音只保留遥控器一路。"
+                    "（控制台 → 音频 → 重新选一只）", label)
+            else:
+                logger.warning("⚠ 系统里没有可用的真实麦克风，混音只保留遥控器一路")
             return False
         try:
             info = sd.query_devices(dev)
@@ -280,10 +469,36 @@ class SystemMic:
 
     # ── 播放侧取数 ──
     def read(self, n: int):
-        """取 n 个采样；不足则返回现有的（调用方自行补零）。"""
+        """取**恰好** n 个采样（不够就少给，由调用方补零）；多出来的尾部留到下次。
+
+        ⚠⚠ 必须留余量，不能整块返回 —— 这是 2026-09-29 审查报告 P0-2 的核心。
+
+        老写法是"攒够 n 就 `np.concatenate(chunks)` 整块返回"，而两个时钟域
+        的块大小差着一个数量级：
+            采集块（PortAudio 回调）  = 1024 个采样
+            播放块（CABLE 输出回调）  =  240 个采样
+        `while got < n` 第一次 `get_nowait()` 就拿到 1024 ≥ 240 → 立刻返回整块，
+        调用方 `for i in range(frames)` 只读前 240 个 ⇒ **每块静默丢掉 784 个
+        （76%）**。房间里那一路于是变成「5ms 有声 / 16ms 空白」的切片，
+        听感是约 67Hz 的嗡嗡声 —— 语音识别直接崩，用户看到的就是
+        「输入法面板弹了、也在收音，但一个字都识别不出来」。
+        而且丢样本这件事**日志里一个字都没有**，属于本项目最怕的"静默失效"。
+
+        同时这也修掉了"采集比播放快"的错觉：老写法每块都丢 76%，
+        队列根本涨不起来，看起来"很实时"，其实是在丢数据。
+        """
         import numpy as np
+        if n <= 0:
+            return _empty()
+
         chunks = []
         got = 0
+        # 先把上次的余量接上 —— 顺序不能反：余量是最老的音频
+        if len(self._remainder):
+            chunks.append(self._remainder)
+            got += len(self._remainder)
+            self._remainder = _empty()
+
         while got < n:
             try:
                 blk = self.queue.get_nowait()
@@ -291,6 +506,25 @@ class SystemMic:
                 break
             chunks.append(blk)
             got += len(blk)
+
         if not chunks:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+            return _empty()
+        out = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        if len(out) > n:
+            self._remainder = out[n:].copy()   # 存起来给下一次，绝不丢
+            out = out[:n]
+        return out
+
+    def skip(self, n: int) -> None:
+        """按 1:1 的比例**丢掉** n 个采样（不返回、不混音）。
+
+        为什么需要它：这一路被静音/被独奏压掉时，输出回调照样每块消费 240 个
+        采样，而老写法是"增益为 0 就**不取数**" —— 队列于是原地积压，
+        一路涨到 maxsize（2 秒）为止，`put_nowait` 开始抛 `queue.Full`；
+        解除静音的那一刻，先播出来的是**2 秒前的旧音频**（听感是"回声/串音"）。
+
+        现在改成"无论发不发声都按一比一消费"：不发声时用本方法把数据丢掉，
+        队列永远不积压，重新出声时听到的就是当下的声音。
+        与 `read()` 共用同一套取数逻辑，避免两处各写一遍、日后改一处漏一处。
+        """
+        self.read(n)

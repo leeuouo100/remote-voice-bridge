@@ -61,6 +61,24 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
     """
     checks: list[tuple[bool, str]] = []
 
+    def _fn_body(text: str, header: str) -> str:
+        """取以 header 开头、到下一个「恰好 4 空格缩进」的语句为止的**原文**。
+
+        ⚠ 别用注释行当结束锚点：本文件里大量"为什么"的注释会逐字引用老写法，
+          拿它当边界会切错块 → 断言因为"找不到"而变绿（假绿）。
+          （`check_voice_session.py` 的 `_indent4_block` 是同一个理由。）
+        """
+        lines = text.splitlines()
+        i = next((k for k, l in enumerate(lines) if l.startswith(header)), -1)
+        if i < 0:
+            return ""
+        j = i + 1
+        while j < len(lines):
+            if re.match(r"^    \S", lines[j]):
+                break
+            j += 1
+        return "\n".join(lines[i:j])
+
     # ── 1. 配置项 ────────────────────────────────────────────────────
     # 🔴 默认必须是**关**。2026-09-17 武哥否掉了原来的"默认开"，理由是对的：
     #   说到一半去上厕所、回来想接着改，程序却已经把半截话发进真人对话里了。
@@ -101,10 +119,15 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
                    "main：主循环真的调用了 maybe_send_after_voice"))
 
     # ── 3. 结束分支登记发送 ──────────────────────────────────────────
-    i = main_src.find("语音会话【结束】（第二次按下语音键）")
-    tail = main_src[i:i + 900] if i >= 0 else ""
-    checks.append(("request_voice_send(_audio_frames)" in tail,
-                   "main：语音结束后登记发送，且**带上本次帧数**"))
+    # ⚠ 2026-09-29 收尾归一之后（审查报告 P0-1），"登记发送"这个动作收进了
+    #   main.end_voice_session()，**调用点只负责声明策略**（send=True/False）。
+    #   断言跟着改，但要求更严：不只是"有人登记"，而是"策略传对了"。
+    evs = _fn_body(main_src, "    def end_voice_session")
+    checks.append(("request_voice_send(_audio_frames)" in evs and "if send:" in evs,
+                   "main：收尾入口按 send 策略登记发送，且**带上本次帧数**"
+                   "（零帧误触保护靠它判断）"))
+    checks.append(('end_voice_session("第二次按下语音键", send=True)' in main_src,
+                   "main：再按语音键收尾 → 登记发送"))
 
     # ── 4. 开始分支取消发送（最容易漏的那一半）──────────────────────
     j = main_src.find("语音会话【开始】")
@@ -169,24 +192,22 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
     checks.append(("_audio_frames = 0" in seg_new,
                    "main：帧计数在「开新一段」时清零（保证登记到的是本段帧数）"))
 
-    # ── 9. 收尾路径不止一条：每一条都得接上（漏一条 = 那条路静默失效）──
-    for anchor in ("语音会话【结束】（确认键）", "语音会话【结束】（厂商页确认键）"):
-        p = main_src.find(anchor)
-        w2 = main_src[p:p + 700] if p >= 0 else ""
-        checks.append(("request_voice_send(" in w2,
-                       f"main：收尾路径「{anchor}」也登记了发送"
-                       "（只接一条路＝另外几条静默失效 —— 本项目反复踩的坑）"))
-
-    checks.append((bool(re.search(r"if swallow:\s*\n\s*request_voice_send\(", main_src)),
-                   "main：确认键那条只在 swallow 时补发送"
-                   "（swallow=False 时这一下 OK 自己就变 Enter，补了就是连发两下）"))
-
-    tp = main_src.find("自动结束，避免一直挂着听")
-    tw = main_src[tp:tp + 1400] if tp >= 0 else ""
-    checks.append(("cancel_voice_send(" in tw and "request_voice_send(" not in tw,
-                   "main：超时收尾**不**自动发送"
-                   "（麦克风开着最多 10 分钟，里面可能是环境音/旁人的话；"
-                   "自动发出去比少发一次严重得多）"))
+    # ── 9. 收尾路径不止一条：每一条都得把**策略**传对 ───────────────
+    #    ⚠ 漏一条 = 那条路静默失效（本项目反复踩的坑）。
+    #      归一之后"机制"只有一份，但"策略"仍必须逐条声明 ——
+    #      传错方向的代价不对称：该发的不发＝多按一下回车；
+    #      不该发的发了＝**替用户把话发出去**，不可逆。
+    for call, why in (
+        ('end_voice_session("确认键", send=swallow)',
+         "键盘确认键：按 swallow 决定"
+         "（swallow=False 时这一下 OK 自己就变 Enter，补了就是连发两下）"),
+        ('end_voice_session("厂商页确认键", send=True)',
+         "厂商页确认键：这一下被我们吞掉了、不会变成 Enter → 无条件登记"),
+        ('end_voice_session("超时自动收尾", send=False)',
+         "超时收尾：**不**发送"
+         "（麦克风可能开着 10 分钟，里面可能是环境音/旁人的话）"),
+    ):
+        checks.append((call in main_src, f"main：{why}"))
 
     return checks
 
@@ -403,18 +424,17 @@ def main() -> int:
     print()
     print("── 反例（改坏后应当报红）──")
 
-    def drop_send_after(src: str, anchor: str, span: int = 800) -> str:
-        """把 anchor 之后 span 字内的 request_voice_send(...) 删掉（构造反例用）。
+    def flip_send(src: str, call: str, new: str) -> str:
+        """把某个收尾调用点的 send 策略改掉（构造反例用）。
 
-        ⚠ 必须按**位置窗口**删，不能用「日志行紧跟调用」那种正则：
-        真实代码里那句话和调用之间夹着解释注释，正则匹配不上 → 等于没改坏 →
-        反例会假绿（这道闸第一版就在这里假绿过一次）。
+        ⚠ 必须按**整条调用**替换，不能只换 `send=True` 这种片段：
+          收尾调用点有 5 处，片段替换会命中错的那一处 → 等于没改坏 →
+          反例假绿（这道闸第一版在 `drop_send_after` 上就栽过一次）。
         """
-        p = src.find(anchor)
-        if p < 0:
+        i = src.find(call)
+        if i < 0:
             return src
-        return (src[:p] + src[p:p + span].replace(
-            "request_voice_send(_audio_frames)", "pass") + src[p + span:])
+        return src[:i] + new + src[i + len(call):]
 
     negatives = [
         ("拿掉白名单里的 send_after_voice",
@@ -430,23 +450,34 @@ def main() -> int:
          main_src,
          cfg_src.replace("send_after_voice_delay_ms: int = 800",
                          "send_after_voice_delay_ms: int = 100")),
-        ("拿掉结束分支的登记",
-         main_src.replace("request_voice_send(_audio_frames)", "pass"),
+        ("拿掉收尾入口里的登记（if send 分支失效）",
+         main_src.replace("        if send:\n            request_voice_send(_audio_frames)",
+                          "        if False:\n            request_voice_send(_audio_frames)"),
          cfg_src),
         # 下面几条对应"复核时揪出来的真 bug"，每一条都必须能报红。
         ("把帧清零挪回 audio_start 顶部（＝自动发送永不触发的那个真 bug）",
          main_src.replace('logger.info("▶ Audio START")\n                state.clear_audio()',
                           'logger.info("▶ Audio START")\n                _audio_frames = 0\n                state.clear_audio()'),
          cfg_src),
+        ("拿掉「再按语音键」那条收尾路径的登记",
+         flip_send(main_src, 'end_voice_session("第二次按下语音键", send=True)',
+                   'end_voice_session("第二次按下语音键", send=False)'),
+         cfg_src),
         ("拿掉确认键那条收尾路径的登记",
-         drop_send_after(main_src, "语音会话【结束】（确认键）"),
+         flip_send(main_src, 'end_voice_session("确认键", send=swallow)',
+                   'end_voice_session("确认键", send=False)'),
          cfg_src),
         ("拿掉厂商页确认键那条收尾路径的登记",
-         drop_send_after(main_src, "语音会话【结束】（厂商页确认键）"),
+         flip_send(main_src, 'end_voice_session("厂商页确认键", send=True)',
+                   'end_voice_session("厂商页确认键", send=False)'),
+         cfg_src),
+        ("确认键不看 swallow（＝swallow=False 时连发两下）",
+         flip_send(main_src, 'end_voice_session("确认键", send=swallow)',
+                   'end_voice_session("确认键", send=True)'),
          cfg_src),
         ("让超时收尾也自动发送（会把 10 分钟环境音发出去）",
-         main_src.replace('cancel_voice_send("超时收尾：这段时间录到的内容不适合自动发")',
-                          'cancel_voice_send("x")\n            request_voice_send(_audio_frames)'),
+         flip_send(main_src, 'end_voice_session("超时自动收尾", send=False)',
+                   'end_voice_session("超时自动收尾", send=True)'),
          cfg_src),
         # —— 2026-09-17 武哥否掉"默认开"之后新增的几条 ——
         ("把默认值改回「开」（＝又会替用户发出没想好的话）",

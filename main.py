@@ -7,6 +7,7 @@ remote-voice-bridge — Windows ATVV bridge for Bluetooth voice remotes.
 from __future__ import annotations
 import asyncio
 import logging
+import math
 import os
 import queue
 import re
@@ -110,6 +111,15 @@ _echo_swallowed = 0
 _cb_last_at  = 0.0     # 输出回调最后一次被调用的时刻
 _cb_calls    = 0       # 回调总次数（隔一段时间应该涨）
 _drop_frames = 0       # 因队列满而**丢掉**的音频帧数
+
+# 遥控器**最后一次推来音频帧**的时刻。
+#
+# 与 `_audio_frames` 的区别很关键：那个只在 `atvv.state.stream_active` 为真时
+# 才自增（`on_audio` 的早退门在它前面），所以它回答的是"这一路**我们认不认**"；
+# 而这个在门**之前**就写，回答的是"遥控器**客观上**还在不在推流"。
+# 主循环的"残留推流自愈"（见 ③）必须用后者 —— 要抓的正是
+# "我们已经不认这段会话了、遥控器却还在推"的情形，前者那时根本不涨。
+_remote_frame_last_at = 0.0
 
 # 手动重连请求。控制台点「重新连接」时置位，主循环看到就断开重来。
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
@@ -459,6 +469,35 @@ async def _open_ble_device(dev_info):
     return None
 
 
+# ── 混音软限幅 ────────────────────────────────────────────────────────────────
+# 混音是 `remote×增益 + sys×增益` **直接相加**，加完硬削顶到 int16 的 [-32768, 32767]。
+#
+# 🔴 2026-09-29 真机实测：遥控器**解码后的原始峰值就已经是 32768（满量程）**，
+#    而用户配置里 `gain = 10.0` —— 放大 10 倍再削顶，正常说话基本被切成方波。
+#    削顶会产生大量高次谐波，语音识别在这种波形上明显退化，用户看到的就是
+#    「语音输入时好时坏、有时候一个字都识别不对」。
+#
+# 软限幅：拐点 `_LIMIT_KNEE` 以下**严格线性**（小信号一点不动），以上渐进压向满量程，
+# 数学上永远到不了 32767，因此不再有硬削顶。代价只是大音量时轻微压缩 —— 比削顶好得多。
+_LIMIT_KNEE = 0.70       # 归一化拐点：|x| ≤ 0.70 原样通过
+_FULL_SCALE = 32767.0
+
+
+def _soft_limit(x: float) -> float:
+    """把归一化样本软限幅到 (-1, 1)。拐点以下严格线性，小信号不被染色。"""
+    a = -x if x < 0 else x
+    if a <= _LIMIT_KNEE:
+        return x
+    over = (a - _LIMIT_KNEE) / (1.0 - _LIMIT_KNEE)
+    y = _LIMIT_KNEE + (1.0 - _LIMIT_KNEE) * (1.0 - math.exp(-over))
+    return -y if x < 0 else y
+
+
+# 限幅占比统计窗口：每约 1 秒结算一次并写进 state 给控制台看。
+# 这是"增益是不是开太大"的**唯一客观依据** —— 以前只能靠耳朵猜。
+_limit_win = {"n": 0, "hit": 0, "at": 0.0, "warn_at": 0.0}
+
+
 # ── Audio stream ───────────────────────────────────────────────────────────────
 def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
     """输出流：把「遥控器麦克风」和「电脑麦克风」按各自的增益/静音/独奏相加后写出去。
@@ -489,14 +528,28 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
         s_gain = float(mx["sys_gain"]) if state.source_audible("sys") else 0.0
 
         sys_blk = None
-        if sysmic is not None and s_gain > 0.0:
+        if sysmic is not None:
+            # ⚠⚠ 无论这一路**是否发声**，都要按一比一的比例把队列消费掉 ——
+            #   与下面遥控器那一路是同一条规矩（见 `if not _pending_samples:` 的注释）。
+            #   老写法是"增益为 0 就**不取数**"（`s_gain > 0.0` 写在 if 里），
+            #   于是静音 / 被别人独奏压掉期间队列原地积压，一路涨到 maxsize
+            #   （2 秒）为止，`put_nowait` 开始抛 queue.Full（静默丢弃）；
+            #   解除静音的那一刻，先播出来的是**2 秒前的旧音频** —— 听感是
+            #   "回声/串音"，而语音识别拿到的是错位的音轨。
+            #   现在不发声时用 skip() 把数据丢掉：队列永不积压，
+            #   重新出声时听到的就是当下的声音。
+            #   （2026-09-29 审查报告 P0-2 的后半条。）
             try:
-                sys_blk = sysmic.read(frames)
+                if s_gain > 0.0:
+                    sys_blk = sysmic.read(frames)
+                else:
+                    sysmic.skip(frames)
             except Exception:                      # noqa: BLE001
                 sys_blk = None
         sys_len = len(sys_blk) if sys_blk is not None else 0
 
         peak = 0
+        lim_hit = 0
         for i in range(frames):
             v = 0.0
             # ⚠⚠ 无论这一路**是否发声**，都要按一比一的比例把队列消费掉。
@@ -520,11 +573,15 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
             if i < sys_len:
                 v += float(sys_blk[i]) * s_gain
 
-            iv = int(v)
-            if iv > 32767:
-                iv = 32767
-            elif iv < -32768:
-                iv = -32768
+            # ⚠ 这里**不要**再写 `int(v)` + 手写 if 削顶。
+            #   那是硬削顶：超过满量程就把波形切平，产生大量高次谐波。
+            #   真机上遥控器解码峰值本来就能到 32768，乘上 gain=10 之后
+            #   整段都被切平 —— 语音识别时好时坏就是这么来的。
+            #   改成软限幅后永远到不了满量程，小信号（拐点以下）一点没变。
+            x = v / 32768.0
+            if x > _LIMIT_KNEE or x < -_LIMIT_KNEE:
+                lim_hit += 1
+            iv = int(_soft_limit(x) * _FULL_SCALE)
             outdata[i, 0] = iv
             a = iv if iv >= 0 else -iv
             if a > peak:
@@ -536,6 +593,28 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
         state.push_levels(mix_db=state.db_from_peak(peak))
         if wave_pts:
             state.push_mix_audio(wave_pts)
+
+        # ── 限幅占比：每约 1 秒结算一次 ──────────────────────────────────
+        # 这是"增益是不是开太大"的**唯一客观依据**。以前只能靠耳朵猜，
+        # 用户报"时好时坏"时也没有任何数字可看。
+        _limit_win["hit"] += lim_hit
+        _limit_win["n"] += frames
+        now_cb = time.time()
+        if now_cb - _limit_win["at"] >= 1.0 and _limit_win["n"] > 0:
+            pct = 100.0 * _limit_win["hit"] / _limit_win["n"]
+            state.update(mix_limit_pct=round(pct, 1))
+            # 只在真的压得厉害时提醒，且 30 秒最多一次 —— 别刷屏
+            if pct >= 20.0 and now_cb - _limit_win["warn_at"] >= 30.0:
+                _limit_win["warn_at"] = now_cb
+                logger.warning(
+                    "🔺 混音里有 %.0f%% 的采样在被限幅（拐点 %.2f）—— 增益开太大了。\n"
+                    "   遥控器解码峰值本来就能顶到满量程，再乘大增益会整段被压平，"
+                    "语音识别在这种波形上会明显变差。\n"
+                    "   处置：控制台 → 音频 → 把「麦克风增益」调小（先试 2~3，"
+                    "看着「混合输出」的电平不顶格即可）。", pct, _LIMIT_KNEE)
+            _limit_win["n"] = 0
+            _limit_win["hit"] = 0
+            _limit_win["at"] = now_cb
 
     return sd.OutputStream(
         device=out_dev, channels=1, dtype="int16",
@@ -821,6 +900,8 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 两边都要有，缺一个都不行。
     voice_active     = False   # 语音会话是否正在进行
     voice_started_at = 0.0     # 本次会话开始时刻（超时兜底用）
+    # 「残留推流自愈」上一次补发 MIC_CLOSE 的时刻（冷却用，见主循环 ③）。
+    _residual_close_at = 0.0
     # 「我们发过 MIC_OPEN、但还没等到它那一声回声」的条数与时刻（防自激用）。
     # 判据见 ECHO_MAX_AGE 那段注释 —— 不能只看时间，还要看这笔账还没销。
     pending_mic_echo = 0
@@ -831,6 +912,91 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 认不出来的控制指令 / 键名，各自只报一次（去重集合）。
     # 见 on_control 与 _on_key 里的注释：这两个洞让"按键没反应"永远查不出结论。
     _unknown_ops: set[int] = set()
+
+    # ── 语音会话收尾：**唯一**入口 ────────────────────────────────────────────
+    def end_voice_session(reason: str, *, send: bool = False) -> bool:
+        """结束语音会话，把"会话已结束"这件事**在每一层**同时落实。
+
+        ⚠⚠ 为什么必须收成一个函数（2026-09-29 审查报告 P0-1）
+
+        收尾有 **6 条**路径：
+            ① 再按一次语音键（toggle 翻转）        ② 键盘确认键（Enter）
+            ③ 厂商页/Frida 确认键                  ④ 600 秒超时兜底
+            ⑤ BLE 断连                            ⑥ 程序退出
+        原先这 6 处各写各的，做的事**还都不一样**：有的只撤 UI、
+        有的连 UI 都不撤。而"让遥控器停止推流"这件事（发 MIC_CLOSE +
+        撤 `atvv.state.stream_active`）**一处都没做** —— 于是：
+
+            真机实证 2026-09-29 11:26:34,435 「语音会话【结束】（确认键）」
+            之后，日志里再无任何 MIC_CLOSE，音频帧从 600 一路涨到 3761
+            （11:27:25 仍在涨）—— **多推了 52 秒**。
+            用户感受：明明结束了，遥控器还在收音；紧接着再按语音键，
+            新会话的帧数统计和"零帧误触保护"全被上一段的残流污染。
+
+        这正是本项目反复踩的同一个坑：**同一套机制在多条路径都要落地，
+        漏一条等于没有**。所以收尾只留这一个入口，6 条路径全部改走它。
+
+        参数
+        ----
+        reason : 写进日志与 UI 的结束原因（如"确认键"）。
+        send   : 是否登记「自动发送」。**默认 False** —— 安全方向是不发，
+                 只有"用户明确表示说完了"的那两条路径（再按语音键 / 确认键）
+                 才传 True；超时、断连、退出传 False（那几段音频不该替用户发出去）。
+
+        返回 True 表示"调用之前会话确实开着"。
+        """
+        nonlocal voice_active, voice_started_at, pending_mic_echo, mic_echo_since
+        was_active = voice_active
+
+        # ① 释放输入法热键（幂等，重复调用没有副作用）。
+        #    放在最前面：万一下面任何一步抛异常，也绝不能把 Ctrl/Win 按着不放 ——
+        #    那会让整台电脑的键盘都不正常。
+        voice_hotkey_up()
+
+        # ② 命令遥控器关麦。**必须在清状态之前**，而且要**不看相位**地发。
+        #    这是让遥控器真正停止推流的唯一手段。
+        closed = session.close(f"会话收尾：{reason}")
+
+        # ③ 立刻撤掉 ATVV 的推流许可。
+        #    ⚠ 只发 MIC_CLOSE 不够：`on_audio()` 与 `decode_audio()` 都先看
+        #      `stream_active`。不置 False，遥控器在"真正停下来"之前推的帧
+        #      照样被喂进 UI 和混音队列（波形继续动、「遥控器麦克风」卡片继续
+        #      显示有声音），`_audio_frames` 也会继续涨 —— 污染下一段的统计。
+        atvv.state.stream_active = False
+
+        # ④ 撤 UI 状态：streaming / remote_level_db / 遥控器波形，一次清干净。
+        #    ⚠ 顺序铁律：这一句必须在 `voice_active = False` **之前**。
+        #      反过来会留一个"voice_active=False 而 streaming 还是 True"的窗口，
+        #      主循环那一轮的"状态归位"检查正好撞上 → 多打一条归位日志，
+        #      结果没错、但会把下一个查日志的人带偏。
+        state.end_session(f"语音结束（{reason}）")
+
+        # ⑤ 清会话记账。
+        #    `pending_mic_echo` 必须一起清 —— 留着它，下一段语音的第一条真按键
+        #    会被判成"回给 MIC_OPEN 的回声"当场吞掉：不崩、不报错、UI 波形还在跳，
+        #    就是"按一下没反应"（v1.0.13 那个坑的变体）。
+        voice_active     = False
+        voice_started_at = 0.0
+        pending_mic_echo = 0
+        mic_echo_since   = 0.0
+
+        # ⑥ 自动发送：按策略登记或取消（真正的发送动作在主循环里做）。
+        if send:
+            request_voice_send(_audio_frames)
+        else:
+            cancel_voice_send(f"会话收尾（{reason}）")
+
+        # ⚠ 这里只报「机械部分」（命令发没发出去、状态撤没撤），
+        #    "是哪条路径收的尾"由**调用点**自己那行 `🎙️ 语音会话【结束】（…）` 负责。
+        #    分两层的原因：收尾机制只有一份（改一处就全对），而"谁触发的"
+        #    天然属于调用点。tools/check_send_after_voice.py 也靠调用点那行锚点
+        #    逐个核对 6 条路径有没有接上。
+        logger.info(
+            "🔚 会话收尾（%s）：MIC_CLOSE %s · stream_active=False · 状态已归位",
+            reason,
+            "已发出" if closed else "⚠ 未发出（遥控器可能还会推一会儿）",
+        )
+        return was_active
 
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
@@ -983,18 +1149,15 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     #   顺序铁律仍然成立：判定在**前**、补开麦在**后**。
                     session.ensure_mic_open()
                 else:
-                    voice_hotkey_up()        # tap=再点按结束 / hold=松开结束
-                    # ⚠ 顺序：先撤 UI 状态、再置 voice_active=False。
-                    #   反过来会留一个 `voice_active=False 而 streaming 还是 True`
-                    #   的窗口，主循环那一轮"状态归位"检查正好撞上 → 多打一条
-                    #   「状态归位」日志（结果没错，但日志会把下一个查的人带偏）。
-                    state.end_session("语音结束")
-                    voice_active     = False
-                    voice_started_at = 0.0
+                    # tap=再点按结束 / hold=松开结束。
+                    # ⚠ 收尾**只走 end_voice_session 这一个入口**（见它的注释）：
+                    #   它会一并发 MIC_CLOSE（让遥控器真的停流）、撤
+                    #   `atvv.state.stream_active`（让后续帧不再喂进 UI/混音）、
+                    #   清 `pending_mic_echo`（否则下一段的第一下会被当回声吞掉）。
                     logger.info("🎙️ 语音会话【结束】（第二次按下语音键）")
-                    # 结束之后替用户按一下「发送」—— 详见 request_voice_send 的注释。
+                    # send=True：用户明确按了结束，这一段该走「自动发送」策略。
                     # 传这一段的帧数：一帧都没收到 = 这次其实是误触，不该发。
-                    request_voice_send(_audio_frames)
+                    end_voice_session("第二次按下语音键", send=True)
             elif event["type"] == "audio_stop":
                 session.on_audio_stop(event["reason"])
                 # ⚠ 松手 **不等于** 语音结束。
@@ -1037,6 +1200,11 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     logger.info(f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，峰值 {_audio_peak}）")
                     # 会话本来就没开（例如"按下→松手"这种一次性的短按）——
                     # 但状态可能被别处点亮过，这里一并归位。
+                    # ⚠ 这条**不算会话收尾**：遥控器已经自己停了流，再发 MIC_CLOSE
+                    #   是多余的。但 atvv 的推流许可必须撤掉 —— 不撤的话
+                    #   `on_audio()` 会把后续帧继续喂进 UI 和混音队列
+                    #   （"遥控器麦克风"卡片波形一直在动 = 用户说的"还在收音"）。
+                    atvv.state.stream_active = False
                     state.end_session("语音结束")
             elif event["type"] == "mic_open_result":
                 session.on_mic_open_result(event["code"])
@@ -1057,8 +1225,16 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     def on_audio(sender, args):
         nonlocal last_ble_activity
-        global _audio_frames, _audio_peak, _drop_frames
+        global _audio_frames, _audio_peak, _drop_frames, _remote_frame_last_at
         last_ble_activity = time.time()
+        # ⚠⚠ 这一行必须在 `stream_active` 那道门**之前**。
+        #
+        # 它是「遥控器现在到底还在不在推流」的唯一证据，而主循环的
+        # "残留推流自愈"（③）正是靠它判断的。写在门之后就永远只在
+        # "我们认为在开会话"时更新 —— 而那条自愈要抓的恰恰是
+        # **我们认为没有会话、遥控器却还在推**的情形，那时门已经把它挡掉了，
+        # 证据永远不会刷新 → 自愈条件永远不成立 → 代码在、永远跑不到。
+        _remote_frame_last_at = time.time()
         if not atvv.state.stream_active:
             return
         try:
@@ -1284,7 +1460,43 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     #     集合的按键翻成 WM_APPCOMMAND 而不是键盘事件，钩子根本看不到。
     #     它们走的是**厂商页**那条路（`remote_hid.py` 直接读 0x2A4D 报告），
     #     解出来的 button_id 直接进同一个 `resolve_button`，不经过这里。
+    # 🔴🔴 2026-09-29 重大整改：这张表**只许放"物理键盘不会产生"的键名**。
+    #
+    # 为什么（真机事故，用户报的原话是"按空格就把消息发出去了"）：
+    #   低级键盘钩子**分不出遥控器和物理键盘** —— 它只看键名。所以只要表里
+    #   出现 `space` / `enter` / `esc` / 方向键 这类**物理键盘也有**的名字，
+    #   用户打字时就会被当成遥控器按键：
+    #       按物理空格 → 命中 "space" → btn_id = "ok" → 注入 Enter
+    #       （config 里 ok 默认就是 enter）→ 微信里**直接把手打的消息发出去**。
+    #   真机日志实证（2026-09-29 09:58:32）：
+    #       🔘 HID 按键 'space'（scan=57） → 按钮「ok」→ 动作 'enter'
+    #   `scan=57` 正是**物理键盘**的空格键码。同一个毛病还有：
+    #       物理回车 → 一次变两次回车；物理 Esc / 方向键 → 每个都多按一下。
+    #
+    # 那遥控器的按键靠什么？**不靠这张表。** 本机遥控器走的是
+    #   · `frida_hid.RemoteHidTap`（v1.0.20：注入 WUDFHost 抄 IOCTL 报告）
+    #   · `remote_hid.RemoteHidButtons`（厂商页 0x2A4D）
+    # 两条路都**直接给出 button_id**、直接进 `resolve_button`，与本表无关。
+    # 本表只是"某些遥控器把按键报在键盘页"时的兜底 —— 而本项目的实测结论是
+    # Chromecast 遥控器的按键**从来不走键盘页**（在 WUDFHost 内部就被消费了）。
+    #
+    # ⚠ 规矩（与下面那三条并列，别再违反）：
+    #  ④ **凡是物理键盘也有的键名，一律进 `KEY_MAP_SHARED`**（默认不生效），
+    #     不许写进这张常开表。`tools/check_keymap.py` 会拦。
     KEY_MAP = {
+        # 消费类键：物理键盘基本不会产生，可以常开。
+        "browser back":               "back",     # 0xA6 遥控器返回键常报这个
+    }
+
+    # ⚠⚠ 这张表里的名字**物理键盘也会产生**，所以**默认不生效**。
+    #   要打开得设 config.json 的 `keyboard_page_keys: true`（见 config.py 里的长注释）。
+    #   打开之后的代价：打字时这些键会被当成遥控器按键 ——
+    #   按一下空格会多发一个回车（在聊天软件里就是"手打的消息被发出去"）。
+    #
+    # 保留它是因为：万一哪天遇到一台**只**走键盘页的遥控器（本机这台不是），
+    # 这条兜底还有用；但默认必须是关的 —— 安全方向是"打字正常"，
+    # 而不是"多认一个遥控器按键"。
+    KEY_MAP_SHARED = {
         # 主页
         "home":                       "home",     # 0x24
         # 确认
@@ -1292,10 +1504,6 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         "space":                      "ok",       # 0x20（确认键走键盘页时可能是空格）
         # 返回
         "esc":                        "back",     # 0x1B ⚠ 曾经写成 "escape"（死键名）
-        "browser back":               "back",     # 0xA6 消费键，遥控器返回键常报这个
-        # ⚠ 不要再写 "back" / "browser home" / "browser start and home" /
-        #   "return" / "volume up" 这些 —— 已用库的 `to_name` 表逐条实测，
-        #   它们**一个都不会**被报出来。`tools/check_keymap.py` 第 6 步会拦。
         # 方向
         "up": "up", "down": "down", "left": "left", "right": "right",
     }
@@ -1430,6 +1638,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                         getattr(new, "send_after_voice_delay_ms", 800) or 800),
                     "send_after_voice_key": str(
                         getattr(new, "send_after_voice_key", "enter") or "enter"),
+                    # 键盘页兜底映射（⚠ 默认关，见 config 里的长注释：
+                    # 开着 = 按物理空格会被当成遥控器确认键、再注入一个回车）。
+                    "keyboard_page_keys": bool(
+                        getattr(new, "keyboard_page_keys", False)),
                 }
                 _warn_bad_keymap(_cfg_cache["keymap"])
                 logger.debug(f"config reloaded (mtime={mt})")
@@ -1477,16 +1689,27 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             return True
 
         # Map key name → button_id
-        btn_id = KEY_MAP.get(e.name, "")
+        #
+        # ⚠⚠ 默认**不查** `KEY_MAP_SHARED` —— 那张表里是 space / enter / esc /
+        #    方向键，**物理键盘也会产生这些名字**，查了就等于劫持打字：
+        #    按一下物理空格 → 命中 "space" → 按钮「ok」→ 注入一个回车
+        #    （config 里 ok 默认就是 enter）→ 聊天软件里手打的消息被直接发出去。
+        #    真机实证 2026-09-29 09:58:32：`HID 按键 'space'（scan=57） → 按钮「ok」`。
+        #    要用得显式打开 config.json 的 `keyboard_page_keys`（默认 false）。
+        cached = _get_cfg()
+        kmap = KEY_MAP
+        if cached.get("keyboard_page_keys", False):
+            kmap = {**KEY_MAP, **KEY_MAP_SHARED}
+        btn_id = kmap.get(e.name, "")
         if not btn_id and e.name:
             # ⚠ 兜底只跑**多词复合键**（键名里带空格），单词键一律不动。
-            # 单词键（up/down/left/right/back/home/enter/escape…）已由第 567 行
-            # 的 `KEY_MAP.get` 精确匹配兜住，绝不能进兜底循环：
+            # 单词键（up/down/left/right/back/home/enter…）已由上面的
+            # `kmap.get` 精确匹配兜住，绝不能进兜底循环：
             # 词边界下 "up" 会误中物理键盘的 "page up"、"left" 误中 "left windows"，
             # 导致按方向/翻页键时顺手注入一个方向键。
             # 复合键（"browser back" / "browser start and home" / "volume up" 等）
             # 即便未来 keyboard 库换种写法、精确匹配失手，也能兜底接住。
-            for k, v in KEY_MAP.items():
+            for k, v in kmap.items():
                 if " " in k and re.search(rf"\b{re.escape(k)}\b", e.name):
                     btn_id = v
                     break
@@ -1504,25 +1727,18 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         #    给用户的逃生口：config.json 里 swallow_ok_during_voice=false。
         if voice_active and btn_id == "ok" and e.event_type == "down":
             swallow = bool(_get_cfg().get("swallow_ok", True))
-            voice_hotkey_up()
-            state.end_session("语音结束（确认键）")
-            voice_active     = False
-            voice_started_at = 0.0
+            # ⚠ 收尾只走 end_voice_session（见它的注释）：6 条路径共用一份机制。
+            #   send=swallow 的理由：按确认＝"我确定说完了"，本该登记自动发送；
+            #   但 swallow=False 时这一下 OK **自己就会变成 Enter** 发出去，
+            #   再登记一次就是连发两下（多发一条空消息）→ 只在吞掉这一下时才登记。
             logger.info(
                 "🎙️ 语音会话【结束】（确认键）"
                 + ("；这一下不再当 Enter 发出" if swallow else "；Enter 照常放行")
             )
-            # ⚠ 收尾路径**不止「第二次按语音键」一条**：用确认键收尾的更该发出去
-            #   （按确认＝"我确定说完了"）。只接一条路 = 另外几条静默失效 ——
-            #   本项目反复踩的坑：同一套机制在多条路径都要落地，漏一条等于没有。
-            #   但 swallow=False 时这一下 OK **自己就会变成 Enter** 发出去，
-            #   再登记一次就是连发两下（多发一条空消息）→ 只在吞掉这一下时补。
-            if swallow:
-                request_voice_send(_audio_frames)
+            end_voice_session("确认键", send=swallow)
             return not swallow               # 吞掉这一下，不让它再当 Enter 发出去
 
         if btn_id and btn_id != "voice":
-            cached = _get_cfg()
             if not cached.get("mapping_enabled", True):
                 return True                  # 映射总开关关掉 → 遥控器当普通遥控器用
             # ⚠ 每个**首次出现**的键名都在这里报一次（之后静默）。
@@ -1642,15 +1858,11 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         # 这条本来只在 _on_key（键盘钩子）里有，而厂商页的确认键走不到那儿 ——
         # 不在这里补上，就是"按 OK 关不掉语音"。
         if is_down and voice_active and btn_id == "ok":
-            voice_hotkey_up()
-            state.end_session("语音结束（确认键）")
-            voice_active     = False
-            voice_started_at = 0.0
+            # ⚠ 收尾只走 end_voice_session（见它的注释）：6 条路径共用一份机制。
             logger.info("🎙️ 语音会话【结束】（厂商页确认键）")
-            # 同上：这条收尾路径也要接上自动发送。下面直接 return，这一下按键被
-            # 我们**吞掉了**、不会走到 resolve_button 变成 Enter → 无条件补上，
-            # 不存在重复发送。
-            request_voice_send(_audio_frames)
+            # send=True：下面直接 return，这一下按键被我们**吞掉了**、不会走到
+            # resolve_button 变成 Enter → 无条件登记，不存在重复发送。
+            end_voice_session("厂商页确认键", send=True)
             return
 
         resolve_button(
@@ -1807,16 +2019,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     f"⏰ 语音会话已持续 {int(_now_v - voice_started_at)} 秒，超过上限 "
                     f"{VOICE_MAX_SECONDS} 秒 → 自动结束，避免一直挂着听"
                 )
-                voice_hotkey_up()
-                state.end_session("语音结束（超时自动收尾）")
-                voice_active     = False
-                voice_started_at = 0.0
-                # ⚠ 超时收尾**故意不自动发送** —— 别顺手改成"那也发一下吧"：
-                #   麦克风已经开着最多 10 分钟，里面很可能全是环境音、旁人的话
-                #   （用户人可能早走开了）。把这种内容自动发进聊天框，
-                #   比"少发一次"严重得多 —— 宁可不发，让用户自己看一眼再决定。
-                #   顺手取消待发送，防别处残留的登记在这一刻被触发。
-                cancel_voice_send("超时收尾：这段时间录到的内容不适合自动发")
+                logger.info("🎙️ 语音会话【结束】（超时自动收尾）")
+                # ⚠ 超时收尾**故意不自动发送**（send=False，也是默认值）——
+                #   别顺手改成"那也发一下吧"：麦克风已经开着最多 10 分钟，
+                #   里面很可能全是环境音、旁人的话（用户人可能早走开了）。
+                #   把这种内容自动发进聊天框，比"少发一次"严重得多 ——
+                #   宁可不发，让用户自己看一眼再决定。
+                #   send=False 会顺手**取消**待发送，防别处残留的登记在这一刻被触发。
+                end_voice_session("超时自动收尾", send=False)
 
             # ② 状态归位：`streaming` 是 UI 上「有没有在收音」的**唯一真源**
             #    （托盘图标变橙红、控制台顶部那行「语音中」都直接读它），
@@ -1833,7 +2043,34 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     state.update(streaming=True, last_event="语音中…")
                 else:
                     logger.info("🧹 语音会话没在跑，但状态还亮着「语音中」→ 已归位")
+                    # ⚠ 顺手把推流许可也撤掉：不撤的话 `on_audio()` 会继续
+                    #   把帧喂进「遥控器麦克风」那张卡的波形 —— 用户看到的就是
+                    #   "已经关了，波形还在动、还显示在收音"（2026-09-29 报的）。
+                    atvv.state.stream_active = False
                     state.end_session("语音结束（状态归位）")
+
+            # ③ 残留推流自愈：程序这边**没有会话**，遥控器却**还在推流**。
+            #
+            # 这一条是给"遥控器没收到 MIC_CLOSE"兜底的。用户能看到的症状是：
+            #   输入法那边早关了、程序也认为会话结束了，**遥控器却还在收音** ——
+            #   控制台「遥控器麦克风」那张卡的波形一直在动，看着像程序坏了。
+            # 真机实证（2026-09-29）：会话 11:26:34 结束，遥控器一路推到 11:27:25
+            #   （多推 52 秒 / 3161 帧），全程没有任何 MIC_CLOSE。
+            # 现在收尾会主动发 MIC_CLOSE（见 end_voice_session），这里再兜一层：
+            #   只要"我们没在开会话"却"还在收帧"，就再命令它停一次。
+            #   ⚠ 冷却时间是必须的 —— 主循环 200ms 一轮，没有冷却会瞬间刷爆 BLE。
+            if (not voice_active
+                    and _remote_frame_last_at
+                    and (_now_v - _remote_frame_last_at) < 2.0
+                    and (_now_v - _residual_close_at) > 5.0):
+                _residual_close_at = _now_v
+                logger.warning(
+                    "⚠ 遥控器还在推流，但程序这边没有会话 → 补发 MIC_CLOSE 让它停"
+                    "（正常情况下不该出现，出现了说明某条收尾路径漏发了命令）"
+                )
+                session.close("残留推流自愈")
+                atvv.state.stream_active = False
+                state.end_session("语音结束（残留推流已停）")
 
             # ── 语音结束后的自动发送（见 request_voice_send 的注释）──────────
             # 放在主循环而不是 BLE 回调线程里，有三个好处：
@@ -1883,6 +2120,37 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         # 否则 Ctrl / Win 会一直处于按下状态，整台电脑的键盘都会不正常。
         try: hotkey_up()
         except Exception: pass
+
+        # ── 第 5、6 条收尾路径：断连 / 退出 ────────────────────────────────
+        # ⚠ 退出前**必须**命令遥控器关麦。不发的后果：程序没了，遥控器还以为
+        #   会话开着，继续推流 —— 用户看到的是"软件都关了，遥控器还在收音"，
+        #   而且它推的流没人接，只能等遥控器自己超时。
+        #
+        # ⚠ 这里**不能只调 end_voice_session()**：它的 `_send_tx` 只是把协程
+        #   投递到事件循环（run_coroutine_threadsafe），而我们此刻**就在**这个
+        #   循环的 finally 里 —— run_bridge 一返回、asyncio.run 一收尾，那条
+        #   还没跑到的写入就被取消了：**MIC_CLOSE 静默丢失**，日志上还写着"已发出"。
+        #   所以这里自己 await 一次写入，确认它真的落到 BLE 上（最多等 1 秒，
+        #   超时就放弃 —— 退出不能被一条蓝牙写入卡住）。
+        _was_streaming = bool(atvv.state.stream_active or voice_active)
+        try:
+            if voice_active or atvv.state.stream_active:
+                logger.info("🎙️ 语音会话【结束】（断开/退出）")
+            end_voice_session("断开或退出", send=False)
+        except Exception as e:                          # noqa: BLE001
+            logger.warning(f"退出前收尾异常（继续清理）：{e}")
+        if _was_streaming:
+            try:
+                _w = DataWriter()
+                _w.write_bytes(atvv.mic_close_cmd(session.state.stream_id))
+                await asyncio.wait_for(
+                    tx_char.write_value_with_result_async(_w.detach_buffer()),
+                    timeout=1.0,
+                )
+                logger.info("📤 MIC_CLOSE（退出前）已发出 —— 遥控器不会继续推流")
+            except Exception as e:                      # noqa: BLE001
+                logger.warning(f"退出前补发 MIC_CLOSE 失败（遥控器可能还会推一会儿）：{e}")
+
         state.reset()
         # 松开「维持连接」的请求，让 Windows 可以正常休眠这条链路；
         # 不显式清掉的话，托盘退出后遥控器会被系统一直拽着不放。
