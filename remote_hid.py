@@ -89,8 +89,15 @@ def decode_report(raw: bytes) -> tuple[str | None, bool]:
 class RemoteHidButtons:
     """后台读厂商页报告 → 回调 on_button(button_id, is_down)。"""
 
-    def __init__(self, on_button) -> None:
+    def __init__(self, on_button, bypass_probe=None) -> None:
         self._on = on_button
+        # 可选探针：按键旁路（frida 注入 WUDFHost）**现在**是不是已经就绪？
+        # 只为让下面 audit() 的判词说实话 —— 旁路走的是 WUDFHost 里的驱动读调用，
+        # **不经过**本类盯的那几路集合，所以"厂商页 0 条"和"按键没到"是两件事。
+        # 默认 None：不传就维持老判词（老调用方/单测不受影响）。
+        self._bypass_probe = bypass_probe
+        self._bypass_note_at = 0.0       # 上次打旁路说明的时间
+        self._bypass_last: bool | None = None   # 上次看到的旁路状态（None=还没问过）
         self._cols: list[hidwatch.HidCollection] = []
         self._cursor: dict[int, int] = {}
         self._stop = threading.Event()
@@ -253,6 +260,52 @@ class RemoteHidButtons:
         total = sum(self._counts.values())
 
         if total == 0:
+            # ⚠ 先问一句：按键旁路是不是已经在送货了？
+            #
+            #   旁路读的是 WUDFHost 里那次驱动调用（IOCTL 0x80018483）的输出缓冲区，
+            #   **完全不经过**本类盯的这几路集合 —— 于是会出现
+            #   「厂商页 0 条」+「按键其实完全可用」并存。
+            #
+            #   2026-09-29 真机就撞上了：旁路已就绪、方向/确认/返回全都收到，
+            #   而这行判词还在说「说明按键没有到达本程序，问题在蓝牙/HID 那一层」
+            #   —— 一句会把下一个查日志的人（包括未来的自己）直接带偏的话。
+            #   判决书必须比被判决的事实更保守：说不清就别下结论。
+            #   ⚠ 探针"存在但还没就绪"要单独成一态：注入 WUDFHost 要 5~6 秒，
+            #     启动后第一次审计必然落在注入完成**之前**。若这时照念老判词，
+            #     日志里就会永久留一条"问题在蓝牙/HID 那一层"——
+            #     而 6 秒后旁路就绪、按键完全可用。**三态必须分开说**：
+            #       · 没配旁路（探针为 None）→ 老判词，那时它是对的
+            #       · 旁路注入中（探针在、返回 False）→ 还说明不了什么，别下结论
+            #       · 旁路已就绪（探针返回 True）→ 明说"这行不能读成按键没到"
+            if self._bypass_probe is not None:
+                ready = bool(self._bypass_probe())
+                # 状态**变了**就立刻说，不走静默窗口 ——
+                # 「注入中 → 就绪」这几秒正是最需要当场改口的时刻：
+                # 上一句刚说"还判不出"，下一句就该说"现在能判了"。
+                # 只有状态没变时才限流，免得刷屏。
+                if (ready == self._bypass_last
+                        and now - self._bypass_note_at < _AUDIT_QUIET_SEC):
+                    return
+                self._bypass_last = ready
+                self._bypass_note_at = now
+                heads = "、".join(c.key for c in self._cols) or "（一路都没打开）"
+                if ready:
+                    logger.info(
+                        "📊 HID 通道审计：厂商页累计 **0 条**（已挂 %d 路：%s）"
+                        "—— 但**按键旁路已就绪**：按键走的是旁路那条路"
+                        "（WUDFHost 内的驱动读调用），**不经过**这几路集合。"
+                        "⇒ 这行**不能**读成「按键没到本程序」。",
+                        len(self._cols), heads,
+                    )
+                else:
+                    logger.info(
+                        "📊 HID 通道审计：厂商页累计 **0 条**（已挂 %d 路：%s）"
+                        "—— 按键旁路**仍在注入中**，尚未就绪。"
+                        "⇒ 此刻还判不出「按键到没到」，请等「按键旁路：就绪」那行。",
+                        len(self._cols), heads,
+                    )
+                return
+
             self._zero_warned += 1
             if (self._zero_warned > _AUDIT_LOUD_TIMES
                     and now - self._zero_warn_at < _AUDIT_QUIET_SEC):

@@ -21,6 +21,7 @@ STEPS = [
                   "config.py", "state.py", "keys.py", "session.py", "buttons.py",
                   "mixer.py", "main.py", "console_server.py", "tray_app.py",
                   "hidinfo.py", "hidwatch.py", "pairing.py", "remote_hid.py",
+                  "frida_hid.py",
                   "tools/_utf8.py",
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
@@ -30,6 +31,7 @@ STEPS = [
                   "tools/watch_reports.py", "tools/check_hidinfo.py",
                   "tools/check_failure_visibility.py", "tools/check_pairing.py",
                   "tools/check_remote_hid.py", "tools/check_injection.py",
+                  "tools/check_frida_tap.py",
                   "tools/check_audio_watchdog.py",
                   "tools/check_send_after_voice.py",
                   "tools/dump_report_descriptor.py",
@@ -90,6 +92,12 @@ STEPS = [
     # 一旦错了，现象和"遥控器没连上"一模一样 —— 必须先用纯单测钉死，
     # 真机上按下键之后只要对焦"报告来没来"这一件事。
     ("厂商页按键解码", [PY, "tools/check_remote_hid.py"]),
+    # 按键旁路（v1.0.20：注入 WUDFHost 从 HID 驱动内部抄报告）——
+    # 这是真机上**唯一**能拿到遥控器按键的那一路（自开厂商页那条实测一直是 0 条）。
+    # 它的失效全是静默的（注入失败 / 挂错宿主 / 报告格式不对，现象都是"按了没反应"），
+    # 所以先把能脱离硬件验证的那一半钉死：消费类页 usage 表、两种报告格式的解码、
+    # 抹除算法、.js 与 .py 的 IOCTL 常量不漂移。带反例自证。
+    ("按键旁路解码", [PY, "tools/check_frida_tap.py"]),
     # "波形在动、输入法却收不到声音，重启才好"（2026-09-17 真机）——
     # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
     # 纯静态，几毫秒。

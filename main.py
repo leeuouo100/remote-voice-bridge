@@ -1599,11 +1599,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     #   CHROMECAST_BUTTONS 里 voice 的 usage 是字符串 "voice"，
     #   所以 remote_hid 的 USAGE_TO_BUTTON 天然不含它，两条路不会打架。
     _hid_buttons = None
+    _hid_tap = None
+    # 两条按键来源（frida 旁路 / 厂商页自读）共用这一个派发口，按 (键, 沿)
+    # 去重，防止同一按键被两路各派发一次（两路都能用时才会碰到）。
+    _hid_recent: dict[tuple[str, bool], float] = {}
 
     def _on_hid_button(btn_id: str, is_down: bool) -> None:
-        """厂商页解出来的按键 → 复用现有映射表派发（与 _on_key 同一套规则）。"""
+        """HID 解出来的按键 → 复用现有映射表派发（与 _on_key 同一套规则）。"""
         nonlocal last_key_activity, last_ble_activity, voice_active, voice_started_at
         now = time.time()
+        _k = (btn_id, is_down)
+        if now - _hid_recent.get(_k, 0.0) < 0.06:
+            return                                  # 两路重复上报 / 抖动
+        _hid_recent[_k] = now
         # 遥控器还活着的证据：watchdog 是"ATVV 静默 180 秒就重连"，
         # 而按键走厂商页、不产生 ATVV 通知 —— 不记进来就会出现
         # "一直在按遥控器却被判失联、给重连了"。
@@ -1640,7 +1648,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     if getattr(cfg, "hid_vendor_keys", True):
         try:
             import remote_hid
-            _hid_buttons = remote_hid.RemoteHidButtons(_on_hid_button)
+            # bypass_probe：让 HID 通道审计在「旁路已就绪」时别再把
+            # 「厂商页 0 条」说成「按键没到本程序」。闭包读的是调用时刻的
+            # `_hid_tap`（它在本函数后面才被赋值），所以这里写 lambda 是安全的。
+            _hid_buttons = remote_hid.RemoteHidButtons(
+                _on_hid_button,
+                bypass_probe=lambda: (_hid_tap is not None
+                                      and bool(getattr(_hid_tap, "ready", False))),
+            )
             n_col = _hid_buttons.start()
             if n_col:
                 logger.info(f"✅ 遥控器厂商页按键已接管（{n_col} 路集合）→ 按键映射生效")
@@ -1660,6 +1675,40 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             _hid_buttons = None
     else:
         logger.info("ℹ️  厂商页按键读取已在设置里关闭（hid_vendor_keys=false）")
+
+    # ── 遥控器按键（Frida 旁路，注入 WUDFHost）────────────────────────────
+    #
+    # ⚠⚠ 这是 v1.0.20 修「除语音键外所有按键都没反应」的关键，也是真机上
+    #    **唯一**能拿到遥控器按键的那一路。
+    #
+    # 为什么：遥控器的 HID 报告在 WUDFHost.exe（承载 HOGP 的 UMDF 驱动宿主）
+    # 内部就被消费掉了 —— 用户态 HID 接口 / Raw Input / 键盘钩子**全都看不到**。
+    # 上面 `hid_vendor_keys` 那条「自开厂商页」的路真机实测一直是 0 条。
+    # 唯一出路是用 Frida 注入 WUDFHost，在它读 GATT 特征的那次
+    # IOCTL（0x80018483）输出缓冲区上抄一份。
+    #
+    # 解出来的 button_id 与厂商页那条路**完全一致**，一起喂给上面的
+    # `_on_hid_button` → 映射表 / 控制台 / config.json 全都不用改。
+    # 两条路并行互补：任一路拿到按键都能用。
+    #
+    # ⚠ 语音键仍不在这里：它走 ATVV 的 BLE 数据通道（见 on_control）。
+    if getattr(cfg, "hid_frida_tap", True):
+        try:
+            import frida_hid
+            _hid_tap = frida_hid.RemoteHidTap(_on_hid_button)
+            try:
+                _hid_tap.set_mapping((_get_cfg().get("keymap") or {}))
+            except Exception:                       # noqa: BLE001
+                pass
+            _hid_tap.start()
+            logger.info("🔓 遥控器按键旁路已启动（注入 WUDFHost 读 HID 报告）"
+                        "—— 若日志随后出现「按键旁路：就绪」，除语音键外的按键即可用")
+        except Exception as e:                      # noqa: BLE001
+            # 同厂商页那条：这一路挂了不该拖垮语音 —— 它是"读不到"，不是"桥起不来"。
+            logger.exception(f"⚠ 启动按键旁路失败（语音功能不受影响）：{e}")
+            _hid_tap = None
+    else:
+        logger.info("ℹ️  按键旁路已在设置里关闭（hid_frida_tap=false）")
 
     # ── Health check ──
     async def check_health(force: bool = False) -> bool:
@@ -1807,6 +1856,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         except Exception: pass
         if _hid_buttons is not None:
             try: _hid_buttons.stop()
+            except Exception: pass
+        if _hid_tap is not None:
+            try: _hid_tap.stop()
             except Exception: pass
         try: ble.close()
         except Exception: pass

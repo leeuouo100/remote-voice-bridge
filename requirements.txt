@@ -17,6 +17,12 @@ winrt-Windows.Devices.Radios==3.2.1
 # 合成按键（Interception 不可用时的降级路径）
 keyboard==0.13.5
 
+# 遥控器按键旁路：注入 WUDFHost.exe 从 HID 驱动内部抄报告。
+# ⚠ 除语音键外的按键**全靠这一路**（自开厂商页那条路真机实测一直是 0 条）。
+# 装不上 / 被安全软件拦时程序会自动降级：语音照常，只是方向键/OK/音量用不了。
+# 版本锁定与 VibeMote 一致（其未公开接口在该区间验证过）。
+frida>=17.18,<18
+
 # 音频输出到 VB-CABLE
 sounddevice==0.4.6
 numpy==1.24.3

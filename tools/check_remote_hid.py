@@ -213,6 +213,60 @@ def run_audit_throttle_tests() -> bool:
         else:
             print(f"   ❌ [反例] 去掉静默窗口后仍只打 {lg4.n_info} 条 → 说明检查无效")
             ok = False
+
+        # ④ 旁路已就绪时，**不许**再把「厂商页 0 条」说成「按键没到本程序」。
+        #
+        #    2026-09-29 真机事故：frida 旁路明明已经收到方向/确认/返回/主页，
+        #    而这行判词还在说「说明按键没有到达本程序，问题在蓝牙/HID 那一层」
+        #    —— 一句会把下一个查日志的人（包括未来的自己）直接带偏的话。
+        #    旁路读的是 WUDFHost 内的驱动调用，**不经过**本类盯的那几路集合，
+        #    所以"厂商页 0 条"和"按键没到"在这里本来就是两件事。
+        #    判决书必须比被判决的事实更保守：说不清就别下结论。
+        lg5 = _FakeLog()
+        remote_hid.logger = lg5
+        rb4 = remote_hid.RemoteHidButtons(lambda *a: None,
+                                          bypass_probe=lambda: True)
+        rb4._cols = [_FakeCol()]
+        for i in range(5):
+            rb4._audit(5000.0 + i * 20.0)
+        if lg5.n_warn == 0 and lg5.n_info >= 1:
+            print(f"   OK 旁路就绪时：0 条告警、{lg5.n_info} 条「旁路在送货」说明")
+        else:
+            print(f"   ❌ 旁路就绪却仍打 {lg5.n_warn} 条「按键没到」告警"
+                  f"（info={lg5.n_info}）→ 判词在说反话")
+            ok = False
+
+        # ④b 反例：**不传探针**时同样的输入必须变回告警。
+        #     不钉这条，上面那条可能只是"碰巧没报"（本项目反复踩的坑）。
+        lg6 = _FakeLog()
+        remote_hid.logger = lg6
+        rb5 = remote_hid.RemoteHidButtons(lambda *a: None)      # 刻意不传探针
+        rb5._cols = [_FakeCol()]
+        for i in range(5):
+            rb5._audit(6000.0 + i * 20.0)
+        if lg6.n_warn >= 1:
+            print(f"   OK [反例] 不传探针 → 照旧报 {lg6.n_warn} 条告警"
+                  "（证明上面卡的不是空气）")
+        else:
+            print("   ❌ [反例] 不传探针也不报 → 说明检查无效")
+            ok = False
+
+        # ④c 探针在、但**还没就绪**（注入中）→ 同样不许念老判词。
+        #     这条钉的是"启动后第一次审计必然早于注入完成"那 5~6 秒 ——
+        #     不钉它，日志里就会永久留一条说反话的行。
+        lg7 = _FakeLog()
+        remote_hid.logger = lg7
+        rb6 = remote_hid.RemoteHidButtons(lambda *a: None,
+                                          bypass_probe=lambda: False)
+        rb6._cols = [_FakeCol()]
+        for i in range(5):
+            rb6._audit(7000.0 + i * 20.0)
+        if lg7.n_warn == 0 and lg7.n_info >= 1:
+            print(f"   OK 旁路注入中：0 条告警、{lg7.n_info} 条「尚未就绪」说明")
+        else:
+            print(f"   ❌ 旁路注入中却打了 {lg7.n_warn} 条「按键没到」告警"
+                  f"（info={lg7.n_info}）")
+            ok = False
     finally:
         remote_hid.logger = orig_log
         remote_hid._AUDIT_LOUD_TIMES = orig_loud

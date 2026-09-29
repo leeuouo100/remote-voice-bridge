@@ -14,7 +14,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "re
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.20"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
@@ -398,6 +398,19 @@ class Config:
     # 什么时候关：万一某个键出现了「按一下出两个动作」（遥控器在别的机器上
     # 走的是标准键盘页、原生键也能用），关掉它退回纯键盘钩子那条路排查。
     hid_vendor_keys:    bool  = True
+
+    # 注入蓝牙驱动宿主（WUDFHost.exe）读 HID 报告（v1.0.20 起，**真机上唯一
+    # 能拿到遥控器按键的那一路**）。
+    #
+    # 为什么需要：遥控器的按键报告在 WUDFHost 内部就被 UMDF 驱动消费掉了，
+    # 用户态 HID 接口 / Raw Input / 键盘钩子**全都看不到**（`hid_vendor_keys`
+    # 那条自开厂商页的路真机实测一直是 0 条）。只有用 Frida 注入 WUDFHost、
+    # 在它读 GATT 特征的那次 IOCTL 输出缓冲区上抄一份，才拿得到按键。
+    #
+    # 什么时候关：① 公司电脑的 EDR 拦注入（日志会说明），关掉退回纯键盘钩子；
+    #            ② 不想装 frida（约 130MB）—— 关掉后语音功能完全不受影响，
+    #               只是除语音键外的按键不生效。
+    hid_frida_tap:      bool  = True
 
     # 配置结构版本。旧版 config.json 里没有这个字段（= 0），
     # load() 会据此跑一次性迁移 —— 见 _migrate()。

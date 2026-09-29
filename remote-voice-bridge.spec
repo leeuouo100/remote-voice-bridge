@@ -30,11 +30,15 @@ winrt_datas, winrt_binaries, winrt_hidden = collect_all('winrt')
 # 漏掉这一步的表现是"控制台打开一片白 + 404"。
 ui_datas = [('ui', 'ui')]
 
+# Frida 注入脚本（按键旁路用）：frida_hid.py 读它、喂给 frida。漏了的表现是
+# 「语音能用、除语音键外的按键一个都不灵」—— 同 remote_hid 那条路的坑。
+tap_datas = [('frida_tap.js', '.')]
+
 a = Analysis(
     ['tray_app.py'],
     pathex=[SPEC_DIR],
     binaries=winrt_binaries,
-    datas=winrt_datas + ui_datas,
+    datas=winrt_datas + ui_datas + tap_datas,
     hiddenimports=winrt_hidden + [
         'winrt.runtime',
         'keyboard',
@@ -49,6 +53,11 @@ a = Analysis(
         # 也不拖垮语音），显式列一遍更保险 —— 漏了的表现是「语音能用、
         # 其它按键一个都不灵」，而且日志里只有一行 warning，极难往这上面想。
         'remote_hid', 'hidinfo', 'hidwatch',
+        # 按键旁路（v1.0.20）：注入 WUDFHost 从 HID 驱动内部抄报告 ——
+        # **真机上唯一能拿到遥控器按键的那一路**。同样是 run_bridge 内部
+        # `import frida_hid`，显式列一遍；frida 本身也列上（装不上时
+        # PyInstaller 只给警告，运行时 frida_hid 会优雅降级）。
+        'frida_hid', 'frida',
     ],
     hookspath=[],
     hooksconfig={},
