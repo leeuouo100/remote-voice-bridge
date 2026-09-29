@@ -88,10 +88,23 @@ jobs:
       - name: Remote HID decode check
         run: python tools/check_remote_hid.py
 
+      # 按键旁路（v1.0.20）：报告不是没发，是在 WUDFHost.exe 内部就被 UMDF 驱动
+      # 消费掉了 —— 这是真机上**唯一**能拿到遥控器按键的那一路。
+      # 它的失效全是静默的（注入失败 / 挂错宿主 / 报告格式不对，现象都是"按了没反应"），
+      # 所以把能脱离硬件验证的那一半钉死：消费类页 usage 表与 config 一一对齐、
+      # 两种报告格式的解码、抹除算法、.js 与 .py 的 IOCTL 常量不漂移。带反例自证。
+      # 纯静态 + 假数据：不需要真遥控器，也不需要装 frida。
+      - name: Frida tap decode check
+        run: python tools/check_frida_tap.py
+
       # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
       # 以前只在本地 check_all 里跑，挪进 CI —— 它是"用户能不能拿到"的唯一守门人。
+      # --selftest 一起跑：4 条反例验证这道闸自己会不会红（含"漏收 frida_tap.js"
+      # 和"漏收 frida_hid"—— 那两种洞的现象都是「语音正常、按键全不灵」）。
       - name: Packaging entry check
-        run: python tools/check_packaging.py
+        run: |
+          python tools/check_packaging.py
+          python tools/check_packaging.py --selftest
 
       # 仓库根目录 .bat 的两条一致性：① 凡"自己挑解释器"的 bat，Python 候选必须逐项同序
       # ② 会打印非 ASCII 的行必须自己声明 chcp。两条都会让「用户双击一下」直接失败，
@@ -145,7 +158,25 @@ jobs:
           if ($code -ne 0) { throw "打包版 --selftest 失败（退出码 $code）" }
           if ($st -notmatch 'DIAG SELFTEST OK') { throw "打包版 --selftest 没打印 OK" }
 
-          Write-Host '✅ 打包产物已验证：hidinfo + hidwatch 都在包里，--hid / --selftest 都能跑'
+          # ③ 按键旁路（v1.0.20）：真机上**唯一**能拿到遥控器按键的那一路。
+          #    它的失效是静默的 —— 现象是「语音完全正常、除语音键外的按键一个都不灵」，
+          #    用户只会觉得"按键又坏了"，而日志里就一行 warning。
+          #    所以这里不看日志、直接证明**产物里真有它**：
+          #      · frida_tap.js        Frida 脚本本体（spec 的 tap_datas 收的）
+          #      · frida 原生扩展      没有它 frida_hid 会优雅降级成空转
+          #    递归找，不写死 `_internal` 这一层（PyInstaller 的 onedir 布局会变）。
+          $tap = @(Get-ChildItem -Path $dir -Recurse -Filter 'frida_tap.js' -ErrorAction SilentlyContinue)
+          if ($tap.Count -eq 0) {
+            throw "包里没有 frida_tap.js —— 按键旁路会静默失效（语音仍正常、按键全不灵）"
+          }
+          $core = @(Get-ChildItem -Path $dir -Recurse -Filter '_frida*.pyd' -ErrorAction SilentlyContinue)
+          if ($core.Count -eq 0) {
+            throw "包里没有 frida 原生扩展（_frida*.pyd）—— frida_hid 会降级成空转，按键不生效"
+          }
+
+          Write-Host "✅ 打包产物已验证：hidinfo + hidwatch 都在包里，--hid / --selftest 都能跑"
+          Write-Host "✅ 按键旁路已进包：$($tap[0].FullName)"
+          Write-Host "✅ frida 原生扩展已进包：$($core[0].FullName)"
 
       - name: Build installer with Inno Setup
         shell: pwsh

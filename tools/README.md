@@ -33,7 +33,7 @@ python tools\check_all.py        :: 把下面所有 check_* 跑一遍，输出 A
 | `check_injection.py` | **真的把组合键按下去**，再用键盘钩子确认系统收到了 | 唯一能拦住「SendInput 静默失效」和「组合键顺序错」的一关 |
 | `smoke_console.py` | 离屏把控制台真的建出来跑几轮刷新 | 控件名写错、变量漏定义，在 CI 阶段就被拦下，而不是等用户点开才炸 |
 | `check_ble_callback_thread.py` | 在没有 asyncio 事件循环的 `Dummy-XXXX` 线程里跑完整语音链路 | v1.0.3 的真机事故：BLE 回调线程里 `get_event_loop()` 直接抛异常，`MIC_OPEN` 一次都没发出去，日志还假报成功。纯标准库、不需要真机，所以放进 CI 当回归闸 |
-| `check_packaging.py` | `remote-voice-bridge.spec` 里有诊断 EXE 入口、`installer.iss` 里名字与它一致并挂进了开始菜单 | v1.0.5 漏了这一步：诊断工具写好了、版也发了，却没打进 `Setup.exe` —— 安装版用户机器上没有 Python，仓库里那个 `.bat` 对他们等于不存在 |
+| `check_packaging.py` | `remote-voice-bridge.spec` 里有诊断 EXE 入口、`installer.iss` 里名字与它一致并挂进了开始菜单；**v1.0.20 起还管按键旁路**：`frida_tap.js` 作为 data 进主 EXE、`frida_hid` 进 hiddenimports（比对用带引号的 `'frida_hid'` —— 不加引号会连 spec 注释里的 `frida_hid.py` 一起匹配上，漏收也照样绿）、`[Files]` 递归拷整个 bundle。含 **`--selftest`（4 条反例）** | v1.0.5 漏了这一步：诊断工具写好了、版也发了，却没打进 `Setup.exe` —— 安装版用户机器上没有 Python，仓库里那个 `.bat` 对他们等于不存在。**v1.0.20 是同一类洞、更隐蔽**：旁路少一个文件的现象是「语音完全正常、除语音键外的按键一个都不灵」，用户只会以为"按键又坏了" |
 | `check_levels.py` | 三路电平/波形是否"有消费者、也有生产者" | v1.0.7 真机：「遥控器麦克风」波形在动、状态却永远卡在「等待语音」—— 根因是**没有任何产品代码喂** `state.remote_level_db`（只有演示脚本喂过） |
 | `check_mix_persist.py` | 音频页的开关**落盘**了没有 | 「界面上关了、后端还在用」：`/api/mix` 只改内存不写 `config.json`，设置页一动就被悄悄回滚。沙箱 APPDATA，不碰真配置 |
 | `check_hidinfo.py` | 遥控器的 HID 判定链：厂商自定义页（`0xFF00+`）Windows 不处理、键盘页会被处理、设备路径与 `cbSize` 偏移无关 | v1.0.8 查到：遥控器暴露**两个厂商自定义集合**（`0xFF01`/`0xFF80`，各 21 字节输入报告），Windows 对它们不做任何事。按键若发在那里，改映射表**永远没用** —— 判定改错，报告就会把用户指向错误的修法 |
