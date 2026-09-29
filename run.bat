@@ -1,44 +1,89 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
 cd /d "%~dp0"
 
-REM â”€â”€ æœ¬æ–‡ä»¶æ˜¯ UTF-8 å­—èŠ‚ï¼Œæ‰€ä»¥å¿…é¡»è‡ªå·± chcp 65001 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-REM    2026-09-23 è¡¥ï¼šä»¥å‰æ²¡å†™ï¼Œè€Œä¸‹é¢æœ‰åå‡ è¡Œä¸­æ–‡ echo + æ¡†çº¿ï¼Œ
-REM    ä¸­æ–‡ Windows çš„ cmd é»˜è®¤ 936ï¼Œé‚£äº›å­—å…¨æ˜¯ä¹±ç ã€‚
-REM    âš  ä¸è¦å› ä¸º"ä¸­æ–‡ Windows å°±ç”¨ GBK"æŠŠå®ƒè½¬ç¼–ç  â€”â€” æ–‡ä»¶è‡ªå·±çš„ chcp æ‰æ˜¯å‡†çš„ã€‚
-REM â”€â”€ Check Python â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+REM ©¤©¤ ±¾ÎÄ¼þÊÇ UTF-8 ×Ö½Ú£¬ËùÒÔ±ØÐë×Ô¼º chcp 936 ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+REM    2026-09-23 ²¹£ºÒÔÇ°Ã»Ð´£¬¶øÏÂÃæÓÐÊ®¼¸ÐÐÖÐÎÄ echo + ¿òÏß£¬
+REM    ÖÐÎÄ Windows µÄ cmd Ä¬ÈÏ 936£¬ÄÇÐ©×ÖÈ«ÊÇÂÒÂë¡£
+REM    [!] ²»ÒªÒòÎª"ÖÐÎÄ Windows ¾ÍÓÃ GBK"°ÑËü×ª±àÂë ¡ª¡ª ÎÄ¼þ×Ô¼ºµÄ chcp ²ÅÊÇ×¼µÄ¡£
+REM
+REM ©¤©¤ 2026-09-29£¨Éó²é±¨¸æµÚÁù½Ú£©Èý´¦Õû¸Ä ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+REM    ¢Ù Èë¿Ú´Ó `main.py` ¸Ä³É **`tray_app.py`**£ºÖ±½ÓÅÜ main.py Ã»ÓÐÍÐÅÌ¡¢Ò²Ã»ÓÐ
+REM       ¡¸ÍË³ö¡¹Õâ¸öÕý³£ÊÕÎ²Èë¿Ú ¡ª¡ª ÓÃ»§Ö»ÄÜ¹Ø¿ØÖÆÌ¨´°¿Ú£¬¶øÄÇÊÇÓ²É±½ø³Ì£¬
+REM       GattSession / Frida ×¢Èë / ÒôÆµÁ÷¶¼²»»á±»ÇåÀí£¨ÏÖÏóÊÇ"ÍË³öÔÙ¿ªÁ¬²»ÉÏ"£©¡£
+REM    ¢Ú ¿òÀïÄÇ¾ä¡¸ÏµÍ³Ä¬ÈÏÂó¿Ë·çÒÑÉèÎª CABLE Input¡¹**ÊÇ´íµÄ**£ºVB-CABLE µÄÁ½¸ö
+REM       ¶ËµãÃüÃûÊÇ·´µÄ ¡ª¡ª `CABLE Input` ÊÇ**²¥·Å**¶Ë£¨±¾³ÌÐòÍùÀïÐ´£©£¬
+REM       `CABLE Output` ²ÅÊÇ**Â¼Òô**¶Ë£¨ÊäÈë·¨/ÏµÍ³Ä¬ÈÏÂó¿Ë·çÒª¶ÁµÄÄÇÖ»£©¡£
+REM       °´´íµÄÉè£¬¶Áµ½µÄÊÇ"Ã»ÓÐÈÎºÎ¶«Î÷ÔÚÐ´µÄÄÇ¸ö¶Ëµã"£¬Ö¢×´¾ÍÊÇ"ÍêÈ«Ã»ÉùÒô"¡£
+REM    ¢Û pip µÄÊä³öÒÔÇ°ÓÃ `>nul 2>&1` Õû¸öÍÌµô¡¢Ò²²»¿´ÍË³öÂë ¡ª¡ª ×°²»ÉÏÊ±½Å±¾
+REM       ÕÕÑùÍùÏÂÅÜ£¬×îºó±ÀÔÚÒ»¸öºÍ"ÒÀÀµÃ»×°ÉÏ"ºÁÎÞ¹ØÏµµÄ ImportError ÉÏ¡£
+REM       ÏÖÔÚÂäÅÌµ½ pip-install.log£¬Ê§°Ü¾Í´òÓ¡Î²°Í²¢**Í£ÏÂÀ´**¡£
+REM ©¤©¤ Check Python ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+REM    [!] Ö§³Ö·¶Î§ÊÇ **Python 3.10 / 3.11**£¨Î¨Ò»ÕæÔ´ÔÚ config.py µÄ PY_MIN/PY_MAX£¬
+REM      ÕâÀïÕâ¸öÇø¼äÓÉ tools\check_ci_workflow.py ¶¢×Å²»ÐíÆ¯£©¡£
+REM      ²»ÏÈËµÇåµÄ»°£¬3.13 ÓÃ»§»áÒ»Â·×ßµ½ `pip install` ²ÅÊ§°Ü£¬¶øÊ§°ÜÔ­Òò
+REM      £¨numpy==1.24.3 Ã»ÓÐ 3.13 µÄ wheel£©ºÍ"³ÌÐòÅÜ²»ÆðÀ´"¿´ÆðÀ´ºÁÎÞ¹ØÏµ¡£
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Python 3.10+ not found. Install from https://python.org
+    echo [ERROR] Ã»ÕÒµ½ Python¡£±¾³ÌÐòÔ´Âë°æÐèÒª Python 3.10 / 3.11¡£
+    echo         ×°Ò»¸ö 3.11: https://www.python.org/downloads/release/python-3119/
+    echo         £¨»òÕßÖ±½ÓÓÃ°²×°°æ ¡ª¡ª ÄÇ¸ö×Ô´øÔËÐÐÊ±£¬²»ÐèÒª Python¡££©
+    pause & exit /b 1
+)
+python -c "import sys; sys.exit(0 if (3,10) <= sys.version_info[:2] <= (3,11) else 1)"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] ±¾°æ±¾Ö»Ö§³Ö Python 3.10 / 3.11£¬Äãµ±Ç°ÊÇ£º
+    python --version
+    echo.
+    echo         ÎªÊ²Ã´£ºrequirements.txt Àï numpy==1.24.3 ÔÚ 3.12/3.13 ÉÏÃ»ÓÐ
+    echo         Ô¤±àÒë°ü£¬×°²»ÉÏ¡£ÒªÃ´»» 3.11£¬ÒªÃ´ÓÃ°²×°°æ£¨×Ô´øÔËÐÐÊ±£©¡£
     pause & exit /b 1
 )
 
-REM â”€â”€ Virtual env â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+REM ©¤©¤ Virtual env ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
 if not exist ".venv\Scripts\python.exe" (
     echo [INFO] Creating .venv ...
     python -m venv .venv
+    if errorlevel 1 (
+        echo [ERROR] ½¨ .venv Ê§°Ü£¨¿´ÉÏÃæµÄÊä³ö£©¡£
+        pause & exit /b 1
+    )
 )
 
-echo [INFO] Installing dependencies...
-.venv\Scripts\pip.exe install -r requirements.txt >nul 2>&1
+echo [INFO] Installing dependencies ... (ÍêÕûÊä³ö -> pip-install.log)
+.venv\Scripts\python.exe -m pip install -r requirements.txt > pip-install.log 2>&1
+if errorlevel 1 (
+    echo.
+    echo [ERROR] ÒÀÀµÃ»×°ÉÏ ¡ª¡ª ÒÑÍ£ÏÂ£¬²»»á´ø×Å²ÐÈ±»·¾³ÍùÏÂÅÜ¡£
+    echo         ÍêÕûÈÕÖ¾: %~dp0pip-install.log
+    echo         ×îºó 25 ÐÐ:
+    echo ---------------------------------------------------------------
+    powershell -NoProfile -Command "Get-Content -Tail 25 'pip-install.log'" 2>nul
+    echo ---------------------------------------------------------------
+    pause & exit /b 1
+)
 
 echo.
-echo â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-echo â•‘  remote-voice-bridge å¯åŠ¨ä¸­...                        â•‘
-echo â•‘                                                      â•‘
-echo â•‘  å‰æ:                                               â•‘
-echo â•‘    1. VB-CABLE å·²å®‰è£… (https://vb-audio.com/Cable/)  â•‘
-echo â•‘    2. é¥æŽ§å™¨å·²åœ¨ Windows è“ç‰™è®¾ç½®ä¸­é…å¯¹              â•‘
-echo â•‘    3. ç³»ç»Ÿé»˜è®¤éº¦å…‹é£Žå·²è®¾ä¸º CABLE Input               â•‘
-echo â•‘                                                      â•‘
-echo â•‘  æŒ‰ Ctrl+C åœæ­¢                                      â•‘
-echo â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+echo ¨X¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨[
+echo ¨U  remote-voice-bridge Æô¶¯ÖÐ...                        ¨U
+echo ¨U                                                      ¨U
+echo ¨U  Ç°Ìá:                                               ¨U
+echo ¨U    1. VB-CABLE ÒÑ°²×° (https://vb-audio.com/Cable/)  ¨U
+echo ¨U    2. Ò£¿ØÆ÷ÒÑÔÚ Windows À¶ÑÀÉèÖÃÖÐÅä¶Ô              ¨U
+echo ¨U    3. ÏµÍ³Ä¬ÈÏÂó¿Ë·çÒÑÉèÎª CABLE Output              ¨U
+echo ¨U       £¨×¢ÒâÊÇ Output ¡ª¡ª ÄÇÊÇÂ¼Òô¶Ë£©                ¨U
+echo ¨U                                                      ¨U
+echo ¨U  ÍË³ö£ºÍÐÅÌÍ¼±êÓÒ¼ü ¡ú ÍË³ö£¨ÕâÑù²Å»áÓÅÑÅÊÕÎ²£©       ¨U
+echo ¨U        ¹Øµô±¾´°¿ÚÊÇÓ²É±½ø³Ì£¬²»ÍÆ¼ö                  ¨U
+echo ¨^¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨T¨a
 echo.
 
-.venv\Scripts\pythonw.exe main.py %*
+REM ×ßÍÐÅÌÈë¿Ú£¨²»Òª¸Ä³É main.py ¡ª¡ª ÄÇÑùÃ»ÓÐÍÐÅÌºÍÕý³£ÍË³ö£©¡£
+.venv\Scripts\python.exe tray_app.py
 
 if errorlevel 1 (
     echo.
-    echo [ERROR] Bridge exited with error. Check bridge.log
+    echo [ERROR] ÇÅ³ÌÐòÒì³£ÍË³ö¡£ÈÕÖ¾: %%APPDATA%%\remote-voice-bridge\bridge.log
     pause
 )

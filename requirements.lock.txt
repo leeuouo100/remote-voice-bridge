@@ -1,0 +1,90 @@
+# 自动生成 —— **不要手改**。改依赖请改 requirements.txt / requirements-build.txt，
+# 然后重跑 `python tools/make_deps_lock.py`。
+#
+# 目标平台：win_amd64 / CPython 3.11（与本项目声明的支持范围一致）
+# 用途：`pip install --require-hashes -r requirements.lock.txt`
+#   —— CI 就是这么装的。哈希对不上就装不上、构建当场失败，
+#      而不是产出一个没人验过的包（2026-09-29 审查报告 P2-7）。
+#
+# ⚠ 为什么连传递依赖也锁：pyinstaller / frida / sounddevice 会拉进
+#   altgraph、pefile、cffi、six、setuptools…… 这些包不锁的话，
+#   同一份代码在不同时间构建出的产物**不一样**；而按键旁路依赖的
+#   frida 原生扩展一变，表现就是"语音正常、按键全不灵"的静默故障。
+
+altgraph==0.17.5 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+
+cffi==2.1.1 \
+    --hash=sha256:42f6930c31dc7f50732c9ae793c2786c7b6b044195967bbdde40bb9be81c4cc0
+
+frida==17.19.0 \
+    --hash=sha256:e920c1f6529364c5701d3be8b33e913972c2863dcc2f9e48dcc86efafe286bdb
+
+keyboard==0.13.5 \
+    --hash=sha256:8e9c2422f1217e0bd84489b9ecd361027cc78415828f4fe4f88dd4acd587947b
+
+numpy==1.24.3 \
+    --hash=sha256:5342cf6aad47943286afa6f1609cad9b4266a05e7f2ec408e2cf7aea7ff69d80
+
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+
+pefile==2024.8.26 \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+
+pillow==12.3.0 \
+    --hash=sha256:8e95e1385e4998ae9694eeaa4730ba5457ff61185b3a55e2e7bea0880aef452a
+
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
+pyinstaller==6.22.2 \
+    --hash=sha256:9b990fa6bbe143572f06644a984ad0d7aa2e2ccc6929d4916031343a5888e9a7
+
+pyinstaller-hooks-contrib==2026.7 \
+    --hash=sha256:24257a04c7a5a7a034cf28e39dcee20fbeeb9f043076729480f2e1b69904408a
+
+pystray==0.19.5 \
+    --hash=sha256:a0c2229d02cf87207297c22d86ffc57c86c227517b038c0d3c59df79295ac617
+
+pywin32-ctypes==0.2.3 \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8
+
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670
+
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+
+sounddevice==0.4.6 \
+    --hash=sha256:7830d4f8f8570f2e5552942f81d96999c5fcd9a0b682d6fc5d5c5529df23be2c
+
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+
+winrt-runtime==3.2.1 \
+    --hash=sha256:c0a9046ae416808420a358c51705af8ae100acd40bc578be57ddfdd51cbb0f9c
+
+winrt-windows-devices-bluetooth==3.2.1 \
+    --hash=sha256:44277a3f2cc5ac32ce9b4b2d96c5c5f601d394ac5f02cc71bcd551f738660e2d
+
+winrt-windows-devices-bluetooth-genericattributeprofile==3.2.1 \
+    --hash=sha256:8179638a6c721b0bbf04ba251ef98d5e02d9a17f0cce377398e42c4fbb441415
+
+winrt-windows-devices-enumeration==3.2.1 \
+    --hash=sha256:2a725d04b4cb43aa0e2af035f73a60d16a6c0ff165fcb6b763383e4e33a975fd
+
+winrt-windows-devices-radios==3.2.1 \
+    --hash=sha256:f87745486d313ba1e7562ca97f25ad436ec01ad4b3b9ea349fb6b6f25cb41104
+
+winrt-windows-foundation==3.2.1 \
+    --hash=sha256:f3762be2f6e0f2aedf83a0742fd727290b397ffe3463d963d29211e4ebb53a7e
+
+winrt-windows-foundation-collections==3.2.1 \
+    --hash=sha256:c646a5d442dd6540ade50890081ca118b41f073356e19032d0a5d7d0d38fbc89
+
+winrt-windows-storage-streams==3.2.1 \
+    --hash=sha256:b02fa251a7eef6081eca1a5f64ecf349cfd1ac0ac0c5a5a30be52897d060bed5
+
+winrt-windows-ui==3.2.1 \
+    --hash=sha256:6196abc88dcab0a189febcf9b7ae549dbd9ea385164911851139d28159e0c7bb

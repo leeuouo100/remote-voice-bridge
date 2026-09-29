@@ -39,9 +39,13 @@ VOICE_MAX_SECONDS = 600
 # 那一声不是用户按的，绝不能被当成"第二次按下"去结束会话 ——
 # 否则用户按下语音键的瞬间就会被自己关掉（"按一次它掉"）。
 #
-# ⚠⚠ 关键：回声是**遥控器收到 MIC_OPEN 之后**才发的，而我们记账的时刻是
-#   `ensure_mic_open()` 返回的那一刻 —— 那只是**把写入排进 BLE 线程**，
-#   真正的 GATT 写入可能慢到 1 秒才完成。v1.0.14 就是在这儿翻的车：
+# ⚠⚠ 关键：回声是**遥控器收到 MIC_OPEN 之后**才发的，而"发出去了"与
+#   "遥控器真的收到了"之间能差 1 秒 —— `_send_tx` 返回只代表**把写入排进了
+#   主事件循环**，真正的 GATT 写入可能慢到 1 秒才落地。
+#   ⇒ 记账分两步（P2-2 之后是这样）：发出时记一条"欠一声回声"，
+#     写入**真正落地**时再把窗口锚点挪过去（`_on_mic_open_done(True)`）；
+#     写入**失败**则把账销掉并复位"已开麦"标记（`_on_mic_open_done(False)`）。
+#   v1.0.14 就是在这儿翻的车：
 #   它把窗口从 1.5 收到 0.8，而真机实测"排进队列 → 回声"最慢 1070ms
 #   → 那 8 次回声漏出窗口 → 被当成第二次按下 → **按下就掉**。
 #   真机日志（2026-09-23 00:18:35）：
@@ -66,19 +70,26 @@ ECHO_MAX_AGE = 1.5
 # ── Logging ────────────────────────────────────────────────────────────────────
 # 必须写到用户目录而不是程序目录：打包成 exe 后程序目录是 PyInstaller 的
 # 临时解压路径（_MEIxxxx），退出即被清理，日志会全部丢失。
+#
+# 三件事交给 logsetup（2026-09-29 审查报告 P2-6）：
+#   ① **轮转** 5 MB × 3 份 —— 以前是 FileHandler，只涨不换，真机上到过十几 MB；
+#   ② **脱敏** 蓝牙地址只留前 2 / 后 2 字节 —— 用户排错第一件事就是把日志发出来；
+#   ③ **raw HID 默认不记** —— `raw=02 42 00` 只对开发有用，且能反推按键。
 from config import CONFIG_DIR
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-log_file = str(CONFIG_DIR / "bridge.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("rvb")
+import logsetup
 
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+logsetup.install(CONFIG_DIR / "bridge.log")
+# ⚠ 配置要在**打第一行日志之前**读出来 —— 否则启动那几行（正好含适配器地址）
+#   会以明文落盘，而"脱敏开着"这件事就只是心理安慰。
+#   读失败不算致命：用 logsetup 的默认值（脱敏开、raw 关），别让日志配置把程序拦住。
+try:
+    _boot_cfg = Config.load()
+    logsetup.set_redact(getattr(_boot_cfg, "log_redact", True))
+    logsetup.set_raw_hid(getattr(_boot_cfg, "log_raw_hid", False))
+except Exception:                                   # noqa: BLE001
+    pass
+logger = logging.getLogger("rvb")
 
 # ── Audio queue ────────────────────────────────────────────────────────────────
 _sample_queue = queue.Queue(maxsize=65536)
@@ -125,6 +136,22 @@ _remote_frame_last_at = 0.0
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
 # 连接和同一个托盘图标，谁赢不确定，表现为"点了重连就时好时坏"。
 _reconnect_request = threading.Event()
+
+# ── 优雅停止（2026-09-29 审查报告 P1-4）──────────────────────────────────────
+# 托盘点「退出」时原先只设了托盘自己的 `_stop`，而 run_bridge 的主循环
+# **根本不看它** —— 桥线程是 daemon，主进程一结束就被直接掐掉，
+# `finally` 里的清理（关 GattSession / 停 Frida 注入 / 关音频流）**不保证执行**。
+# 后果是：重开程序时上一轮的 BLE 会话/注入可能还残着，表现为"退出再开就连不上"。
+#
+# 所以给主循环一个它能看见的信号，并把「连接阶段的等待」也一起叫醒。
+_stop_request = threading.Event()
+
+
+def request_stop() -> None:
+    """请求桥线程尽快收尾退出（托盘「退出」用）。"""
+    _stop_request.set()
+    # 连接阶段在 `_hold_ble_connection` 里睡 0.5s 一轮，重连请求能把它叫醒
+    _reconnect_request.set()
 
 
 # ── 语音结束后的「自动发送」（⚠ 默认关，是可选项）────────────────────────
@@ -623,7 +650,7 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
 
 
 # ── BLE 链路建立 ───────────────────────────────────────────────────────────────
-async def _hold_ble_connection(ble, timeout: float = 20.0):
+async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
     """主动把 BLE 链路拉起来，并尽量维持住。
 
     为什么不能只"看一眼 connection_status"：
@@ -671,8 +698,13 @@ async def _hold_ble_connection(ble, timeout: float = 20.0):
         logger.debug("触发连接时 get_gatt_services_async 抛异常（可忽略）：%r", e)
 
     # ③ 等链路真正建起来。实测约 10 秒，这里给 20 秒余量。
+    #    ⚠ 每轮都要看 stop：用户点了「退出」不该还要在这儿干等 20 秒
+    #      （托盘 join 有超时，等超了就会把清理直接掐掉 —— 那正是 P1-4 要修的）。
     waited = 0.0
     while waited < timeout:
+        if stop is not None and stop.is_set():
+            logger.info("🛑 连接等待期间收到退出请求 → 提前结束")
+            break
         if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
             return True, sess
         await asyncio.sleep(0.5)
@@ -682,7 +714,182 @@ async def _hold_ble_connection(ble, timeout: float = 20.0):
 
 
 # ── Main bridge ────────────────────────────────────────────────────────────────
-async def run_bridge(device_type: str | None = None, name_hint: str | None = None):
+class _BridgeResources:
+    """一次 run_bridge 里所有「需要收尾」的句柄 —— 2026-09-29 审查报告 P1-3。
+
+    ⚠ 为什么要有这个类
+    ------------------
+    原先的 `try/finally` 只包住**主循环**，而**建立阶段**（连 BLE → 找 ATVV
+    服务 → 找三个特征 → 订阅通知 → 起音频流 → 装键盘钩子 → 注入 Frida）中间
+    有十来条 `return False`。那些路**直接绕过 finally**：
+
+      · `GattSession.maintain_connection` 还举着 —— Windows 会一直拽着这条链路；
+      · `BluetoothLEDevice` 没 close；
+      · Frida 注入的会话还挂在 WUDFHost 里；
+      · 音频流没停。
+
+    全靠 GC 回收，而 GC 什么时候跑、跑不跑得到都不确定。现象是"重连之后
+    第一次总是失败"，日志里还看不出原因。
+
+    现在改成：**从拿到第一个句柄起就进入同一个 finally**。`run_bridge` 只剩
+    一层薄壳，真正的活儿在 `_run_bridge_inner`；不管它是正常返回、中途
+    `return False`、还是抛异常，收尾都走同一个 `teardown()`。
+    """
+
+    def __init__(self) -> None:
+        self.ble = None              # BluetoothLEDevice
+        self.gatt_session = None     # GattSession（维持连接那个，不能被 GC 回收）
+        self.atvv = None             # ATVVProtocol
+        self.coord = None            # SessionCoordinator
+        self.tx_char = None
+        self.audio_char = None
+        self.ctl_char = None
+        self.aud_token = None
+        self.ctl_token = None
+        self.stream = None           # sd.OutputStream
+        self.sysmic = None           # mixer.SystemMic
+        self.hid_buttons = None      # remote_hid.RemoteHidButtons
+        self.hid_tap = None          # frida_hid.RemoteHidTap
+        self.kb = None               # keyboard 模块（装了钩子才非 None）
+        self.voice_active = False
+        self.ran_ok = False
+        # ⚠ 「统一收尾」那个入口（`_run_bridge_inner` 里的局部函数 `end_voice_session`）。
+        #    **必须**由建立阶段显式登记进来 —— teardown 在**模块级类**里，
+        #    那里根本没有这个名字（局部函数不是全局名），直接写裸名会被解析成
+        #    全局查找 → 运行期 NameError → 被 teardown 的 `except Exception`
+        #    吞成一行 warning ⇒ **退出/断连时那条收尾路径整条没跑**
+        #    （现象：只发了一行"退出前收尾异常"的告警，而相位、UI 状态、
+        #     待发送登记全都没归位）。2026-09-29 审查报告 P2 排查时发现。
+        self.end_voice_session = None
+
+    async def teardown(self) -> None:
+        """收尾。**每一步都自己 try 住** —— 某一步失败不能让后面的清理不跑。"""
+        # 安全兜底：退出/断线时绝不能把快捷键按着不放 ——
+        # 否则 Ctrl / Win 会一直处于按下状态，整台电脑的键盘都会不正常。
+        try:
+            hotkey_up()
+        except Exception:
+            pass
+
+        # ── 第 5、6 条收尾路径：断连 / 退出 ────────────────────────────────
+        # ⚠ 退出前**必须**命令遥控器关麦。不发的后果：程序没了，遥控器还以为
+        #   会话开着，继续推流 —— 用户看到的是"软件都关了，遥控器还在收音"，
+        #   而且它推的流没人接，只能等遥控器自己超时。
+        #
+        # ⚠ 这里**不能只调 end_voice_session()**：它的 `_send_tx` 只是把协程
+        #   投递到事件循环，而我们此刻**就在**这个循环的收尾里 —— run_bridge
+        #   一返回、asyncio.run 一收尾，那条还没跑到的写入就被取消了：
+        #   **MIC_CLOSE 静默丢失**，日志上还写着"已发出"。
+        #   所以这里自己 await 一次写入，确认它真的落到 BLE 上（最多等 1 秒，
+        #   超时就放弃 —— 退出不能被一条蓝牙写入卡住）。
+        was_streaming = bool(
+            (self.atvv is not None and self.atvv.state.stream_active)
+            or self.voice_active
+        )
+        try:
+            if was_streaming:
+                logger.info("🎙️ 语音会话【结束】（断开/退出）")
+            if self.atvv is not None and self.coord is not None:
+                # ⚠ 走登记进来的那个入口，**不要**写裸名 —— 见 __init__ 里的注释：
+                #   裸名在这里解析成全局查找，模块顶层没有这个名字，运行期 NameError，
+                #   被下面那个 except 吞掉 ⇒ 收尾静默失效。
+                if self.end_voice_session is not None:
+                    self.end_voice_session("断开或退出", send=False)
+                else:
+                    logger.warning(
+                        "退出前收尾入口未登记（res.end_voice_session 为空）—— "
+                        "跳过统一收尾，只发 MIC_CLOSE"
+                    )
+        except Exception as e:                          # noqa: BLE001
+            logger.warning(f"退出前收尾异常（继续清理）：{e}")
+        if was_streaming and self.tx_char is not None and self.coord is not None:
+            try:
+                from winrt.windows.storage.streams import DataWriter
+                _w = DataWriter()
+                _w.write_bytes(self.atvv.mic_close_cmd(self.coord.state.stream_id))
+                await asyncio.wait_for(
+                    self.tx_char.write_value_with_result_async(_w.detach_buffer()),
+                    timeout=1.0,
+                )
+                logger.info("📤 MIC_CLOSE（退出前）已发出 —— 遥控器不会继续推流")
+            except Exception as e:                      # noqa: BLE001
+                logger.warning(f"退出前补发 MIC_CLOSE 失败（遥控器可能还会推一会儿）：{e}")
+
+        # ⚠ 会话协调器**作废**：取消它排出去的所有定时器，之后入口一律 no-op。
+        #   放在这里（MIC_CLOSE 已经补发完）而不是更早：早于补发的话，
+        #   `end_voice_session` 里的 `session.close()` 会被挡掉。
+        #   为什么必须有这一步（P2-3）：`close()` 只收尾"这一次会话"，
+        #   对象还活着；而重连/退出时它会被丢掉，排出去的定时器却还挂在
+        #   threading 里 —— 到点 `_retry_open()` 会把相位推回 OPENING 并
+        #   **再发一次 MIC_OPEN**，此时链路可能已经换了一条。
+        if self.coord is not None:
+            try:
+                self.coord.shutdown()
+            except Exception:                           # noqa: BLE001
+                pass
+
+        state.reset()
+        # 松开「维持连接」的请求，让 Windows 可以正常休眠这条链路；
+        # 不显式清掉的话，托盘退出后遥控器会被系统一直拽着不放。
+        if self.gatt_session is not None:
+            try: self.gatt_session.maintain_connection = False
+            except Exception: pass
+            try: self.gatt_session.close()
+            except Exception: pass
+        if self.sysmic is not None:
+            try: self.sysmic.stop()
+            except Exception: pass
+        if self.stream is not None:
+            try: self.stream.stop(); self.stream.close()
+            except Exception: pass
+        if self.ctl_char is not None and self.ctl_token is not None:
+            try: self.ctl_char.remove_value_changed(self.ctl_token)
+            except Exception: pass
+        if self.audio_char is not None and self.aud_token is not None:
+            try: self.audio_char.remove_value_changed(self.aud_token)
+            except Exception: pass
+        if self.kb is not None:
+            try: self.kb.unhook_all()
+            except Exception: pass
+        if self.hid_buttons is not None:
+            try: self.hid_buttons.stop()
+            except Exception: pass
+        if self.hid_tap is not None:
+            try: self.hid_tap.stop()
+            except Exception: pass
+        if self.ble is not None:
+            try: self.ble.close()
+            except Exception: pass
+        logger.info("🧹 Cleanup done")
+
+
+async def run_bridge(device_type: str | None = None, name_hint: str | None = None,
+                     stop_event: "threading.Event | None" = None):
+    """跑一轮桥。返回 True 表示"这一轮正常结束"（含收到退出请求）。
+
+    ⚠ 这里只是一层**壳**：真正干活的是 `_run_bridge_inner`。这样不管它是
+    正常返回、中途 `return False`、还是抛异常，收尾都走同一个 `teardown()`
+    （2026-09-29 审查报告 P1-3）。
+
+    `stop_event`：外部（托盘）要求退出的信号。**必须能被主循环看见** ——
+    否则托盘点「退出」时桥线程是被直接掐掉的，清理不保证跑（P1-4）。
+    """
+    res = _BridgeResources()
+    try:
+        res.ran_ok = await _run_bridge_inner(device_type, name_hint, stop_event, res)
+        return res.ran_ok
+    finally:
+        await res.teardown()
+
+
+async def _run_bridge_inner(device_type: str | None = None,
+                            name_hint: str | None = None,
+                            stop_event: "threading.Event | None" = None,
+                            res: "_BridgeResources | None" = None):
+    """真正干活的那一层。收尾**不在这里** —— 见 `_BridgeResources.teardown`。"""
+    if res is None:                       # 允许单独调用（诊断/测试）
+        res = _BridgeResources()
+    stop = stop_event if stop_event is not None else _stop_request
     cfg = Config.load()
     if device_type:
         cfg.device = device_type
@@ -719,6 +926,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         logger.error("❌ Remote not found. Pair it in Windows Settings → Bluetooth first.")
         return False
     logger.info(f"✅ Found: {dev_info.name}  ID: {dev_info.id[:50]}...")
+    # 远端 MAC —— 后面 Frida 旁路挑驱动宿主时用它做"就是这台"的硬证据
+    # （同型号的第二只遥控器 VID/PID 完全一样，只有 MAC 分得开）。
+    _, _remote_addr = _addr_from_ble_id(dev_info.id)
 
     # ── Connect BLE ──
     from winrt.windows.devices.bluetooth import BluetoothLEDevice, BluetoothConnectionStatus
@@ -731,14 +941,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     ble = await _open_ble_device(dev_info)
     if ble is None:
         return False
+    res.ble = ble                       # P1-3：立刻登记，失败路径也能被收尾
 
     # ⚠ 必须把 GattSession 存成局部变量：run_bridge 的栈一直活着，
     #   它就不会被 GC 回收，链路也就能一直维持住。
     ble_session = None
     if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
         logger.warning("⚠️  Not connected yet — remote may be sleeping. Press any button to wake.")
-    connected, ble_session = await _hold_ble_connection(ble)
+    connected, ble_session = await _hold_ble_connection(ble, stop=stop)
+    res.gatt_session = ble_session      # P1-3：同上，它是"举着链路"的那个
     if not connected:
+        if stop.is_set():
+            logger.info("🛑 收到退出请求 → 不再重试连接")
+            return True
         logger.error(
             "❌ Connection failed —— 20 秒内没能建立 BLE 链路。\n"
             "   处置：按一下遥控器上任意一个键把它唤醒（别只按一次就等），\n"
@@ -770,20 +985,40 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     tx_char   = tx_r.characteristics[0]
     audio_char= aud_r.characteristics[0]
     ctl_char  = ctl_r.characteristics[0]
+    # P1-3：逐个登记（不写成元组赋值 —— 闸门按 `res.<名字> =` 逐个核，
+    # 元组形式会让它数不到，而"数不到"就等于"以后漏了也发现不了"）
+    res.tx_char = tx_char
+    res.audio_char = audio_char
+    res.ctl_char = ctl_char
     logger.info("✅ ATVV characteristics ready")
 
     # ── Protocol + Session ──
     atvv = ATVVProtocol()
+    res.atvv = atvv
 
-    def _send_tx(cmd: bytes, tag: str = "TX", on_sent=None) -> bool:
+    def _send_tx(cmd: bytes, tag: str = "TX", on_done=None) -> bool:
         """Write raw bytes to the ATVV TX characteristic (fire-and-forget).
 
         返回 True = **已成功投递到主事件循环**（写入本身异步进行）。
 
-        `on_sent`：GATT 写入**真正成功**时回调。别小看这个回调 ——
-        它跑在 BLE 线程上、发生在写入落地的那一刻，而"排队成功"和
-        "遥控器真的收到了"之间能差 1 秒。回声窗口必须锚在这儿（见
-        ECHO_MAX_AGE 那段注释）。
+        ⚠⚠ 返回值**不是**"写成功了" —— 2026-09-29 审查报告 P2-2 说的就是这件事。
+        要知道真实结果，必须给 `on_done`：
+
+        `on_done(ok)`：GATT 写入**有结果**时回调一次（成功 True / 失败 False），
+        跑在**主事件循环线程**上。`cmd` 非空时**保证恰好调用一次** ——
+        三条路都会调到：异步写入拿到结果、写入抛异常、以及"连排队都没排上"
+        （最后这条是**同步**调用，就在调用方的线程上）。
+
+        为什么"投递成功"不能当"写入成功"用：
+        `run_coroutine_threadsafe` 只是把协程排进队列，真正的 GATT 写可能
+        几百毫秒后才失败（链路抖动、遥控器走远、特征被注销）。老代码把
+        "排上了"当成功返回，于是**状态机按"已经开麦"记账**：
+          · `session.state.mic_open_sent = True` ⇒ 后面的 `ensure_mic_open()`
+            一律直接 return，**再也不重发**；
+          · `pending_mic_echo` 也记了一笔"欠一声回声"，而回声永远不会来
+            ⇒ 窗口一直挂着，下一条真按键有可能被误吞。
+        现象是"按了没反应"，日志上还写着"补发成功"。
+        现在把真实结果交给调用方回滚（见 `_on_mic_open_done`）。
 
         ⚠ 必须用 run_coroutine_threadsafe 投递回主循环，不能在当前线程直接
         asyncio.get_event_loop().create_task() —— BLE 通知回调跑在 WinRT/COM
@@ -796,6 +1031,15 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         if not cmd:
             return False
 
+        def _fire(ok: bool) -> None:
+            """回调失败不能把写入的结果吞掉 —— 分开 try。"""
+            if on_done is None:
+                return
+            try:
+                on_done(ok)
+            except Exception as e:                    # noqa: BLE001
+                logger.error(f"{tag} on_done 回调失败: {e}")
+
         async def _write():
             try:
                 w = DataWriter()
@@ -803,15 +1047,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 r = await tx_char.write_value_with_result_async(w.detach_buffer())
                 logger.info(f"📤 {tag} [{cmd.hex(' ')}] status={r.status}")
                 ok = r.status == GattCommunicationStatus.SUCCESS
-                if ok and on_sent is not None:
-                    # 回调失败不能把已经成功的写入报成失败 —— 分开处理。
-                    try:
-                        on_sent()
-                    except Exception as e:                # noqa: BLE001
-                        logger.error(f"{tag} on_sent 回调失败: {e}")
+                if not ok:
+                    logger.warning(f"⚠ {tag} 写入未成功：status={r.status}")
+                _fire(ok)
                 return ok
             except Exception as e:
                 logger.error(f"{tag} write failed: {e}")
+                _fire(False)
                 return False
 
         coro = _write()
@@ -824,46 +1066,105 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             # 让真正的错误信息（下面那行 logger.error）被噪声淹没。
             coro.close()
             logger.error(f"{tag} schedule failed: {e}")
+            _fire(False)          # 保证 on_done 恰好被调用一次
             return False
 
-    # ── 回声窗口的记账（两处调用点都不能少，见 ECHO_MAX_AGE 的注释）──────
+    # ── 回声窗口的记账（见 ECHO_MAX_AGE 的注释）────────────────────────────
     def _mark_mic_open_scheduled():
-        """我们**刚排队**一次 MIC_OPEN —— 从现在起该来一声回声了。"""
+        """我们**发了一次** MIC_OPEN —— 从现在起该来一声回声了。"""
         nonlocal pending_mic_echo, mic_echo_since
         pending_mic_echo += 1
         mic_echo_since = time.time()
 
-    def _mark_mic_open_written():
-        """MIC_OPEN **真正写进 BLE** 了 —— 把窗口锚点挪到这一刻。
+    def _undo_mic_open_scheduled(reason: str):
+        """把"欠一声回声"那笔账销掉 —— 前提是这声回声**确实不会来了**。
 
-        ⚠ 只挪时刻、**不加计数**：这是同一次 MIC_OPEN 的第二个事实，
-          不是新的一次。写成 `+= 1` 会让回声永远还剩一条账没销，
-          下一条真按键就可能被误吞。
-        ⚠ 只在"还欠着回声"时挪（pending_mic_echo > 0）：否则一次迟到的
-          写入回调会把已经销完账的窗口重新拉开。
+        ⚠ 销账的时机有两种，都在 `_on_mic_open_done` 那条路上：
+          · 写入失败（含"连排队都没排上"）；
+          · 其余情况一律**不销** —— 宁可多留一笔，也别把真按键的回声窗口
+            提前关掉（那会让回声被当成真按键、把会话关掉）。
+        """
+        nonlocal pending_mic_echo
+        if pending_mic_echo > 0:
+            pending_mic_echo -= 1
+        logger.warning("⚠ %s → 销掉一笔「欠一声回声」的账（当前还欠 %d 声）",
+                       reason, pending_mic_echo)
+
+    def _on_mic_open_done(ok: bool):
+        """MIC_OPEN 的**真实结果**（2026-09-29 审查报告 P2-2）。
+
+        跑在主事件循环线程上（"连排队都没排上"那条是同步调用）。
+
+        ok=True  → 写入真的落到 BLE 了：把回声窗口锚点挪到这一刻。
+                   "排队"与"落地"能差 1 秒，回声跟着差 1 秒（v1.0.14
+                   就是拿排队时刻当锚点，窗口才老是漏）。
+        ok=False → 这一声回声**永远不会来**：
+                   ① 销掉那笔账（不销的话窗口一直挂着，下一条真按键可能被吞）；
+                   ② 把 `mic_open_sent` 复位 —— **这条最要紧**：不复位的话
+                      `ensure_mic_open()` 会一直以为已经开过麦而直接 return，
+                      遥控器**一帧音频都不会推**，而日志上只有一行"补发成功"。
         """
         nonlocal mic_echo_since
-        if pending_mic_echo > 0:
-            mic_echo_since = time.time()
+        if ok:
+            # 只挪时刻、**不加计数**：这是同一次 MIC_OPEN 的第二个事实，
+            # 不是新的一次。写成 `+= 1` 会让账永远销不完。
+            # 只在"还欠着回声"时挪：否则一次迟到的回调会把已销完账的窗口重新拉开。
+            if pending_mic_echo > 0:
+                mic_echo_since = time.time()
+            return
+        _undo_mic_open_scheduled("MIC_OPEN 未真正写入")
+        # ⚠ 走协调器的方法，不直接改 `session.state.mic_open_sent`：
+        #   那个字段是状态机的一部分，必须和相位迁移在同一把锁里改（P2-3）。
+        if session.mark_mic_open_failed():
+            logger.warning(
+                "⚠ MIC_OPEN 真实写入失败 → 已撤销「本次已开麦」标记，"
+                "下次按下 / 松手会重发（否则遥控器一帧音频都不会推）"
+            )
 
     def _on_mic_open(sid: int):
         """Host 主动开麦 — 必须真正写入 BLE，否则遥控器不会推流。
 
-        返回 None = 没发出去（构造失败或调度失败），调用方据此不置 mic_open_sent。
+        返回 None = 没排上（构造失败或投递失败），调用方据此不置 mic_open_sent。
 
         ⚠ MIC_OPEN 是**唯一**会引来回声的动作，所以"该来一声回声"这笔账
-          在这里记，而且只在真的排队成功之后记 —— 没排上就不会有回声，
+          在这里记，而且只在真的排上之后记 —— 没排上就不会有回声，
           记了账反而会让下一条真按键被吞（v1.0.13 就是这么全废的）。
+
+        ⚠⚠ 顺序（P2-2）：**先记账、再排队**。反过来的话有个竞态 ——
+          `_send_tx` 一返回，主循环那边可能**立刻**就写完并回调
+          `_on_mic_open_done(False)`（销账），而这一边还没来得及 `+= 1`：
+          销账销在了记账之前，账上就永远挂着 1 笔"欠一声回声"，
+          下一条真按键可能被误吞。先记账再排队，回调最早也只能在记账之后发生。
+
+        ⚠ 这里**不**在 `_send_tx` 返回 False 时自己销账 —— `on_done` 保证
+          恰好被调用一次（含"连排队都没排上"那条同步路），销账只放在
+          `_on_mic_open_done` 一处，免得两条路各销一次、账被销成负数。
         """
         try:
             cmd = atvv.mic_open_cmd()
         except Exception as e:
             logger.error(f"mic_open_cmd failed: {e}")
             return None
-        if not _send_tx(cmd, "MIC_OPEN", on_sent=_mark_mic_open_written):
+        if not cmd:
             return None
         _mark_mic_open_scheduled()
+        if not _send_tx(cmd, "MIC_OPEN", on_done=_on_mic_open_done):
+            return None
         return cmd
+
+    def _on_mic_close_done(ok: bool):
+        """MIC_CLOSE 的**真实结果**（P2-2）。
+
+        失败时**必须如实说**：`end_voice_session` 那行日志写的是"已发出"，
+        而它其实是"排上了"。遥控器没收到 MIC_CLOSE 就会**继续推流** ——
+        用户看到的是"程序里已经结束了，遥控器还在收音"。
+        这里把它点破，主循环的「残留推流自愈」（③）才有据可依。
+        """
+        if not ok:
+            logger.warning(
+                "⚠ MIC_CLOSE 真实写入失败 —— 遥控器可能还会继续推一会儿；"
+                "主循环的「残留推流自愈」会在 5 秒内补发一次"
+            )
 
     def _on_mic_close(sid: int):
         try:
@@ -871,7 +1172,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         except Exception as e:
             logger.error(f"mic_close_cmd failed: {e}")
             return None
-        return cmd if _send_tx(cmd, "MIC_CLOSE") else None
+        if not cmd:
+            return None
+        return cmd if _send_tx(cmd, "MIC_CLOSE", on_done=_on_mic_close_done) else None
 
     session = SessionCoordinator(
         on_mic_open=_on_mic_open,
@@ -879,6 +1182,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         on_phase=lambda phase, reason: logger.debug(f"Phase: {phase.value}  ({reason})"),
     )
     session.set_mode(cfg.voice_mode)
+    res.coord = session
 
     # ── Callbacks ──
     last_ble_activity = time.time()
@@ -899,6 +1203,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     #   · 程序这一半   = 什么时候算开始、什么时候算结束、会不会卡死、异常怎么恢复
     # 两边都要有，缺一个都不行。
     voice_active     = False   # 语音会话是否正在进行
+    res.voice_active = False
     voice_started_at = 0.0     # 本次会话开始时刻（超时兜底用）
     # 「残留推流自愈」上一次补发 MIC_CLOSE 的时刻（冷却用，见主循环 ③）。
     _residual_close_at = 0.0
@@ -912,6 +1217,19 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 认不出来的控制指令 / 键名，各自只报一次（去重集合）。
     # 见 on_control 与 _on_key 里的注释：这两个洞让"按键没反应"永远查不出结论。
     _unknown_ops: set[int] = set()
+
+    # ── 能力响应（CAPS）到达信号 —— 2026-09-29 审查报告 P2-1 ─────────────────
+    #
+    # 为什么需要它：采样率是**遥控器**在 CAPS 里告诉我们的（ADPCM 8k / 16k），
+    # 而 `atvv.state.sample_rate` 在响应到达之前是**默认值 16000**。
+    # 老代码发完 GET_CAPS 就往下走、立刻按 16000 建音频流 ——
+    # 协商出来是 8k 的遥控器就会**按错速率**建流（音频变调/变速），
+    # 而这件事不会报错，只会"听起来不对"。
+    #
+    # 用 threading.Event 而不是 asyncio.Event：它由 **BLE 通知回调线程**
+    # 里的 on_control 置位，asyncio.Event.set() 不是线程安全的。
+    # 等待放在 executor 里跑（见下面 `caps_ready.wait(...)`），不占事件循环。
+    caps_ready = threading.Event()
 
     # ── 语音会话收尾：**唯一**入口 ────────────────────────────────────────────
     def end_voice_session(reason: str, *, send: bool = False) -> bool:
@@ -976,6 +1294,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         #    会被判成"回给 MIC_OPEN 的回声"当场吞掉：不崩、不报错、UI 波形还在跳，
         #    就是"按一下没反应"（v1.0.13 那个坑的变体）。
         voice_active     = False
+        res.voice_active = False      # P1-3：收尾时要能判断"是不是还在推流"
         voice_started_at = 0.0
         pending_mic_echo = 0
         mic_echo_since   = 0.0
@@ -997,6 +1316,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             "已发出" if closed else "⚠ 未发出（遥控器可能还会推一会儿）",
         )
         return was_active
+
+    # ⚠ 登记给收尾用：teardown 是**模块级类**的方法，看不见这里的局部函数。
+    #   不登记的话那行裸名会变成运行期 NameError，被 except 吞掉（P2 排查时发现）。
+    res.end_voice_session = end_voice_session
 
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
@@ -1030,6 +1353,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 if caps:
                     logger.info(f"📋 CAPS: v{caps.version[0]}.{caps.version[1]}  "
                                 f"codec=0x{caps.codecs:02X}  sr={caps.sample_rate}Hz  frame={caps.frame_size}")
+                    # 唤醒"等能力响应再建音频流"那条路（P2-1）。
+                    # 放在 if caps 里面：解析失败（caps=None）时不能放行 ——
+                    # 否则会拿着默认 16000 去建流，跟"没等"是一个效果。
+                    caps_ready.set()
             elif event["type"] == "audio_start":
                 session.on_audio_start(event["codec"], event["stream_id"])
                 atvv.state.decoder.reset()
@@ -1125,6 +1452,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     _echo_swallowed = 0
                     voice_hotkey_down()      # tap=点按开始 / hold=按下并保持
                     voice_active     = True
+                    res.voice_active = True
                     voice_started_at = time.time()
                     state.update(streaming=True, last_event="语音中…")
                     logger.info("🎙️ 语音会话【开始】—— 可以松手了，会一直听着")
@@ -1293,6 +1621,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # ── Subscribe BEFORE sending CAPS ──
     logger.info("📡 Subscribing to notifications...")
     ctl_token  = ctl_char.add_value_changed(on_control)
+    res.ctl_token = ctl_token
     try:
         await ctl_char.write_client_characteristic_configuration_descriptor_async(
             GattClientCharacteristicConfigurationDescriptorValue.NOTIFY)
@@ -1302,6 +1631,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         return False
 
     aud_token  = audio_char.add_value_changed(on_audio)
+    res.aud_token = aud_token
     try:
         await audio_char.write_client_characteristic_configuration_descriptor_async(
             GattClientCharacteristicConfigurationDescriptorValue.NOTIFY)
@@ -1317,6 +1647,36 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     # ── Audio output ──
     loop = asyncio.get_event_loop()
+
+    # ── 等能力响应再建音频链（2026-09-29 审查报告 P2-1）──────────────────────
+    #
+    # 采样率是**遥控器**在 CAPS 里给我们的（ADPCM 8k / 16k），而响应到达之前
+    # `atvv.state.sample_rate` 只是 ATVVState 的默认值 16000。
+    # 老代码发完 GET_CAPS 就一路往下建流 ⇒ 协商出来是 8k 的遥控器会被
+    # **按 16k 建流**：不报错、不崩，只是声音变调变速（听感不对但没人知道为什么）。
+    #
+    # 这里先等它一下（最多 _CAPS_WAIT 秒）。**超时不能当失败** —— 一条慢响应
+    # 不该把整个桥卡住，所以超时就用默认值继续，并在下面用 `_audio_rate`
+    # 盯着它变（迟到且速率不同 ⇒ 重建整条链）。
+    _CAPS_WAIT = 3.0
+    got_caps = await loop.run_in_executor(None, caps_ready.wait, _CAPS_WAIT)
+    if got_caps and atvv.state.caps is not None:
+        _c = atvv.state.caps
+        logger.info(
+            "🎚 采样率按遥控器协商值建流：%d Hz"
+            "（CAPS v%d.%d  codec=0x%02X  frame=%d）",
+            atvv.state.sample_rate, _c.version[0], _c.version[1],
+            _c.codecs, _c.frame_size)
+    else:
+        logger.warning(
+            "⚠ 发出 CAPS 请求后 %.1f 秒内没等到能力响应 —— 先按默认 %d Hz 建流。\n"
+            "   若响应迟到且协商速率不同，会自动按新速率重建整条音频链；"
+            "这条日志留着是为了让「声音变调」这种**不报错**的故障有据可查。",
+            _CAPS_WAIT, atvv.state.sample_rate or 16000)
+
+    # 建流时用的速率 —— 能力响应迟到时靠它发现"这条流是按错的速率开的"（P2-1）
+    _audio_rate = {"sr": int(atvv.state.sample_rate or 16000)}
+
     out_dev = await loop.run_in_executor(None, _find_cable, cfg.audio_output)
     if out_dev is None:
         logger.error(
@@ -1332,24 +1692,35 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     # ── 电脑麦克风（混音的另一路）──
     # 采不到不影响遥控器那一路能用 —— 降级成"只有遥控器麦克风"，而不是整体失败。
-    sysmic = None
-    if cfg.system_mic_enabled:
-        sysmic = mixer.SystemMic(cfg.system_mic_device, atvv.state.sample_rate or 16000)
-        ok = await loop.run_in_executor(None, sysmic.start)
+    #
+    # ⚠ 抽成函数是因为**采样率变了要能重建**（P2-1）：`SystemMic` 是按
+    #   `out_rate` 做重采样的（mixer.py: resample_linear(in_rate → out_rate)），
+    #   输出流换了速率而它不换 ⇒ 喂给新流的是**旧速率**的样本，听感又是变调。
+    async def _make_sysmic(sr: int):
+        if not cfg.system_mic_enabled:
+            logger.info("ℹ️  电脑麦克风已在设置里关闭，本次只桥接遥控器一路")
+            return None
+        sm = mixer.SystemMic(cfg.system_mic_device, sr)
+        ok = await loop.run_in_executor(None, sm.start)
         if ok:
-            state.update(sys_mic_ready=True, sys_mic_name=sysmic.device_label)
-        else:
-            state.update(sys_mic_ready=False, sys_mic_name="")
-            sysmic = None
-    else:
-        logger.info("ℹ️  电脑麦克风已在设置里关闭，本次只桥接遥控器一路")
+            state.update(sys_mic_ready=True, sys_mic_name=sm.device_label)
+            return sm
+        state.update(sys_mic_ready=False, sys_mic_name="")
+        return None
+
+    sysmic = await _make_sysmic(_audio_rate["sr"])
+    res.sysmic = sysmic
 
     def _start_stream():
-        return _create_stream(out_dev, atvv.state.sample_rate or 16000, sysmic)
+        # ⚠ 读 `_audio_rate` 而不是 `atvv.state.sample_rate`：
+        #   这条流必须和 `sysmic` 用**同一个**速率，否则两路混出来的东西是错的。
+        #   采样率变化时由 `_rebuild_for_rate` 把这两个一起换掉。
+        return _create_stream(out_dev, _audio_rate["sr"], sysmic)
 
     stream = await loop.run_in_executor(None, _start_stream)
+    res.stream = stream
     await loop.run_in_executor(None, stream.start)
-    logger.info("✅ Audio stream started")
+    logger.info("✅ Audio stream started（%d Hz）", _audio_rate["sr"])
 
     # 起跑线：先给心跳一个初值，否则监护第一次检查时 _cb_last_at 还是 0，
     # 会被当成"已静默很久"而白重建一次。
@@ -1410,6 +1781,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             new = await loop.run_in_executor(None, _start_stream)
             await loop.run_in_executor(None, new.start)
             stream = new
+            res.stream = new      # P1-3：监护重建之后也要收得到
             _audio_sup["rebuilt"] += 1
             logger.info("✅ 音频输出流已重建（累计 %d 次），声音应立刻恢复",
                         _audio_sup["rebuilt"])
@@ -1427,8 +1799,61 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
             return
         await _rebuild_audio(f"输出回调已静默 {silent:.1f} 秒")
 
+    async def _rebuild_for_rate(new_sr: int) -> None:
+        """协商采样率与建流速率不同 → 整条音频链按新速率重建（P2-1）。
+
+        什么时候会走到：CAPS 响应比 `_CAPS_WAIT` 还晚（蓝牙慢 / 遥控器刚被唤醒），
+        于是我们先用默认 16000 建了流，之后才收到"其实是 8k"。
+        不重建的后果是**不报错但听感不对** —— 8k 的样本按 16k 播 = 变调变速，
+        用户只会说"声音怪怪的"，日志里一个字都没有。
+
+        ⚠ `_audio_rate` 在开头就改成新值，**失败也不回退**：不回退是为了
+          避免主循环每 200ms 重试一次、把日志刷爆（重建失败多半是设备被独占，
+          重试也不会好）。代价是"这条链可能还停在旧速率"—— 所以失败那条
+          日志把话说全了，别让后来的人以为已经修好了。
+        """
+        nonlocal stream, sysmic
+        old_stream, old_sysmic = stream, sysmic
+        _audio_rate["sr"] = new_sr
+        logger.warning(
+            "🎚 协商采样率与建流时不同 → 按 %d Hz 重建整条音频链。\n"
+            "   为什么会出现：CAPS 响应比我们等待的时间还晚（蓝牙慢 / 遥控器刚醒）。\n"
+            "   为什么必须重建：8k 的样本按 16k 播是变调变速，**不报错**、只听着不对；\n"
+            "   而且电脑麦克风那一路是按旧速率做重采样的，只换输出流同样不对。",
+            new_sr)
+        state.update(last_event=f"采样率改为 {new_sr} Hz → 已重建音频链")
+
+        def _stop_old():
+            for obj in (old_stream, old_sysmic):
+                if obj is None:
+                    continue
+                for fn in ("stop", "close"):
+                    try:
+                        getattr(obj, fn)()
+                    except Exception:                   # noqa: BLE001
+                        pass
+
+        await loop.run_in_executor(None, _stop_old)
+        dropped = _drain_audio_queues()
+        if dropped:
+            logger.info("🧹 重建前清掉 %d 块积压音频（避免按新速率播出旧声音）", dropped)
+        try:
+            sysmic = await _make_sysmic(new_sr)
+            res.sysmic = sysmic
+            new = await loop.run_in_executor(None, _start_stream)
+            await loop.run_in_executor(None, new.start)
+            stream = new
+            res.stream = new
+            logger.info("✅ 音频链已按 %d Hz 重建", new_sr)
+        except Exception as e:                          # noqa: BLE001
+            logger.error(
+                "❌ 按新采样率重建音频链失败：%s\n"
+                "   ⚠ 这条链可能**还停在旧速率**（声音会变调），且不会再自动重试"
+                "（重试多半也没用，设备被独占）。处置：控制台点「重新连接」。", e)
+
     # ── Keyboard hooks ──
     import keyboard as _kb
+    res.kb = _kb              # P1-3：unhook 用
     from keys import was_self_injected
 
     # 遥控器按键（HID）→ 内部 button_id。
@@ -1584,6 +2009,44 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     # 首次见到的键名只报一次，见 _on_key 里那两处。
     _seen_keys: set[str] = set()
 
+    # 按键旁路（Frida）的句柄。⚠ 必须**在这里**先声明成 None：
+    # 下面的 `_get_cfg()` 会在旁路起来之前就被调用（本函数第 1997 行那次预热），
+    # 而"配置一变就下发屏蔽表"要读它 —— 晚一步声明就会撞
+    # `NameError: unbound local`，把整个桥启动搞挂。
+    _hid_tap = None
+    _last_pushed_mapping: dict | None = None
+
+    def _effective_keymap(cached: dict) -> dict:
+        """归一后、**真正要下发给钩子**的那张表。
+
+        ⚠ 总开关关掉时要下发的是**空表**，不是"不下发"。
+        不下发 = JS 侧继续按上一次的表把 usage 原地写 0 ⇒ 界面写着
+        「已停用/原样直通」，实际那些键彻底失效，直到重连。
+        """
+        if not cached.get("mapping_enabled", True):
+            return {}
+        return dict(cached.get("keymap") or {})
+
+    def _push_mapping_if_changed(cached: dict) -> None:
+        """keymap / mapping_enabled 一变就把新屏蔽表下发给 Frida 钩子（P1-6）。
+
+        原先只在启动时下发一次，于是运行中关掉映射、或把某键改成 native 之后
+        Python 不再映射、JS 仍按旧表清零 —— 现象是"改了没用，得重连"。
+        """
+        nonlocal _last_pushed_mapping
+        km = _effective_keymap(cached)
+        if km == _last_pushed_mapping:
+            return
+        _last_pushed_mapping = km
+        if _hid_tap is None:
+            # 旁路还没起来（或本来就没启用）。起来那一刻会自己下发一次，
+            # 所以这里只记账、不报错。
+            return
+        try:
+            _hid_tap.set_mapping(km)
+        except Exception as e:                      # noqa: BLE001
+            logger.warning(f"⚠ 下发按键屏蔽表失败（按键映射可能滞后到重连）：{e}")
+
     def _warn_bad_keymap(keymap: dict) -> None:
         """开机/热重载时检查一遍：映射值里的键名是不是真的能发出去。
 
@@ -1644,6 +2107,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                         getattr(new, "keyboard_page_keys", False)),
                 }
                 _warn_bad_keymap(_cfg_cache["keymap"])
+                # 映射表变了就立刻下发（P1-6）：控制台改完 / 手改 config.json
+                # 都能马上生效，不用重连。
+                _push_mapping_if_changed(_cfg_cache)
                 logger.debug(f"config reloaded (mtime={mt})")
             except Exception as e:
                 logger.error(f"config reload failed: {e}")
@@ -1830,7 +2296,10 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     #   CHROMECAST_BUTTONS 里 voice 的 usage 是字符串 "voice"，
     #   所以 remote_hid 的 USAGE_TO_BUTTON 天然不含它，两条路不会打架。
     _hid_buttons = None
-    _hid_tap = None
+    # ⚠ `_hid_tap` 不在这里声明 —— 它已经在上面 `_get_cfg` 定义之前声明过了
+    #   （那段"配置一变就下发屏蔽表"要读它）。这里再写一次会把它**重新置成 None**，
+    #   虽然此刻还没赋值、后果一样，但两处声明会让下一个改代码的人以为
+    #   "这里才是权威"，改错地方。保持唯一声明点。
     # 两条按键来源（frida 旁路 / 厂商页自读）共用这一个派发口，按 (键, 沿)
     # 去重，防止同一按键被两路各派发一次（两路都能用时才会碰到）。
     _hid_recent: dict[tuple[str, bool], float] = {}
@@ -1883,6 +2352,7 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 bypass_probe=lambda: (_hid_tap is not None
                                       and bool(getattr(_hid_tap, "ready", False))),
             )
+            res.hid_buttons = _hid_buttons
             n_col = _hid_buttons.start()
             if n_col:
                 logger.info(f"✅ 遥控器厂商页按键已接管（{n_col} 路集合）→ 按键映射生效")
@@ -1922,9 +2392,24 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     if getattr(cfg, "hid_frida_tap", True):
         try:
             import frida_hid
-            _hid_tap = frida_hid.RemoteHidTap(_on_hid_button)
+            # 远端 MAC（12 位小写 hex）—— 比 VID/PID 硬的"就是这台"证据：
+            # 同型号的第二只遥控器 VID/PID 完全一样，只有 MAC 分得开。
+            _mac = f"{_remote_addr:012x}" if _remote_addr is not None else None
+            _hid_tap = frida_hid.RemoteHidTap(
+                _on_hid_button,
+                # ⚠ 默认**不许**回退到"任意 BLE HID 的第一项"（P1-8）：
+                #   同一个 WUDFHost 里可能还服务别的蓝牙键鼠。兼容款要显式打开。
+                allow_any_hid=bool(getattr(cfg, "hid_frida_any_hid", False)),
+                expect_mac=_mac,
+            )
+            res.hid_tap = _hid_tap
+            # 下发的是**归一后**的表（mapping_enabled=false → 空表，见
+            # _effective_keymap 的注释）。记进 _last_pushed_mapping，免得
+            # 下一次 _get_cfg() 又原样推一遍。
+            _initial = _effective_keymap(_get_cfg())
+            _last_pushed_mapping = _initial
             try:
-                _hid_tap.set_mapping((_get_cfg().get("keymap") or {}))
+                _hid_tap.set_mapping(_initial)
             except Exception:                       # noqa: BLE001
                 pass
             _hid_tap.start()
@@ -1994,6 +2479,14 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     ran_ok = False
     try:
         while True:
+            # ⚠ 退出请求必须在**每一轮的最前面**看：托盘点「退出」时，
+            #   桥线程要能自己走到 finally 去关 GattSession / Frida / 音频流，
+            #   而不是等主进程结束时被直接掐掉（2026-09-29 审查报告 P1-4）。
+            if stop.is_set():
+                logger.info("🛑 收到退出请求 → 结束桥循环，开始清理")
+                ran_ok = True
+                break
+
             await asyncio.sleep(0.2)
 
             # 音频输出流监护：回调静默超时就重建（见 _supervise_audio 注释）。
@@ -2002,6 +2495,16 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 await _supervise_audio()
             except Exception as e:                      # noqa: BLE001
                 logger.error("音频监护异常：%s", e)
+
+            # 协商采样率变了 → 整条音频链按新速率重建（P2-1）。
+            # 只在"CAPS 响应迟到"时才会响一次（正常情况下上面已经等到了），
+            # 所以放在这里不占常规开销。
+            _want_sr = int(atvv.state.sample_rate or 16000)
+            if _want_sr != _audio_rate["sr"]:
+                try:
+                    await _rebuild_for_rate(_want_sr)
+                except Exception as e:                  # noqa: BLE001
+                    logger.error("按采样率重建音频链异常：%s", e)
 
             # ── 语音会话的收尾与「状态归位」（每一轮都核一遍）──────────────
             #
@@ -2115,73 +2618,6 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
     except KeyboardInterrupt:
         ran_ok = True
         logger.info("\n⏹️  Interrupted")
-    finally:
-        # 安全兜底：退出/断线时绝不能把快捷键按着不放 ——
-        # 否则 Ctrl / Win 会一直处于按下状态，整台电脑的键盘都会不正常。
-        try: hotkey_up()
-        except Exception: pass
-
-        # ── 第 5、6 条收尾路径：断连 / 退出 ────────────────────────────────
-        # ⚠ 退出前**必须**命令遥控器关麦。不发的后果：程序没了，遥控器还以为
-        #   会话开着，继续推流 —— 用户看到的是"软件都关了，遥控器还在收音"，
-        #   而且它推的流没人接，只能等遥控器自己超时。
-        #
-        # ⚠ 这里**不能只调 end_voice_session()**：它的 `_send_tx` 只是把协程
-        #   投递到事件循环（run_coroutine_threadsafe），而我们此刻**就在**这个
-        #   循环的 finally 里 —— run_bridge 一返回、asyncio.run 一收尾，那条
-        #   还没跑到的写入就被取消了：**MIC_CLOSE 静默丢失**，日志上还写着"已发出"。
-        #   所以这里自己 await 一次写入，确认它真的落到 BLE 上（最多等 1 秒，
-        #   超时就放弃 —— 退出不能被一条蓝牙写入卡住）。
-        _was_streaming = bool(atvv.state.stream_active or voice_active)
-        try:
-            if voice_active or atvv.state.stream_active:
-                logger.info("🎙️ 语音会话【结束】（断开/退出）")
-            end_voice_session("断开或退出", send=False)
-        except Exception as e:                          # noqa: BLE001
-            logger.warning(f"退出前收尾异常（继续清理）：{e}")
-        if _was_streaming:
-            try:
-                _w = DataWriter()
-                _w.write_bytes(atvv.mic_close_cmd(session.state.stream_id))
-                await asyncio.wait_for(
-                    tx_char.write_value_with_result_async(_w.detach_buffer()),
-                    timeout=1.0,
-                )
-                logger.info("📤 MIC_CLOSE（退出前）已发出 —— 遥控器不会继续推流")
-            except Exception as e:                      # noqa: BLE001
-                logger.warning(f"退出前补发 MIC_CLOSE 失败（遥控器可能还会推一会儿）：{e}")
-
-        state.reset()
-        # 松开「维持连接」的请求，让 Windows 可以正常休眠这条链路；
-        # 不显式清掉的话，托盘退出后遥控器会被系统一直拽着不放。
-        if ble_session is not None:
-            try: ble_session.maintain_connection = False
-            except Exception: pass
-            try: ble_session.close()
-            except Exception: pass
-        if sysmic is not None:
-            try: sysmic.stop()
-            except Exception: pass
-        if stream:
-            try: stream.stop(); stream.close()
-            except Exception: pass
-        if ctl_char and ctl_token:
-            try: ctl_char.remove_value_changed(ctl_token)
-            except Exception: pass
-        if audio_char and aud_token:
-            try: audio_char.remove_value_changed(aud_token)
-            except Exception: pass
-        try: _kb.unhook_all()
-        except Exception: pass
-        if _hid_buttons is not None:
-            try: _hid_buttons.stop()
-            except Exception: pass
-        if _hid_tap is not None:
-            try: _hid_tap.stop()
-            except Exception: pass
-        try: ble.close()
-        except Exception: pass
-        logger.info("🧹 Cleanup done")
     return ran_ok
 
 

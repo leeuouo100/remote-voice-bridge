@@ -6,12 +6,42 @@ Config file: ~/.config/remote-voice-bridge/config.json
 from __future__ import annotations
 import json
 import os
+import tempfile
+import threading
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / "remote-voice-bridge"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+
+# ── 支持范围（唯一真源，2026-09-29 审查报告第六节 8）─────────────────────────
+# 说清楚"我们到底验过哪些 Python"，而不是让人拿 3.12/3.13 去撞：
+#   · CI（.github/workflows/ci.yml）只跑 3.11；
+#   · `requirements.txt` 里 `numpy==1.24.3` 在 **3.13 上没有 wheel**（要现场编译，
+#     基本装不上），3.12 也不保证；
+#   · 安装版自带 PyInstaller 打的 3.11 运行时，**用户不需要 Python**。
+# ⇒ 所以声明 **3.10 / 3.11**。要放宽范围，先把依赖升级 + 在 CI 里建版本矩阵，
+#   两件事一起做；只改这个声明会被 `tools/check_ci_workflow.py` 拦下来
+#   （它要求 ci.yml 验的那个版本必须落在下面这个区间内）。
+PY_MIN = (3, 10)
+PY_MAX = (3, 11)
+PY_RANGE_TEXT = "3.10 / 3.11"
+
+# 修复工具的注册表备份目录（2026-09-29 审查报告 P1-7）。
+#
+# ⚠ 为什么**不能**放在 %APPDATA%（原来就在那儿）：
+#   修复工具是**以管理员身份**跑的，而 %APPDATA% 是当前用户可写的普通目录。
+#   低权限进程（或任何能在用户会话里落地的东西）可以往里面塞一个"更新"的
+#   .reg，等用户下一次点「还原」时被 UAC 提权导入 —— 一次提权放大。
+#   而备份里装的是**蓝牙链路密钥**（BTHPORT\Parameters\Keys），
+#   那是能解密链路的材料，不能放在谁都能写的目录里。
+#
+# 放 %ProgramData% 并在首次使用时把 DACL 收紧成"只有管理员/SYSTEM 可写"，
+# 普通用户留只读（托盘里的「打开修复备份目录」还要能浏览）。
+BACKUP_DIR = (Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+              / "remote-voice-bridge" / "backup")
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
 APP_VERSION = "1.0.22"
@@ -434,6 +464,33 @@ class Config:
     #               只是除语音键外的按键不生效。
     hid_frida_tap:      bool  = True
 
+    # 兼容款兜底：VID/PID 对不上时，允许注入「本机第一台 BLE HID 设备」的驱动宿主。
+    #
+    # ⚠ 默认**关**（2026-09-29 审查报告 P1-8）。为什么：
+    #   同一个 WUDFHost.exe 里可能还服务**别的**蓝牙键鼠，"猜第一项"等于
+    #   可能去抄/改写别人的报告 —— 而按键旁路是会**原地改写**输出缓冲区的。
+    #   精确匹配（节点名里的 VID/PID + 远端 MAC）能对上的话，这条路根本用不着。
+    #
+    # 什么时候打开：遥控器换了型号 / 换了牌子，日志里出现
+    #   「没找到 VID/PID = 18D1/9450 的 BLE HID 驱动宿主」
+    #   而你想试试它能不能用。打开后请核对日志里的节点名是不是你那台设备。
+    hid_frida_any_hid:  bool  = False
+
+    # ── 日志（2026-09-29 审查报告 P2-6）───────────────────────────────
+    # 日志里到处是蓝牙地址（本机适配器地址、远端 MAC），而用户排错时**第一件事
+    # 就是把日志发出来**。默认把地址中间几位打掉、只留前 2 / 后 2 字节 ——
+    # 同机只有一根蓝牙棒、一只遥控器，认得出是哪个设备就够了。
+    #
+    # 为什么给开关而不是写死：真机排查偶发链路问题时，偶尔需要**完整**地址去
+    # 对注册表/事件日志；写死就没法查了。要贴给别人的日志请保持默认（开）。
+    log_redact:         bool  = True
+    # `raw=02 42 00` 这类原始 HID 报告字节**默认不记**。
+    #
+    # 为什么：① 只对开发有用，长期记在盘上没意义；② 它能反推"用户按了什么"，
+    # 属于不该默默留在用户目录里的东西。要看的时候把 config.json 里这个字段
+    # 改成 true 再重启（属"高级项"，UI 上不铺开关）。
+    log_raw_hid:        bool  = False
+
     # 配置结构版本。旧版 config.json 里没有这个字段（= 0），
     # load() 会据此跑一次性迁移 —— 见 _migrate()。
     config_version:     int   = CONFIG_VERSION
@@ -460,50 +517,178 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        if CONFIG_PATH.exists():
-            try:
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-                # 旧版写下的 config.json 没有这个字段 → 0，据此判断要不要迁移。
-                # ⚠ 必须读**原始 data**，不能用 defaults：defaults 里它已经是当前版本了。
-                saved_version = int(data.get("config_version") or 0)
-                defaults = cls().to_dict()
-                # keymap 单独合并：旧版本写下的 config.json 里没有新增的按键，
-                # 直接整体覆盖会让这些键变成"未配置"，表现为按键失效。
-                km = dict(DEFAULT_KEYMAP)
-                if isinstance(data.get("keymap"), dict):
-                    # ⚠ 原来这里是 `if isinstance(v, str)` 一句话过滤掉非字符串，
-                    # 被丢掉的条目**一声不响** —— 用户手改 config.json 写错了值
-                    # （或旧版本留下了别的类型），那个按键就永远没反应，
-                    # 而且日志里一个字都没有。这里补一条告警，别让它继续静默。
-                    dropped = [
-                        f"{k}={v!r}" for k, v in data["keymap"].items()
-                        if not isinstance(v, str)
-                    ]
-                    if dropped:
-                        print("[CONFIG] ⚠ keymap 里有非字符串的值，已忽略（该按键会没反应）："
-                              + "、".join(dropped))
-                    km.update({k: v for k, v in data["keymap"].items()
-                               if isinstance(v, str)})
-                defaults.update(data)
-                defaults["keymap"] = km
-                cfg = cls(**defaults)
-                if saved_version < CONFIG_VERSION:
-                    # 升级用户的旧配置不会被新默认值覆盖（否则等于偷偷改用户的设置），
-                    # 但**默认值本身变了**的那几项必须搬过去 —— 不然新装的用户有
-                    # 「静音键按住说话」，老用户永远看不到，还以为是坏了。
-                    cfg = _migrate(cfg, saved_version)
-                _warn_mode_mismatch(cfg)
+        with _CONFIG_LOCK:
+            return cls._load_locked()
+
+    @classmethod
+    def _load_locked(cls) -> "Config":
+        data = _read_raw()
+        if data is None:
+            return cls()
+        try:
+            # 旧版写下的 config.json 没有这个字段 → 0，据此判断要不要迁移。
+            # ⚠ 必须读**原始 data**，不能用 defaults：defaults 里它已经是当前版本了。
+            saved_version = int(data.get("config_version") or 0)
+            defaults = cls().to_dict()
+            # ⚠⚠ 未知字段**必须先摘掉**，不能直接喂给 dataclass 构造函数 ——
+            #   那会抛 `TypeError: unexpected keyword argument`，被下面的
+            #   `except` 抓住 ⇒ **整份配置回退成默认值**（用户的设置一次全没）。
+            #   用户手改过 config.json、或者降级装回旧版，都会留下未知字段。
+            known = set(defaults)
+            unknown = sorted(k for k in data if k not in known)
+            if unknown:
+                print("[CONFIG] ⚠ config.json 里有不认识的字段，已忽略（其余设置照常生效）："
+                      + "、".join(unknown))
+                data = {k: v for k, v in data.items() if k in known}
+            # keymap 单独合并：旧版本写下的 config.json 里没有新增的按键，
+            # 直接整体覆盖会让这些键变成"未配置"，表现为按键失效。
+            km = dict(DEFAULT_KEYMAP)
+            if isinstance(data.get("keymap"), dict):
+                # ⚠ 原来这里是 `if isinstance(v, str)` 一句话过滤掉非字符串，
+                # 被丢掉的条目**一声不响** —— 用户手改 config.json 写错了值
+                # （或旧版本留下了别的类型），那个按键就永远没反应，
+                # 而且日志里一个字都没有。这里补一条告警，别让它继续静默。
+                dropped = [
+                    f"{k}={v!r}" for k, v in data["keymap"].items()
+                    if not isinstance(v, str)
+                ]
+                if dropped:
+                    print("[CONFIG] ⚠ keymap 里有非字符串的值，已忽略（该按键会没反应）："
+                          + "、".join(dropped))
+                km.update({k: v for k, v in data["keymap"].items()
+                           if isinstance(v, str)})
+            defaults.update(data)
+            defaults["keymap"] = km
+            cfg = cls(**defaults)
+            if saved_version < CONFIG_VERSION:
+                # 升级用户的旧配置不会被新默认值覆盖（否则等于偷偷改用户的设置），
+                # 但**默认值本身变了**的那几项必须搬过去 —— 不然新装的用户有
+                # 「静音键按住说话」，老用户永远看不到，还以为是坏了。
+                cfg = _migrate(cfg, saved_version)
+            _warn_mode_mismatch(cfg)
+            return cfg
+        except Exception as e:
+            print(f"[CONFIG] Load error: {e}")
+            return cls()
+
+    @classmethod
+    def update(cls, mutator) -> "Config":
+        """在**同一把锁**里完成「读 → 改 → 写」，返回改完的配置。
+
+        为什么必须有它：控制台多个请求各自 `load() → 改字段 → save()` 时，
+        两个请求可能都基于**同一份旧快照**改，后写的把先写的**整段覆盖**掉
+        （典型症状："我在设置页改了 A，另一个请求同时改了 B，结果 A 没了"）。
+        走这个入口，读改写是串行的。
+
+        `mutator(cfg)` 直接在 cfg 上改。返回 `False` 表示"**没有变化**"，
+        此时**不写盘**（拖动增益滑块这种高频操作不该反复落盘）；
+        抛异常则不写盘。
+        """
+        with _CONFIG_LOCK:
+            cfg = cls._load_locked()
+            if mutator(cfg) is False:
                 return cfg
-            except Exception as e:
-                print(f"[CONFIG] Load error: {e}")
-        return cls()
+            cfg.save()
+            return cfg
 
     def save(self) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        """**原子写**：临时文件 → flush → fsync → `os.replace`。
+
+        为什么不能直接 `write_text()`：那是"截断 + 写入"，中间有一个窗口期，
+        并发的读者会拿到**半截 JSON**（见 `_CONFIG_LOCK` 那段注释）。
+        `os.replace` 在同一个文件系统内是原子的 —— 读者要么看到旧内容、
+        要么看到新内容，**永远不会看到半截**。
+        """
+        global _LAST_GOOD_RAW
+        with _CONFIG_LOCK:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            text = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+            fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR),
+                                       prefix=".config-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                # ⚠ 必须重试：Windows 上目标文件被别的线程/进程短暂打开时，
+                #   `os.replace` 会抛 PermissionError（见 `_retry_io` 的说明）。
+                _retry_io(os.replace, tmp, CONFIG_PATH)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            # 磁盘上已经是这份内容了 → 同步"最近有效"快照，
+            # 免得下一次 load 因别的原因解析失败而回退到**更旧**的配置。
+            _LAST_GOOD_RAW = self.to_dict()
+
+
+# ── 配置读改写的并发保护与原子写（2026-09-29 审查报告 P1-5）────────────────────
+# 控制台是 `ThreadingHTTPServer`，多个请求会**并发**走
+# `Config.load() → 改字段 → cfg.save()`。原先既没有锁、`save()` 又是
+# `write_text()` 直接截断写入，于是：
+#   · 两个请求同时保存 → 后写的覆盖先写的（**丢配置**）；
+#   · 一个请求正在写、另一个在读 → 读到**半截 JSON** → 解析失败 →
+#     走 `except` 直接 `return cls()` ⇒ **整份回退成默认值**，
+#     而调用方紧接着一个 `save()` 就把默认值**写回磁盘**，用户设置一次全没。
+#
+# 所以这里做四件事：进程内可重入锁 + 临时文件原子替换 +
+# 解析失败保留最近一份有效配置 + 未知字段只警告不回退。
+_CONFIG_LOCK = threading.RLock()
+
+# 最近一次**成功解析**出来的原始 dict（不是合并后的 Config）。
+# 磁盘文件被写坏 / 读到半截时用它兜底，绝不退回"全默认"。
+_LAST_GOOD_RAW: Optional[dict] = None
+
+
+def _retry_io(fn, *args, attempts: int = 25, delay: float = 0.008, **kwargs):
+    """带退避重试的文件操作 —— Windows 上的**短暂**占用不是错误。
+
+    ⚠ 真机实测（2026-09-29，闸门 `check_config_atomic.py` B 组）：Windows 上
+    `os.replace` 与并发读会**抢文件句柄**，抛
+    `PermissionError [WinError 5] 拒绝访问`。触发场景全是真的：
+    用户开着 config.json 用记事本看、杀毒/备份软件扫描、同时开了两个程序实例。
+    而读方一读完就释放 —— 占用是**毫秒级**的。所以这里退避重试，
+    **不能把异常甩给调用方**：对 `save()` 来说，甩出去就等于
+    「用户点了保存，其实没保存上」，而界面上什么提示都没有。
+    """
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (1 + i * 0.4))
+
+
+
+def _read_raw() -> Optional[dict]:
+    """读 config.json 的原始 dict。
+
+    解析失败时**返回最近一次成功的快照**（而不是 None），这样调用方不会
+    退回默认值、更不会把默认值写回磁盘。真的从来没有成功过才返回 None。
+    """
+    global _LAST_GOOD_RAW
+    try:
+        # ⚠ 读也要重试：正在 `save()` 的线程可能刚把目标文件锁进替换过程，
+        #   此刻裸读会抛 PermissionError —— 那是**短暂**的，不是"文件坏了"。
+        raw = json.loads(_retry_io(CONFIG_PATH.read_text, encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as e:                                  # noqa: BLE001
+        if _LAST_GOOD_RAW is not None:
+            print(f"[CONFIG] ⚠ config.json 解析失败（{e}）—— 已回退到**最近一次有效的"
+                  f"配置**，而不是默认值（避免把用户的设置整份清掉）")
+            return _LAST_GOOD_RAW
+        print(f"[CONFIG] ⚠ config.json 解析失败（{e}）—— 没有可用的历史快照，"
+              f"本次按默认值运行（**不会**把默认值写回磁盘）")
+        return None
+    if not isinstance(raw, dict):
+        print("[CONFIG] ⚠ config.json 顶层不是对象，已忽略这份内容")
+        return _LAST_GOOD_RAW
+    _LAST_GOOD_RAW = raw
+    return raw
 
 
 def _warn_mode_mismatch(cfg: "Config") -> None:
@@ -615,10 +800,17 @@ def _migrate(cfg: "Config", from_version: int) -> "Config":
         for c in changed:
             print(f"         · {c}")
         print("[CONFIG] 不想要？控制台「按键映射」页或「设置 → 语音」里改回来即可。")
-        try:
-            cfg.save()
-        except Exception as e:                      # noqa: BLE001
-            print(f"[CONFIG] 迁移结果保存失败（不影响本次启动）：{e}")
+
+    # ⚠ 只要迁移**跑过**就必须落盘，哪怕 `changed` 是空的（审查报告 P2）。
+    #   原来这句 `save()` 写在 `if changed:` **里面** ⇒ 那次迁移恰好没改任何
+    #   字段时（版本号跳了、但默认值没变），新版本号就**永远写不回文件**，
+    #   于是**每一次** load 都会再走一遍迁移。
+    #   今天只是白跑一遍（`_migrate` 目前幂等），但任何"不幂等"的未来迁移
+    #   都会变成「每次启动都改一次用户配置」—— 那是最难查的一类 bug。
+    try:
+        cfg.save()
+    except Exception as e:                          # noqa: BLE001
+        print(f"[CONFIG] 迁移结果保存失败（不影响本次启动）：{e}")
 
     return cfg
 

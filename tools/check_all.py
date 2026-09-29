@@ -1,10 +1,26 @@
 """跑一遍全部静态校验，把结果汇总到一个 UTF-8 报告里（供 CI / 本地一键验收）。
 
-用法： python tools/check_all.py
+用法：
+    python tools/check_all.py           本地全量（含真实按键注入）
+    python tools/check_all.py --ci      **CI 安全集**：排除需要真机 / 交互桌面的那几道，
+                                        其余全部必跑；且**必需项 SKIP 一律算失败**
+
+为什么要有 `--ci`（2026-09-29 审查报告 P1-10）：
+    老工作流只挑了十来道闸手动列一遍，剩下的"本地绿、CI 不跑" —— 而 CI 才是
+    "用户能不能拿到这个包"的唯一守门人。两份清单还会各自漂。现在只有**一份**清单
+    （下面这个 STEPS），CI 用 `--ci` 跑同一份，只是把"需要真人按键 / 交互桌面"
+    的那几道显式摘出来，并在结尾**点名报出没跑的是哪几道**（"没跑"不许被读成"过了"）。
+
+    同时把"跳过"升格成**结构化结论**：脚本打印 `SKIPPED` 就是 SKIP，
+    SKIP 的必需项按 FAIL 计。原先 `smoke_console.py` 之类对任意 OSError
+    都以 SKIP/成功退出 ⇒ 环境一坏，整道闸静默变成永远绿的摆设。
 """
 from __future__ import annotations
 
+import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -16,13 +32,40 @@ _setup_utf8()
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 
+
+def _find_node() -> str | None:
+    """找 node —— 前端的"真实浏览器"那两道闸要用它。
+
+    先看 PATH（CI 的 runner 自带），再找本机托管的那个版本。
+    """
+    n = shutil.which("node")
+    if n:
+        return n
+    base = os.path.join(os.path.expanduser("~"), ".workbuddy-ai",
+                        "binaries", "node", "versions")
+    if os.path.isdir(base):
+        for d in sorted(os.listdir(base), reverse=True):
+            exe = os.path.join(base, d, "node.exe")
+            if os.path.isfile(exe):
+                return exe
+    return None
+
+
+NODE = _find_node()
+# playwright 装在哪：npm 全局目录（Node 的 require 解析不到，得靠 NODE_PATH）
+_NPM_GLOBAL = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
+                           "npm", "node_modules")
+if os.path.isdir(_NPM_GLOBAL):
+    os.environ["NODE_PATH"] = (_NPM_GLOBAL + os.pathsep
+                               + os.environ.get("NODE_PATH", "")).rstrip(os.pathsep)
+
 STEPS = [
     ("编译全部模块", [PY, "-m", "py_compile",
                   "config.py", "state.py", "keys.py", "session.py", "buttons.py",
                   "mixer.py", "main.py", "console_server.py", "tray_app.py",
                   "hidinfo.py", "hidwatch.py", "pairing.py", "remote_hid.py",
-                  "frida_hid.py",
-                  "tools/_utf8.py",
+                  "frida_hid.py", "logsetup.py",
+                  "tools/_utf8.py", "tools/_bat.py",
                   "tools/check_version.py", "tools/check_keymap.py",
                   "tools/smoke_console.py", "tools/test_recorder.py",
                   "tools/check_ble_callback_thread.py",
@@ -42,6 +85,12 @@ STEPS = [
                   "tools/takeover_hid_reports.py",
                   "tools/check_takeover_guard.py",
                   "tools/check_voice_session.py",
+                  "tools/check_ci_workflow.py",
+                  "tools/check_run_bat.py",
+                  "tools/check_licenses.py",
+                  "tools/check_logging.py",
+                  "tools/check_audio_rate.py",
+                  "tools/make_deps_lock.py",
                   "tools/check_all.py"]),
     ("版本号一致性", [PY, "tools/check_version.py"]),
     # spec / installer.iss 的一致性：诊断工具必须真的被打进安装包。
@@ -59,6 +108,31 @@ STEPS = [
     # 设置页一动或重连就被 config.json 悄悄回滚。这是最难查的一类 bug：
     # 一点声音都没有，用户只会说"它自己不听话"。沙箱 APPDATA，不碰真配置。
     ("混音开关落盘", [PY, "tools/check_mix_persist.py"]),
+    # 配置读改写的并发保护与原子写（2026-09-29 审查报告 P1-5）。
+    # 控制台是 ThreadingHTTPServer：多个请求各读各的旧快照再写回 → 丢配置；
+    # save() 直接截断写 → 并发读拿到半截 JSON → 回退默认 → 用户设置一次全没。
+    # 顺带钉住 Windows 上 os.replace 与并发读抢句柄的问题（必须退避重试）。
+    ("配置原子写与并发", [PY, "tools/check_config_atomic.py"]),
+    # 托盘「修复 / 诊断」菜单（2026-09-29 武哥的建议）。
+    # 静态断言 + **真的 build 一次菜单**：菜单项指向的函数改名、工具文件名
+    # 写错、传了个工具不认的开关、用 subprocess.run 把托盘线程卡死 ——
+    # 这四种洞用户看到的都只是「点了没反应」，日志里一个字都没有。
+    ("托盘修复菜单", [PY, "tools/check_tray_tools.py"]),
+    # 控制台鉴权与请求边界（2026-09-29 审查报告 P1-1）。
+    # 绑 127.0.0.1 只挡外网，挡不住同机进程和浏览器里的网页 —— 随机端口是概率、
+    # 不是鉴权。裸 socket 验精确状态码（401/403/415/413）+ 反证。
+    ("控制台鉴权", [PY, "tools/check_console_auth.py"]),
+    # 托盘退出必须让桥线程自己走完 finally（2026-09-29 审查报告 P1-4）。
+    # 原先只设了托盘自己的事件、主循环看不见 → daemon 线程被直接掐掉，
+    # GattSession / Frida 注入 / 音频流没清理，现象是「退出再开就连不上」。
+    # 其中「20 秒连接等待可被打断」是真跑一遍验的（假设备）。
+    ("退出时优雅收尾", [PY, "tools/check_graceful_stop.py"]),
+    # run_bridge 的**收尾范围**（2026-09-29 审查报告 P1-3）。
+    # 原先 finally 只包住主循环，建立阶段那十来条 return False 全绕过它 ——
+    # GattSession 还举着、注入还挂着、音频流没停，全靠 GC。现在收尾只有一处
+    # （_BridgeResources.teardown），这道闸按句柄逐个核"登记了没有 / 释放了没有 /
+    # 有没有 None 判断"，并真跑一遍"句柄全 None 的 teardown"。
+    ("收尾范围与句柄登记", [PY, "tools/check_teardown_scope.py"]),
     ("按键映射表", [PY, "tools/check_keymap.py"]),
     ("控制台冒烟", [PY, "tools/smoke_console.py"]),
     ("录制器逻辑", [PY, "tools/test_recorder.py"]),
@@ -101,6 +175,30 @@ STEPS = [
     # 所以先把能脱离硬件验证的那一半钉死：消费类页 usage 表、两种报告格式的解码、
     # 抹除算法、.js 与 .py 的 IOCTL 常量不漂移。带反例自证。
     ("按键旁路解码", [PY, "tools/check_frida_tap.py"]),
+    # 屏蔽表要**随配置实时更新**，并且下发后要**等钩子确认**（2026-09-29 审查报告 P1-6）。
+    # 原先只在启动时 set_mapping 一次 ⇒ 运行中关掉映射 / 把键改成 native 之后，
+    # Python 不映射了、JS 仍按旧表把 usage 原地写 0：界面写着"已停用"，
+    # 实际那个键彻底失效，得重连。另一面：下发是异步的，控制台保存完就回
+    # "已生效"，用户立刻按键时钩子可能还在用旧表。行为级（假 script 驱动真类）
+    # + 反例自证（含"迟到 ack 不算数"那条最容易假绿的）。
+    ("按键屏蔽表实时下发", [PY, "tools/check_frida_mapping.py"]),
+    # Frida 旁路**只认准那一台设备**（2026-09-29 审查报告 P1-8）。
+    # 原先两处太宽：Python 侧找不到精确 VID/PID 就自动回退到"任意 BLE HID 第一项"
+    # （而且匹配用的是子串判断，REV/序列号/MAC 段里撞上短 VID 就误判）；JS 侧只按
+    # IOCTL 过滤、没绑 FileHandle ⇒ 同一个 WUDFHost 里别的蓝牙键鼠的报告也会被
+    # 原地改写。现象是"按键串台"，完全静默。行为级用**假 winreg** 驱动 hid_hosts()
+    # 验证过滤真的生效，含"子串陷阱"两种名字 + 反例自证。
+    ("按键旁路目标精确化", [PY, "tools/check_frida_target.py"]),
+    # 配对修复的备份/还原必须是**可信事务**（2026-09-29 审查报告 P1-7）。
+    # 修复工具以管理员身份动注册表，老版本的备份有三个洞：① 整棵
+    # BTHPORT\Parameters\Keys + 整个 Devices 全抄（本机所有蓝牙设备的链路密钥
+    # 都落盘）；② 备份落在 %APPDATA%（当前用户可写）—— 低权限进程塞一个"更新"的
+    # .reg，等用户下次点「还原」被 UAC 提权导入，而里面装的是能解密链路的材料；
+    # ③ 还原只 glob 最新的**一个** .reg（半个事务 + 挑哪个看 mtime）。
+    # 现在：最小子树 + manifest（事务 ID / SHA-256）+ 解析 .reg 键路径限制前缀 +
+    # ProgramData + DACL 禁继承 + 任一关键项失败即停。行为级用假 _run + 临时目录
+    # 真跑（不碰注册表），并**逐条**反例自证。
+    ("配对备份可信事务", [PY, "tools/check_pairing_backup.py"]),
     # 混音取数不许丢样本（2026-09-29 审查报告 P0-2）。
     # 采集块 1024 / 播放块 240，老写法"攒够 n 就整块返回" ⇒ 调用方只读前 240 个，
     # **每块静默丢 76%**（实测：4096 个采样只剩 960 个）。房间里那一路于是变成
@@ -125,6 +223,18 @@ STEPS = [
     # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
     # 纯静态，几毫秒。
     ("音频流自愈", [PY, "tools/check_audio_watchdog.py"]),
+    # 采样率是**遥控器**在 CAPS 里给的（8k/16k），而 ATVVState 默认就是 16000。
+    # 发完 GET_CAPS 就建流 = 8k 的遥控器被按 16k 播 —— **不报错**，只是变调变速。
+    # 这道闸钉：先协商再建流、超时留痕、迟到的响应要能触发整条链重建
+    # （含电脑麦克风那一路 —— 它按 out_rate 重采样，只换输出流同样不对）。
+    ("采样率先协商后建流", [PY, "tools/check_audio_rate.py"]),
+    # 依赖"未完全锁定"：requirements.txt 里传递依赖没写版本（pyinstaller 拉
+    # altgraph/pefile/…、frida 拉 cffi/six/…）⇒ 同一份代码在不同时间构建出的
+    # 产物**不一样**，而按键旁路依赖的 frida 原生扩展一变就是静默故障。
+    # 锁文件把版本 + 每个 wheel 的 SHA-256 固定下来，CI 用 --require-hashes 装。
+    # 这一步是**离线**静态校验（锁与 requirements 一致、每行都有哈希）；
+    # 真正"锁能用"由 CI 的 `pip install --require-hashes` 证明。
+    ("依赖锁一致性", [PY, "tools/make_deps_lock.py", "--check"]),
     # voice coding 的最后一环：说完 → 按语音键结束 → **替用户把消息发出去**。
     # 2026-09-17 武哥的原话是"说完还要去电脑上按鼠标点发送，完全没有
     # voice coding 的感觉"。这道闸钉住：默认开、延迟不能小到在文字落进
@@ -141,7 +251,11 @@ STEPS = [
     #     ② retries：整步再跑一次（脚本内部本身也已经重试 6 轮）
     #   settle/retries 只加在它身上，别的步骤该红就红。
     ("按键注入自检", [PY, "tools/check_injection.py"],
-     {"settle": 2.0, "retries": 1, "retry_hint": "钩子没收到"}),
+     {"settle": 2.0, "retries": 1, "retry_hint": "钩子没收到",
+      # CI 不跑：它**真的往系统里注入按键**，需要交互桌面会话。
+      # runner 上没有桌面会话 ⇒ 跑了只会 SKIP（旧版还会把 SKIP 当成功）。
+      "hardware": True,
+      "why": "真的注入按键，需要交互桌面会话（runner 上没有）"}),
     # 接管 0x1812 的那个工具是**本项目唯一会改系统设备状态**的东西。
     # 这道闸钉三件事：默认只读（不带 --go 一个字节都不改）、
     # 目标必须是 BTHLEDEVICE 父节点（0x1812 底下还有 5 个 HID 子集合，
@@ -188,9 +302,76 @@ STEPS = [
     # 这条闸**人为制造当初那个条件**（把 gatt_part 换成立刻返回的假货），
     # 再断言窗口照样跑满。反例实测过：掐掉窗口循环 → 立刻红。
     ("监听窗口不被 GATT 成败绑住", [PY, "tools/watch_all_channels.py", "--selftest"]),
+    # 控制台前端「不拼 HTML」（2026-09-29 审查报告 P1-2）。
+    # 原来是 renderStatusList 把 checklist[].value 拼进 innerHTML，而那个 value
+    # 可以是 /api/config 写进去的设备名 —— 存储型 XSS。现在钉住：整个前端
+    # 只剩 iconFor 那一处 innerHTML（赋的是本文件常量），且 HTML 里没有内联
+    # 脚本/样式/事件、服务端真的发 CSP。
+    ("控制台前端不拼 HTML", [PY, "tools/check_ui_xss.py"]),
+    # CI 工作流与「项目声称的闸门」必须一致（2026-09-29 审查报告 P1-10）。
+    # 老工作流只在 tag/手动触发（PR 不跑）、闸门是手工列的（和本地这份各自漂）、
+    # 构建与发布同一个 job（发出去的包是又构建一次的）、没写 draft（靠 Action
+    # 默认值，v1.0.21 事实上直接公开了）、权限全程 contents: write。
+    # 外加 `--ci` 的判定机制本身：必需项 SKIP 必须算失败（否则环境一坏，
+    # 整道闸静默变成永远绿的摆设）。行为级用**假 STEPS + 假 _run_step 真跑 main()**。
+    ("CI 与声称的闸门一致", [PY, "tools/check_ci_workflow.py"]),
+    # 源码用户唯一会双击的那个入口（2026-09-29 审查报告第六节 1~3）。
+    # 它的三处错误**都不报错**：入口是 main.py（没托盘、只能关窗口硬杀进程，
+    # P1-3/P1-4 做的优雅收尾根本到不了）／把系统默认麦克风写成 CABLE Input
+    # （VB-CABLE 两端命名是反的，写成 Input 就是读"没人写的那只端点"，
+    # 症状一点声音都没有）／pip 输出 `>nul` 全吞且不看退出码。
+    ("run.bat 的入口与端点", [PY, "tools/check_run_bat.py"]),
+    # 第三方许可证清单必须**覆盖实际依赖**，并真的装进安装包（第六节 9）。
+    # 安装包里分发着 15 个第三方包，其中 pystray 是 LGPL-3.0、frida 是
+    # wxWindows（LGPL 派生）—— 都要求随分发附上许可证；PyInstaller 的
+    # GPL 特殊例外也得写出来。而 THIRD_PARTY_NOTICES.md 原先只写了三个
+    # "移植来源"，实际依赖一个没列，安装包里也没有 licenses\。
+    # 拿 requirements*.txt 逐项比对 + 反例自证（含"新增依赖忘了补"这个动作）。
+    ("第三方许可证清单", [PY, "tools/check_licenses.py"]),
+    # 日志三件事（P2-6）：**轮转** / **脱敏** / **raw HID 默认不记**。
+    # 坏掉的现象分别是「bridge.log 涨到几十 MB 没人敢删」和「用户把日志贴到
+    # 群里、里面是他完整的蓝牙地址」。前两件**行为级**真跑（真起 handler、
+    # 真写满触发轮转、真格式化 args 里的地址），后一件查源码接线。
+    # 含 5 条反例：改回 basicConfig / 先打日志后脱敏 / raw 改回裸打 /
+    # 默认值改成脱敏关 / 把白名单那行删掉。
+    ("日志轮转与脱敏", [PY, "tools/check_logging.py"]),
 ]
 
-STEP_DEFAULTS = {"settle": 0.0, "retries": 0, "retry_hint": ""}
+# 真实浏览器那一道要 node + playwright。没有就别硬塞进列表 —— 但**要出声**，
+# 免得"没跑"被读成"跑过了、过了"。这里记进 `_UNRUN`，结尾会点名（`--ci` 时算失败：
+# CI 上有 node，缺了就是环境没配好，不该悄悄降级）。
+_UNRUN: list[tuple[str, str]] = []
+if NODE:
+    STEPS.append(("控制台 XSS 真实渲染", [NODE, "tools/check_ui_xss.js"]))
+else:
+    _UNRUN.append(("控制台 XSS 真实渲染",
+                   "本机没有 node（CI 上自带 node，会装 playwright chromium）"))
+
+STEP_DEFAULTS = {
+    "settle": 0.0,
+    "retries": 0,
+    "retry_hint": "",
+    # ── 下面三个是 2026-09-29 审查报告 P1-10 加的 ──────────────────────────
+    # hardware=True  → 需要真机 / 交互桌面，`--ci` 时**显式摘掉**并在结尾点名
+    "hardware": False,
+    # required=False → 允许它 SKIP（只给"环境本来就可能没有"的闸用；
+    #                  默认 True ⇒ SKIP 按 FAIL 计）
+    "required": True,
+    "why": "",
+}
+
+# 一条闸门"本次没验证任何东西"的写法：脚本自己打印以 `SKIPPED` 开头的行。
+# 可能带一个符号前缀（例如 `  ⚠ SKIPPED（import main 失败：…）`）——
+# 这是仓库里既有的约定（check_injection / smoke_console / diag_remote /
+# check_send_after_voice 都这么写），这里把它升格成结构化结论。
+_SKIP_RE = re.compile(r"^\s*(?:[^\w\s]{1,3}\s+)?SKIPPED\b", re.M)
+
+
+def _verdict(ok: bool, out: str) -> str:
+    """把一次运行归一成 PASS / FAIL / SKIP。"""
+    if not ok:
+        return "FAIL"
+    return "SKIP" if _SKIP_RE.search(out) else "PASS"
 
 
 def _run_step(cmd: list[str]) -> tuple[bool, str]:
@@ -199,11 +380,48 @@ def _run_step(cmd: list[str]) -> tuple[bool, str]:
     return p.returncode == 0, ((p.stdout or "") + (p.stderr or "")).strip()
 
 
-def main() -> int:
-    fails = 0
+def _step_summary(counts: dict, excluded: list[tuple[str, str]]) -> str:
+    """给 GitHub Actions 的步骤摘要用的 Markdown（结构化结果）。"""
+    out = ["## 闸门结果（`tools/check_all.py --ci`）", "",
+           "| 结论 | 数量 |", "|---|---|",
+           f"| PASS | {counts['PASS']} |",
+           f"| FAIL | {counts['FAIL']} |",
+           f"| SKIP | {counts['SKIP']} |"]
+    if excluded:
+        out += ["", "### 本模式未运行的闸", ""]
+        out += [f"- `{n}` —— {w}" for n, w in excluded]
+    return "\n".join(out) + "\n"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="跑一遍全部校验（CI 用 --ci）")
+    ap.add_argument("--ci", action="store_true",
+                    help="CI 安全集：摘掉需要真机/交互桌面的闸，其余必跑，"
+                         "必需项 SKIP 视为失败")
+    args = ap.parse_args(argv)
+
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+    excluded: list[tuple[str, str]] = []
+
+    # 工具缺失（没 node）也是"没跑"的一种，一并点名。
+    for name, why in _UNRUN:
+        if args.ci:
+            # CI 上有 node；缺了说明环境没配好，不许悄悄降级成"跳过"。
+            counts["FAIL"] += 1
+            print(f"[FAIL] {name} —— {why}")
+        else:
+            excluded.append((name, why))
+            print(f"[--  ] {name} —— {why}")
+
     for step in STEPS:
         name, cmd = step[0], step[1]
         opt = {**STEP_DEFAULTS, **(step[2] if len(step) > 2 else {})}
+
+        # ── `--ci` 摘掉需要真机 / 人工操作的那几道（**显式**，不是悄悄跳过）──
+        if args.ci and opt["hardware"]:
+            excluded.append((name, opt["why"] or "需要真机 / 人工操作"))
+            print(f"[--  ] {name} —— CI 不跑：{opt['why'] or '需要真机 / 人工操作'}")
+            continue
 
         if opt["settle"]:
             time.sleep(opt["settle"])
@@ -220,15 +438,39 @@ def main() -> int:
             time.sleep(1.5)
             ok, out = _run_step(cmd)
 
-        print(f"[{'OK  ' if ok else 'FAIL'}] {name}")
+        verdict = _verdict(ok, out)
+        if verdict == "SKIP" and opt["required"]:
+            # 必需项 SKIP = 失败。否则"环境一坏，闸门静默变成永远绿的摆设"。
+            verdict = "FAIL"
+            out = ((out + "\n" if out else "")
+                   + "[必需项不许跳过] 这道闸本次没有真正验证任何东西。"
+                     "要么把环境补齐，要么把它标成 required=False 并写清为什么。")
+        counts[verdict] += 1
+        print(f"[{verdict:4}] {name}")
         if out:
             for line in out.splitlines():
                 print("       " + line)
-        if not ok:
-            fails += 1
+
     print()
-    print("ALL CHECKS PASSED" if not fails else f"{fails} 项校验未通过")
-    return 1 if fails else 0
+    print("── 结果汇总 ──────────────────────────────────────────────────")
+    print(f"   PASS {counts['PASS']}    FAIL {counts['FAIL']}    SKIP {counts['SKIP']}")
+    if excluded:
+        print(f"   本模式未运行 {len(excluded)} 道（**没跑 ≠ 过了**）：")
+        for n, w in excluded:
+            print(f"     · {n} —— {w}")
+    print("ALL CHECKS PASSED" if not counts["FAIL"]
+          else f"{counts['FAIL']} 项校验未通过")
+
+    # 结构化结果也给一份给 CI 的步骤摘要（PR 页面上一眼能看）
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as fh:
+                fh.write(_step_summary(counts, excluded))
+        except OSError:
+            pass
+
+    return 1 if counts["FAIL"] else 0
 
 
 if __name__ == "__main__":

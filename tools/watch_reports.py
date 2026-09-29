@@ -52,7 +52,8 @@ def _bridge_running() -> str:
         p = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq RemoteVoiceBridge.exe", "/NH"],
             capture_output=True, text=True, timeout=6,
-            creationflags=0x08000000,
+            errors="replace",              # 同 diag_remote：解不出来也得有输出，
+            creationflags=0x08000000,      # 否则读取线程抛异常 ⇒ stdout 空 ⇒ 误判
         )
         if "RemoteVoiceBridge.exe" in (p.stdout or ""):
             return "进程 RemoteVoiceBridge.exe 正在运行"

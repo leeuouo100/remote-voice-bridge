@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import os
 import shutil
@@ -59,6 +60,10 @@ import state  # noqa: E402
 
 FAILS: list[str] = []
 PORT = 0
+# 带 CookieJar 的会话：控制台令牌是随页面 Set-Cookie 下发的（P1-1）。
+# 先 GET 一次 `/` 把 Cookie 拿回来，后续 /api/* 才通得过鉴权。
+_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
 def check(cond, msg) -> bool:
@@ -72,8 +77,14 @@ def req(path, method="GET", body=None):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method,
                                headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=10) as resp:
+    with _OPENER.open(r, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8")), resp.status
+
+
+def prime_cookie() -> None:
+    """取一次首页，把令牌 Cookie 收进 jar（跟真实浏览器同一条路）。"""
+    with _OPENER.open(f"http://127.0.0.1:{PORT}/", timeout=10) as resp:
+        resp.read()
 
 
 def saved() -> dict:
@@ -86,6 +97,7 @@ def main() -> int:
     global PORT
     srv = console_server.ensure_started(0)
     PORT = srv.port
+    prime_cookie()
 
     # 先让配置文件存在（Config.save 会建目录）
     cfg = config.Config.load()

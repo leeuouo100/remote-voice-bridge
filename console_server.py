@@ -12,14 +12,17 @@ CSS/HTML 能力，而且**零新增依赖**（只用标准库 http.server）。
 --------
 · 只绑定 `127.0.0.1`，不监听外网；
 · 只提供读配置/改配置/打开文件这几类接口，不接受任意路径；
-· `/api/open` 的白名单写死（日志 / 配置目录 / 项目主页），不做通用 shell 打开。
+· `/api/open` 的白名单写死（日志 / 配置目录 / 项目主页），不做通用 shell 打开；
+· **所有 `/api/*` 都要令牌**（v1.0.23 起，审查报告 P1-1），见下面 `_TOKEN` 那段。
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -36,6 +39,7 @@ from config import (
     apply_recommended, hotkey_label, ordered_buttons,
 )
 import state
+import logsetup
 
 logger = logging.getLogger("rvb.console")
 
@@ -59,6 +63,49 @@ _TARGET_GROUPS = [
         "ctrl+shift+esc",
     ]},
 ]
+
+
+# ── 控制台令牌（2026-09-29 审查报告 P1-1）────────────────────────────────────
+# 控制台原先**完全无鉴权**：同机任意低权限进程都能直接 POST /api/config、
+# /api/test_hotkey、/api/reconnect……；恶意网页只要能命中那个随机端口，也可能
+# 构造出**无需预检**的请求（`text/plain` 的简单请求不触发 CORS preflight）。
+# 随机端口只是把概率压低，**它不是鉴权**。
+#
+# 现在的做法：进程启动时生成 256 位随机令牌，用 **HttpOnly + SameSite=Strict
+# 的 Cookie** 交给控制台页面（页面本身由本服务提供，所以拿得到）；`/api/*`
+# 一律要令牌。为什么走 Cookie 而不是把令牌写进 URL：
+#   · URL 会进 `bridge.log`（那行「🖥 控制台已就绪：http://…」就在日志里）——
+#     令牌写 URL 等于**把令牌写进日志**；
+#   · `HttpOnly` 让页面脚本读不到它，XSS 也偷不走（P1-2 的纵深防御）；
+#   · `SameSite=Strict` 让跨站请求**根本带不上**这个 Cookie。
+# 另加三道闸：精确 Host（防 DNS rebinding）、Origin 白名单（防跨站）、
+# 只收 `application/json`（把简单请求挡在预检之外）+ 64 KiB 体积上限。
+_TOKEN: str = ""
+_TOKEN_LOCK = threading.Lock()
+_TOKEN_COOKIE = "rvb_token"
+_MAX_BODY = 64 * 1024
+# Host 只认本机回环的三种写法
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# CSP（2026-09-29 审查报告 P1-2）：即使有值漏进 DOM，也不让它变成可执行的东西。
+#   · `script-src 'self'`  —— 禁内联脚本、禁 eval；页面只有一个外链 app.js
+#   · `style-src 'self'`   —— 禁内联 <style>/style=；样式全在 style.css
+#   · `object-src/base-uri/form-action 'none'` —— 禁插件、禁改基地址、禁表单外发
+#   · `frame-ancestors 'none'` —— 不许被别人 iframe 套住（防点击劫持）
+#   · `connect-src 'self'` —— 只许 fetch 自己这一个源
+_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+        "base-uri 'none'; form-action 'none'; object-src 'none'; "
+        "frame-ancestors 'none'")
+
+
+def console_token() -> str:
+    """本进程的控制台令牌（256 位）。首次调用时生成，之后固定。"""
+    global _TOKEN
+    with _TOKEN_LOCK:
+        if not _TOKEN:
+            _TOKEN = secrets.token_urlsafe(32)
+        return _TOKEN
 
 
 # ── 资源定位 ──────────────────────────────────────────────────────────────────
@@ -515,6 +562,15 @@ def build_state(force_devices: bool = False) -> dict:
             # 厂商页按键读取（v1.0.11 起按键映射全靠这一路）——
             # 面板上要能看见它是不是开着，否则"按键没反应"又变成猜谜。
             "hid_vendor_keys": bool(getattr(cfg, "hid_vendor_keys", True)),
+            # 按键旁路 + 兼容款兜底（P1-8）：兜底默认关，面板要能看出
+            # "这次是精确匹配还是猜的"，否则"按键串台"查不出来。
+            "hid_frida_tap": bool(getattr(cfg, "hid_frida_tap", True)),
+            "hid_frida_any_hid": bool(getattr(cfg, "hid_frida_any_hid", False)),
+            # 日志脱敏 / raw HID（P2-6）。要能从 `/api/config` 读出来 ——
+            # 否则用户往聊天窗口贴日志时**不知道自己在贴什么**。
+            # （跟 hid_frida_* 一样属于"高级项"，UI 上不铺开关，改 config.json。）
+            "log_redact": bool(getattr(cfg, "log_redact", True)),
+            "log_raw_hid": bool(getattr(cfg, "log_raw_hid", False)),
         },
         "devices": {
             # `system_mic` 是**程序真正打开**的那只（由 SystemMic.start 写入 state），
@@ -556,11 +612,19 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug("%s - %s", self.address_string(), fmt % args)
 
     # ── 工具 ──
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str,
+              extra: dict | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # 防 MIME 嗅探：把一个 .txt 当脚本执行是 XSS 的常见入口
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # CSP 对所有响应都发（对 JSON 无害），漏一个分支就等于没设
+        self.send_header("Content-Security-Policy", _CSP)
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -574,10 +638,101 @@ class Handler(BaseHTTPRequestHandler):
     def _err(self, msg: str, code: int = 400) -> None:
         self._json({"error": msg}, code)
 
+    # ── 鉴权（P1-1）──────────────────────────────────────────────────────
+    # ⚠ 为什么必须自己写：`ThreadingHTTPServer` 默认**什么都不验**。这个服务
+    #   绑在 127.0.0.1 上，看着"外网进不来"就安全了 —— 但同机的任何进程、
+    #   以及用户浏览器里打开的任何网页，都能直接打这些接口。
+    def _cookie_token(self) -> str:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == _TOKEN_COOKIE:
+                return v
+        return ""
+
+    def _token_ok(self) -> bool:
+        want = console_token()
+        got = self._cookie_token() or (self.headers.get("X-RVB-Token") or "").strip()
+        # compare_digest：别用 `==`，那会把令牌长度/前缀通过耗时泄出去
+        return bool(got) and hmac.compare_digest(got, want)
+
+    def _host_ok(self) -> bool:
+        """Host 必须**精确**是本机这个端口 —— 防 DNS rebinding。
+
+        攻击者把自己的域名解析到 127.0.0.1，再让浏览器去打这个域名：
+        Cookie 会带上（同站），Origin 也是攻击者的域名 —— 所以这条 + Origin
+        白名单必须一起用，只留一条都不够。
+        """
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return False
+        if raw.startswith("["):                    # [::1]:1234
+            name, _, rest = raw[1:].partition("]")
+            port = rest.lstrip(":")
+        else:
+            name, _, port = raw.partition(":")
+        if name.lower() not in _ALLOWED_HOSTS:
+            return False
+        if port:
+            try:
+                if int(port) != self.server.server_address[1]:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def _origin_ok(self) -> bool:
+        """有 Origin 就必须是本机控制台自己的来源；没有 Origin 才放行。
+
+        浏览器对**跨站** POST 一定会带 Origin（表单、fetch 都带），所以
+        "带了但不是自己" = 跨站，直接拒。同源的 fetch 也带 Origin，值是
+        `http://127.0.0.1:<port>`，能对上。非浏览器客户端不带 Origin，
+        由令牌兜住。
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        port = self.server.server_address[1]
+        return origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}",
+                          f"http://[::1]:{port}")
+
+    def _guard(self, *, post: bool) -> bool:
+        """API 统一入口检查。返回 False 时**已经把响应发出去了**。"""
+        if not self._host_ok():
+            self.close_connection = True
+            self._err("bad host", 403)
+            return False
+        if not self._origin_ok():
+            self.close_connection = True
+            self._err("bad origin", 403)
+            return False
+        if not self._token_ok():
+            self.close_connection = True
+            self._err("unauthorized", 401)
+            return False
+        if post:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                # 只收 application/json：`text/plain` 这类"简单请求"**不触发
+                # CORS 预检**，是跨站写接口最省事的入口，所以从类型上掐掉。
+                self.close_connection = True
+                self._err("需要 Content-Type: application/json", 415)
+                return False
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n > _MAX_BODY:
+                self.close_connection = True
+                self._err(f"请求体过大（上限 {_MAX_BODY} 字节）", 413)
+                return False
+        return True
+
     def _body(self) -> dict:
         try:
             n = int(self.headers.get("Content-Length") or 0)
             if n <= 0:
+                return {}
+            if n > _MAX_BODY:                      # 双保险：_guard 已挡一次
                 return {}
             return json.loads(self.rfile.read(n).decode("utf-8")) or {}
         except Exception:  # noqa: BLE001
@@ -586,6 +741,8 @@ class Handler(BaseHTTPRequestHandler):
     # ── GET ──
     def do_GET(self):  # noqa: N802
         path = urlparse(self.path).path
+        if path.startswith("/api/") and not self._guard(post=False):
+            return
         try:
             if path == "/api/state":
                 # ?devices=1 强制重新枚举声卡（设置页的「刷新」按钮用）
@@ -625,11 +782,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._err("forbidden", 403)
         if not target.is_file():
             return self._err("not found", 404)
-        self._send(200, target.read_bytes(), _MIME.get(target.suffix, "application/octet-stream"))
+        # 页面/静态资源本身就是"发令牌"的地方：控制台是同源页面，Cookie 一下发
+        # 后续 /api/* 就自动带上。不需要页面脚本碰令牌（HttpOnly，脚本也读不到）。
+        cookie = (f"{_TOKEN_COOKIE}={console_token()}; Path=/; "
+                  f"HttpOnly; SameSite=Strict")
+        self._send(200, target.read_bytes(),
+                   _MIME.get(target.suffix, "application/octet-stream"),
+                   extra={"Set-Cookie": cookie})
 
     # ── POST ──
     def do_POST(self):  # noqa: N802
         path = urlparse(self.path).path
+        if not self._guard(post=True):
+            return
         body = self._body()
         try:
             if path == "/api/config":
@@ -639,21 +804,19 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/mapping":
                 return self._json(self._patch_mapping(body))
             if path == "/api/mapping/reset":
-                cfg = Config.load()
-                cfg.keymap = dict(DEFAULT_KEYMAP)
-                cfg.save()
-                return self._json({"ok": True})
+                Config.update(lambda c: setattr(c, "keymap", dict(DEFAULT_KEYMAP)))
+                # 恢复默认也是一次映射变更 → 同样要推给钩子并等确认（P1-6）。
+                return self._json({"ok": True,
+                                   "effective": self._push_mapping_now()})
             if path == "/api/hotkey":
                 from keys import combo_bad_parts
-                cfg = Config.load()
                 keys_in = [str(k).strip() for k in (body.get("keys") or []) if str(k).strip()]
                 # 服务端把住最后一道关：解析不出来的键名写进配置只会静默失效，
                 # 用户看到的就是「设了没用」。宁可直接报错。
                 bad = [p for p in keys_in if combo_bad_parts(p)]
                 if bad:
                     return self._err(f"不认识这些键名：{'、'.join(bad)}")
-                cfg.voice_hotkey = keys_in
-                cfg.save()
+                cfg = Config.update(lambda c: setattr(c, "voice_hotkey", keys_in))
                 return self._json({"ok": True, "label": hotkey_label(cfg.trigger_keys_windows())})
             if path == "/api/record/start":
                 RECORDER.start()
@@ -710,28 +873,34 @@ class Handler(BaseHTTPRequestHandler):
           界面上既然给了开关，就得让它留得住。
         """
         mix = state.set_mix(**body)
+        saved = {"v": False}
 
-        cfg = Config.load()
-        changed = False
-        for mix_key, cfg_key in self._MIX_TO_CFG:
-            if mix_key not in body or not hasattr(cfg, cfg_key):
-                continue
-            new = mix.get(mix_key)
-            if new is not None and getattr(cfg, cfg_key) != new:
-                setattr(cfg, cfg_key, new)
-                changed = True
-        if changed:
-            cfg.save()
-        return {"mix": mix, "saved": changed}
+        def _apply(cfg) -> bool:
+            for mix_key, cfg_key in self._MIX_TO_CFG:
+                if mix_key not in body or not hasattr(cfg, cfg_key):
+                    continue
+                new = mix.get(mix_key)
+                if new is not None and getattr(cfg, cfg_key) != new:
+                    setattr(cfg, cfg_key, new)
+                    saved["v"] = True
+            return saved["v"]
+
+        # ⚠ 走 Config.update（同一把锁里"读→改→写"），**不要**自己 load/save：
+        #   控制台是 ThreadingHTTPServer，并发请求各读各的旧快照再写回，
+        #   会把彼此改的字段整段覆盖掉（2026-09-29 审查报告 P1-5）。
+        Config.update(_apply)
+        return {"mix": mix, "saved": saved["v"]}
 
     def _patch_config(self, body: dict) -> dict:
-        cfg = Config.load()
         allowed = {
             "gain": float, "audio_output": str, "system_mic_device": str,
             "system_mic_gain": float, "hotkey_mode": str, "suppress_keys": bool,
             "input_method": str, "device": str, "voice_mode": str,
             "mapping_enabled": bool, "swallow_ok_during_voice": bool,
             "hid_vendor_keys": bool,
+            # 兼容款兜底（P1-8）：VID/PID 对不上时是否允许猜第一台 BLE HID。
+            # 必须进白名单 —— 不进就是"改了 config.json 没反应"（静默）。
+            "hid_frida_any_hid": bool,
             # ⚠ 这两个原先漏在白名单外：前端一发过来就被**静默丢掉**，
             #   界面显示"已关闭"、后端仍按旧配置把这一路混进去 ——
             #   「我明明不让系统麦克风参与说话了，它还是在输出」有一半出在这里。
@@ -740,22 +909,33 @@ class Handler(BaseHTTPRequestHandler):
             # "界面上改了、后端当没听见"，而用户看到的只是"它不听话"。
             "send_after_voice": bool, "send_after_voice_delay_ms": int,
             "send_after_voice_key": str,
+            # v1.0.22 键盘页兜底映射开关（默认关）。不进白名单 = 用户打开后
+            # 重启又变回关的，而界面会显示成打开 —— 方向相反，最难查。
+            "keyboard_page_keys": bool,
+            # 日志脱敏 / raw HID（P2-6）。**必须进白名单** —— 不进就是
+            # "改了 config.json 或调 API 没反应"（静默），更糟的是用户以为
+            # 脱敏开着、其实没开（贴日志时把完整地址漏出去）。
+            "log_redact": bool, "log_raw_hid": bool,
         }
         ignored: list[str] = []
-        for k, v in body.items():
-            if k not in allowed or not hasattr(cfg, k):
-                ignored.append(k)
-                continue
-            try:
-                setattr(cfg, k, allowed[k](v))
-            except (TypeError, ValueError):
-                ignored.append(k)
-                continue
+
+        def _apply(cfg) -> None:
+            for k, v in body.items():
+                if k not in allowed or not hasattr(cfg, k):
+                    ignored.append(k)
+                    continue
+                try:
+                    setattr(cfg, k, allowed[k](v))
+                except (TypeError, ValueError):
+                    ignored.append(k)
+                    continue
+
+        # 走 Config.update：同一把锁里"读→改→写"，并发请求不会互相覆盖（P1-5）。
+        cfg = Config.update(_apply)
         if ignored:
             # 静默忽略是不可调试的：前端以为改成功了，后端当没听见。
             # 留一条日志 + 在返回值里说明，下次"设了没用"能立刻对上号。
             logger.warning("⚠ /api/config 忽略了这些字段（不在白名单或类型不符）：%s", ignored)
-        cfg.save()
         # 增益是"热"参数：面板一改立即生效，不用重连。
         # 注意要同时更新两处 —— state.set_gain 是给诊断/显示用的，
         # state.set_mix(remote_gain=...) 才是混音回调真正读的那个值；
@@ -765,7 +945,38 @@ class Handler(BaseHTTPRequestHandler):
                       sys_gain=cfg.system_mic_gain,
                       sys_enabled=cfg.system_mic_enabled,
                       remote_enabled=cfg.remote_mic_enabled)
-        return {"ok": True, "config": body, "ignored": ignored}
+        # 日志开关是**热**的：改完立刻生效，不用重启（P2-6）。
+        # ⚠ 只影响**之后**写下的行 —— 已经落盘的内容不会回头改写（那是历史，
+        #   而且改写历史会让日志失去可信度）。要彻底干净就重启一次。
+        logsetup.set_redact(cfg.log_redact)
+        logsetup.set_raw_hid(cfg.log_raw_hid)
+        out = {"ok": True, "config": body, "ignored": ignored}
+        # `mapping_enabled` 变了也必须立刻下发（关掉 → 下发空表）。
+        # 只在这里判一次：其它字段改不动屏蔽表，白推一次没有意义（P1-6）。
+        if "mapping_enabled" in body:
+            out["effective"] = self._push_mapping_now()
+        return out
+
+    def _push_mapping_now(self) -> bool:
+        """把当前 keymap 下发给 Frida 钩子，并**等它确认**（审查报告 P1-6）。
+
+        为什么要等：JS 侧是"按这张表把报告里的 usage 原地写 0"的。下发是异步的，
+        不等确认就回「已生效」，用户可能立刻按一个键，而钩子还在用旧表 ——
+        看到的是"改了没用"。等不到就如实说"未确认"，别让界面撒谎。
+
+        返回 True = 钩子确认了（或本来就没有旁路在跑，没什么要确认的）。
+        """
+        try:
+            import frida_hid
+        except Exception:                               # noqa: BLE001
+            return True
+        try:
+            cfg = Config.load()
+            km = dict(cfg.keymap) if getattr(cfg, "mapping_enabled", True) else {}
+            return frida_hid.push_mapping(km, wait=True, timeout=1.5)
+        except Exception as e:                          # noqa: BLE001
+            logger.warning("下发按键屏蔽表失败：%s", e)
+            return False
 
     def _patch_mapping(self, body: dict) -> dict:
         btn = str(body.get("button") or "")
@@ -774,10 +985,11 @@ class Handler(BaseHTTPRequestHandler):
         if CHROMECAST_BUTTONS[btn]["usage"] == "voice":
             return {"error": "语音键由语音通道处理，不可映射"}
         value = str(body.get("value") or "")
-        cfg = Config.load()
-        cfg.keymap[btn] = value
-        cfg.save()
-        return {"ok": True, "button": btn, "value": value}
+        # 走 Config.update：并发改不同按键时不会互相覆盖（P1-5）。
+        Config.update(lambda cfg: cfg.keymap.__setitem__(btn, value))
+        # ⚠ 改完必须把新表推给钩子 —— 否则运行中改映射要重连才生效（P1-6）。
+        return {"ok": True, "button": btn, "value": value,
+                "effective": self._push_mapping_now()}
 
     def _test_hotkey(self) -> dict:
         def worker():
@@ -849,6 +1061,7 @@ _SERVER_LOCK = threading.Lock()
 def ensure_started(port: int = 0) -> ConsoleServer:
     """启动（或复用）控制台服务，返回实例。"""
     global _SERVER
+    console_token()          # 先把令牌定下来，别等第一个请求才生成
     with _SERVER_LOCK:
         if _SERVER is None:
             _SERVER = ConsoleServer(port)

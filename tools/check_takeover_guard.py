@@ -35,6 +35,16 @@
 否则等它睡完就没时间监听了）。这样 Python 这边崩了、被 Ctrl+C 了，设备照样回来。
 再加一道：收尾回读节点状态，不是 `OK` 就大声喊人。
 
+### ④ 一键入口必须退役（2026-09-29 审查报告第六节 7）
+
+仓库根目录的 `run-0x1812-takeover.bat` 以前是个**一键管理员入口**：自己弹 UAC、
+`taskkill` 掉桥程序、再跑 `--go`。而 ③ 之后我们知道这条路**被 Windows 封死**
+（`DevNodeStatus` 里没有 `DN_DISABLEABLE`），它每次必然以 `DISABLE_FAIL` 收场。
+
+⇒ 一个"要管理员 + 强杀桥程序 + 动系统设备状态"的入口，去回答一个**已经有答案**的
+问题，只有风险没有收益。它现在是个**什么都不做的退役壳**（只打印"已退役 + 为什么"，
+不提权、不 taskkill、不传 `--go`），文件留着只是给"记得有这个 bat"的人一个明确去处。
+
 用法： python tools/check_takeover_guard.py
 """
 
@@ -48,8 +58,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _utf8 import setup as _setup_utf8  # noqa: E402
 _setup_utf8()
 
-SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                   "tools", "takeover_hid_reports.py")
+import _bat  # noqa: E402  （读 .bat 的唯一入口，见 tools/_bat.py）
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC = os.path.join(_ROOT, "tools", "takeover_hid_reports.py")
+BAT = os.path.join(_ROOT, "run-0x1812-takeover.bat")
 
 
 def _block(src: str, name: str) -> str:
@@ -148,15 +161,57 @@ def audit(src: str) -> list[tuple[bool, str]]:
     return c
 
 
+def _bat_code(text: str) -> str:
+    """只留会**真的执行**的行（去掉 REM / :: 注释和 echo）。
+
+    ⚠ 判据只看会执行的行：退役壳里"以前会提权 / 会 taskkill / 会 --go"
+    全都是 `echo` 出来给人看的说明文字，拿整份文件判必然假红
+    （和 `_code_only` / `_ps_code` 是同一个坑，第三次踩了）。
+    """
+    return "\n".join(ln for ln in text.splitlines()
+                     if not re.match(r"^\s*(?:rem\b|::|echo\b)", ln, re.I))
+
+
+def audit_bat(text: str) -> list[tuple[bool, str]]:
+    """一键入口必须是个「什么都不做」的退役壳。"""
+    code = _bat_code(text)
+    return [
+        ("已退役" in text and "退役" in text,
+         "④ 一键入口写明「已退役」并说清为什么"),
+        ("RunAs" not in code and "Start-Process" not in code,
+         "④ 它**不再提权**（会执行的行里没有 Start-Process -Verb RunAs）"),
+        ("taskkill" not in code,
+         "④ 它**不再强杀桥程序**（会执行的行里没有 taskkill）"),
+        ("--go" not in code,
+         "④ 它**不再传 --go**（不会去动系统设备状态）"),
+        (re.search(r"exit\s*/b\s+0", code, re.I) is not None,
+         "④ 跑完是正常退出（不是「装完就静默结束」）"),
+        ("takeover_hid_reports.py" in text,
+         "④ 给出了历史取证的只读去处（别让人绕过它去直接跑 --go）"),
+    ]
+
+
 def main() -> int:
     src = open(SRC, encoding="utf-8").read()
     checks = audit(src)
 
     ok = True
     print("=" * 74)
-    print(" 闸：接管 0x1812 —— 默认不动 / 目标对 / 恢复有保证")
+    print(" 闸：接管 0x1812 —— 默认不动 / 目标对 / 恢复有保证 / 一键入口已退役")
     print("=" * 74)
     for good, name in checks:
+        print(f"  {'✅' if good else '❌'} {name}")
+        if not good:
+            ok = False
+
+    # ── ④ 一键入口已退役 ──────────────────────────────────────────
+    # ⚠ 编码走 _bat.read：这个 bat 2026-09-29 从 UTF-8 转成了 GBK
+    #   （配套 chcp 936，为的是绕开 cmd.exe 在 chcp 65001 下读批处理文件
+    #   会按字节偏移错位的毛病）。写死 utf-8 会解出乱码、判据全变成
+    #   "找不到那句话"，而报出来的结论会指向完全错误的地方。
+    bat = _bat.read(BAT)
+    bat_checks = audit_bat(bat)
+    for good, name in bat_checks:
         print(f"  {'✅' if good else '❌'} {name}")
         if not good:
             ok = False
@@ -194,7 +249,30 @@ def main() -> int:
         print("  ❌ 反例：去掉默认只读居然全绿 —— 这道闸没用")
         ok = False
 
-    if n_fail < 2:
+    # 反例：把一键入口改回老样子（提权 + taskkill + --go）必须报红
+    old_bat = (
+        "@echo off\n"
+        "chcp 65001 >nul\n"
+        "title 0x1812 takeover test\n"
+        'cd /d "%~dp0"\n'
+        "net session >nul 2>&1\n"
+        "if not errorlevel 1 goto elevated\n"
+        'powershell -NoProfile -Command "Start-Process -FilePath \'%~f0\' -Verb RunAs"\n'
+        "exit /b\n"
+        ":elevated\n"
+        "taskkill /F /IM RemoteVoiceBridge.exe >nul 2>&1\n"
+        '"%PY%" "tools\\takeover_hid_reports.py" --go --seconds 60\n'
+        "pause\n"
+    )
+    bad3 = [g for g, _ in audit_bat(old_bat) if not g]
+    if bad3:
+        n_fail += 1
+        print(f"  ✅ 反例：一键入口改回「提权 + taskkill + --go」→ 报了 {len(bad3)} 项红")
+    else:
+        print("  ❌ 反例：老的一键入口居然全绿 —— ④ 那几条没用")
+        ok = False
+
+    if n_fail < 3:
         ok = False
 
     print()

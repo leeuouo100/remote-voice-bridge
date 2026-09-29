@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import os
 import shutil
@@ -47,6 +48,7 @@ import console_server  # noqa: E402
 
 FAILS: list[str] = []
 PORT = 0
+_OPENER = None      # 带 CookieJar 的"浏览器会话"，在 main 里建
 
 
 def check(cond, msg):
@@ -55,30 +57,73 @@ def check(cond, msg):
     return bool(cond)
 
 
-def req(path, method="GET", body=None):
+def req(path, method="GET", body=None, opener=None):
+    """带 Cookie 的请求 —— 控制台令牌是随页面 `Set-Cookie` 下发的（P1-1）。
+
+    ⚠ 不要图省事直接读 `console_server.console_token()` 塞进请求头：
+      那样测的就不是「真实浏览器能不能用」，而是「进程内能不能作弊」。
+      这里用真正的 CookieJar，跟浏览器走同一条路。
+    """
     url = f"http://127.0.0.1:{PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method,
                                headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=10) as resp:
+    with (opener or _OPENER).open(r, timeout=10) as resp:
         raw = resp.read()
         ctype = resp.headers.get("Content-Type", "")
         return (json.loads(raw.decode("utf-8")) if "json" in ctype
                 else raw.decode("utf-8")), resp.status
 
 
+def _make_opener():
+    """一个新的「浏览器会话」：自带 CookieJar。"""
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+
+def raw_get(path, opener=None):
+    """返回 (状态码, 响应头, 正文)。用来验**响应头本身**
+    （令牌 Cookie 的属性、CSP、nosniff）—— 那些 `req` 拿不到。"""
+    r = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", method="GET")
+    with (opener or _OPENER).open(r, timeout=10) as resp:
+        return resp.status, resp.headers, resp.read()
+
+
 def main() -> int:
-    global PORT
+    global PORT, _OPENER
     try:
         srv = console_server.ensure_started(0)
     except OSError as e:
         print(f"SKIPPED (端口不可用：{e})")
         return 0
     PORT = srv.port
+    _OPENER = _make_opener()
     print(f"[smoke] 控制台端口 {PORT}　沙箱配置目录 {_SANDBOX}")
 
     try:
-        # ── 1. 静态资源 ──
+        # ── 0. 鉴权：没有令牌必须打不进来（P1-1）─────────────────────────────
+        # 控制台以前**完全无鉴权** —— 同机任意进程、浏览器里任意网页都能直接
+        # POST /api/config。这里用**全新会话**（不带 Cookie）验它真的被挡住了。
+        anon = _make_opener()
+        for meth, path, b in (("GET", "/api/state", None),
+                              ("GET", "/api/log", None),
+                              ("POST", "/api/config", {"gain": 3.0}),
+                              ("POST", "/api/reconnect", {})):
+            try:
+                req(path, meth, b, opener=anon)
+                FAILS.append(f"无令牌的 {meth} {path} 本应被拒，却成功了")
+            except urllib.error.HTTPError as e:
+                check(e.code == 401, f"无令牌 {meth} {path} 应返回 401，实际 {e.code}")
+
+        # ── 1. 静态资源 ──（第一次请求顺带把令牌 Cookie 拿回来）
+        _, hdrs, _ = raw_get("/", opener=_make_opener())
+        sc = hdrs.get("Set-Cookie", "")
+        # 令牌必须走 HttpOnly Cookie 下发：脚本读不到它，XSS 也偷不走；
+        # SameSite=Strict 让跨站请求根本带不上它。
+        check("rvb_token=" in sc, f"GET / 没有下发令牌 Cookie（实际 {sc!r}）")
+        check("HttpOnly" in sc, f"令牌 Cookie 缺 HttpOnly（实际 {sc!r}）")
+        check("SameSite=Strict" in sc, f"令牌 Cookie 缺 SameSite=Strict（实际 {sc!r}）")
+
         html, code = req("/")
         check(code == 200, "GET / 未返回 200")
         check("语音触发键" in html and "混合输出" in html,

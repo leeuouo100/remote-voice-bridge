@@ -4,7 +4,7 @@
 为什么要有这个脚本：版本号散在两个文件里，改一个忘一个，结果就是
 "代码是 1.0.2、装出来的安装包标题还写着 1.0.1" —— 而这种错误只有在
 别人装完点开「设置 → 关于」才会发现，那时候 tag 已经推出去了，只能重新发版。
-CI 也会跑同样的一致性校验（见 .github/workflows/build-installer.yml）。
+CI 也会跑同样的一致性校验（见 .github/workflows/ci.yml 的 checks job）。
 
 用法： python tools/check_version.py
 输出： OK 1.0.2   /   不一致时非零退出

@@ -60,6 +60,12 @@ Source: "dist\RemoteVoiceBridge\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignor
 Source: "dist\RemoteVoiceBridge\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; 配对修复入口（内容会自己认出"旁边是 exe"并走 exe，不需要 Python）
 Source: "{#MyFixBatName}"; DestDir: "{app}"; Flags: ignoreversion
+; 许可证与第三方声明（2026-09-29 审查报告第六节 9）。
+; 安装包里分发着十几个第三方包（winrt / numpy / Pillow / pystray / frida …），
+; 其中 pystray 是 LGPL-3.0、frida 是 wxWindows —— 都要求"随分发附上许可证"。
+; 装进 {app}\licenses\ 而不是散在根目录：卸载时也好一起删。
+Source: "LICENSE"; DestDir: "{app}\licenses"; DestName: "LICENSE-RemoteVoiceBridge.txt"; Flags: ignoreversion
+Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

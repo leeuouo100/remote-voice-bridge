@@ -1,0 +1,367 @@
+name: CI
+
+# 三件事，拆成三个 job（2026-09-29 审查报告 P1-10）：
+#   ① checks  —— 每个 PR / main push / tag 都跑**同一份闸门清单**
+#                 （tools/check_all.py --ci），必需项 SKIP 视为失败
+#   ② build   —— 只有 ① 全绿才构建；构建完**真跑一遍产物**再上传 artifact
+#   ③ release —— 只消费 ② 传上来的那个 artifact，且**显式 draft**
+#
+# 为什么这么拆（老工作流 `build-installer.yml` 的三个洞）：
+#   · 只在 tag / workflow_dispatch 触发 ⇒ **PR 根本不跑**，回归要到发版那一刻才发现；
+#   · 闸门是"手动挑十来道列一遍"⇒ 和本地 check_all 两份清单各自漂，
+#     "本地绿、CI 不跑"的东西发出去没人验；
+#   · 构建和发布挤在同一个 job 里 ⇒ 发布用的包是**又构建了一次**的，
+#     和"验过的那个包"不是同一个文件（PyInstaller 产物每次都不完全一样）；
+#   · `softprops/action-gh-release` 没写 `draft` ⇒ 依赖 Action 的默认值。
+#     v1.0.21 事实上就是**直接公开**发布的，而 README 声称默认 Draft。
+#
+# ── 供应链（2026-09-29 审查报告 P2-7）──────────────────────────────────────
+# 三件事，都在这个文件里：
+#   · **Action 全部钉 commit SHA**（不是 `@v4`）。`@v4` 是**可变引用** ——
+#     上游把 v4 指向一个新 commit，我们下次构建就跑的是**没审过的新代码**，
+#     而且这件事在 diff 里看不见（文件一个字节都没变）。行尾注释写清对应版本，
+#     便于升级时对照。判据见 tools/check_ci_workflow.py 的 D 组。
+#   · **依赖装锁文件**：`pip install --require-hashes -r requirements.lock.txt`。
+#     传递依赖（altgraph/pefile/cffi/six/setuptools…）不锁的话，
+#     同一份代码在不同时间构建出的产物**不一样** —— 而按键旁路依赖的
+#     frida 原生扩展一变，表现就是"语音正常、按键全不灵"的静默故障。
+#     哈希对不上就装不上、构建当场失败，而不是产出一个没人验过的包。
+#   · **SBOM + 构建证明**：`sbom.cdx.json`（CycloneDX，列出所有组件及版本）
+#     随 Release 一起发；`attest-build-provenance` 给安装包签一份
+#     可验证的"这个文件是在本仓库的这次 workflow 里构建出来的"。
+#
+# ⚠ **Authenticode 代码签名：目前没有证书，处于待命状态。**
+#   见下面 build job 里那两个 sign 步骤。没有签名的后果是实打实的：
+#   SmartScreen 会拦"未知发布者"、企业环境可能直接禁止安装。
+#   要启用：把 PFX 的 base64 存进仓库 Secret `SIGN_PFX_B64`，
+#   再把口令存进 `SIGN_PFX_PASSWORD` —— 步骤会自动开始签。
+#   没配的时候**明确打印"本次产物未签名"**，不许静默跳过：
+#   静默跳过会让"以为签了"变成默认认知，而下载页面上可能写着"已签名"。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 默认只读；只有 release job 单独提权到 contents: write。
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# 这些自检脚本有中文输出（"OK 32 个目标动作 / ..."），而 windows-latest 上
+# Python 的 stdout 默认跟随系统代码页 cp1252 —— print 中文会直接抛
+# UnicodeEncodeError，把构建挂在一行和业务逻辑毫无关系的 print 上。
+# 脚本内部也各自钉了编码（tools/_utf8.py），这里是兜底。
+env:
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  # ── ① 闸门：一份清单，PR / main / tag 都跑 ────────────────────────────────
+  checks:
+    name: 闸门（安全集）
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: '3.11'
+
+      # ⚠ 装的是**锁文件**（带 SHA-256），不是 requirements.txt —— 见文件头。
+      - name: Install dependencies (hash-locked)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock.txt
+
+      # 真实浏览器那道 XSS 闸要 playwright 的 chromium。**装**它，而不是让那道闸
+      # SKIP —— 「必需项 SKIP 视为失败」这条正是 P1-10 的整改要求：
+      # 靠 SKIP 混过去的闸，等于把 XSS 的验证悄悄省掉。
+      - name: Install playwright (real-browser XSS gate)
+        run: |
+          npm install -g playwright
+          npx --yes playwright install chromium
+
+      # 版本号只在 config.py 里写一次，tag 触发时校验两者一致。
+      # 不校验的话会出"tag 是 v1.0.3、装出来还显示 1.0.2"这种需要重新发版才能修的事故。
+      #
+      # ⚠ 校验**只在 tag 触发时**做。`workflow_dispatch` 手动跑的是分支
+      #   （`github.ref_name` 形如 `main`），拿它当版本号比永远不可能相等 ——
+      #   之前没分这个岔，导致工作流虽然声明了 `workflow_dispatch`，
+      #   手动触发却必定在第一步抛异常，等于这个入口是死的。
+      - name: Resolve & verify version
+        id: ver
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $line = Select-String -Path config.py -Pattern '^APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw "config.py 里找不到 APP_VERSION" }
+          $appVer = $line.Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tagVer = $ref.TrimStart('v')
+            Write-Host "tag=$tagVer   config.APP_VERSION=$appVer"
+            if ($tagVer -ne $appVer) {
+              throw "版本号不一致：tag=$tagVer，但 config.py APP_VERSION=$appVer。请先把 config.py 改成 $tagVer 再打 tag。"
+            }
+          } else {
+            Write-Host "非 tag 触发（ref_type=${{ github.ref_type }}，ref=$ref）—— 以 config.py 为准：$appVer"
+          }
+          "version=$appVer" >> $env:GITHUB_OUTPUT
+
+      # 只有**一份**闸门清单（tools/check_all.py 的 STEPS）。`--ci` 把需要真机 /
+      # 交互桌面的那几道显式摘掉并在结尾点名；其余全部必跑，且必需项 SKIP 一律算失败。
+      # 结果同时写进 GITHUB_STEP_SUMMARY（PR 页面上一眼能看）。
+      - name: Run all safe gates
+        run: python tools/check_all.py --ci
+
+  # ── ② 构建：闸门全绿才构建，构建完**真跑一遍产物** ─────────────────────────
+  build:
+    name: 构建安装包
+    needs: checks
+    runs-on: windows-latest
+    # `id-token` + `attestations` 是给"构建证明"用的（P2-7）——
+    # 只在这个 job 开，别的地方仍然只有读权限。
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (hash-locked)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock.txt
+
+      # ── SBOM（CycloneDX）──────────────────────────────────────────────────
+      # 装什么就报什么：`environment` 子命令读的是**当前环境**，
+      # 也就是上面刚按锁文件装出来的那一套 —— 所以 SBOM 里的版本
+      # 与真正打进包里的版本是同一个来源，不是另抄一份清单。
+      # 顺带用 `--validate` 把 json 真解析一遍：一个语法都不对的 SBOM
+      # 上传上去比没有更糟（看起来"有了"）。
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          pip install cyclonedx-bom==7.4.0
+          cyclonedx-py environment --output-format JSON --output-file sbom.cdx.json
+          python -c "import json;d=json.load(open('sbom.cdx.json',encoding='utf-8'));n=len(d.get('components') or []);assert n>10, f'SBOM 只列出 {n} 个组件，明显不对';print(f'SBOM OK：{n} 个组件')"
+
+      # ── 代码签名（Authenticode）—— 先看有没有证书 ──────────────────────
+      # ⚠ 这一步**不签名**，只判断"能不能签"，并把结论写进 job 摘要。
+      #   为什么单独一步：`if` 里读不到同一步自己定义的 env，
+      #   所以要先把结论落成 step output，后面的 sign 步骤再看它。
+      #   没有证书时**必须打印**——静默跳过会让"以为签了"成为默认认知。
+      - name: Check code-signing certificate
+        id: sign
+        shell: pwsh
+        env:
+          SIGN_PFX_B64: ${{ secrets.SIGN_PFX_B64 }}
+        run: |
+          if ($env:SIGN_PFX_B64) {
+            Write-Host "✅ 检测到签名证书（Secret SIGN_PFX_B64）→ 本次产物将做 Authenticode 签名"
+            "available=true" >> $env:GITHUB_OUTPUT
+            "### 代码签名`n`n已配置证书，产物会做 Authenticode 签名。" >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            Write-Host "::warning::本次产物**未签名**（Authenticode）：仓库里没有配置代码签名证书（Secret SIGN_PFX_B64）。SmartScreen 会拦「未知发布者」。"
+            "available=false" >> $env:GITHUB_OUTPUT
+            "### 代码签名`n`n**未签名** —— 没有配置 Secret SIGN_PFX_B64。" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Export signing certificate
+        if: steps.sign.outputs.available == 'true'
+        shell: pwsh
+        env:
+          SIGN_PFX_B64: ${{ secrets.SIGN_PFX_B64 }}
+        run: |
+          $bytes = [Convert]::FromBase64String($env:SIGN_PFX_B64)
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\signing.pfx", $bytes)
+          Write-Host "证书已落到 $env:RUNNER_TEMP\signing.pfx"
+
+      - name: Build with PyInstaller
+        run: pyinstaller remote-voice-bridge.spec --noconfirm
+
+      # ⚠ 顺序要紧：Inno Setup 在编译时就把 dist 里的 exe **压进安装包**了，
+      #   所以必须**先签里面的 exe、再跑 ISCC** —— 反过来签，装到用户机器上
+      #   的还是那批没签名的文件（安装包本身签了名，里面却没签）。
+      - name: Sign bundled executables
+        if: steps.sign.outputs.available == 'true'
+        shell: pwsh
+        env:
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                       Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $signtool) { throw "找不到 signtool.exe（Windows SDK 没装？）" }
+          $n = 0
+          Get-ChildItem "dist\RemoteVoiceBridge\*.exe" | ForEach-Object {
+            & $signtool sign /f "$env:RUNNER_TEMP\signing.pfx" /p $env:SIGN_PFX_PASSWORD `
+              /fd sha256 /tr http://timestamp.digicert.com /td sha256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "签名失败：$($_.Name)" }
+            $n++
+          }
+          if ($n -eq 0) { throw "dist 里一个 exe 都没有 —— 构建明显没成功" }
+          Write-Host "✅ 已签名 $n 个 exe"
+
+      # ── 构建后真验证：这个包**里面**到底有什么 ──────────────────────────
+      # 为什么必须真跑一次：PyInstaller 在 INFO 级别**只记录入口脚本**
+      # （日志里有 `Analyzing …\tray_app.py` / `…\tools\diag_remote.py`），
+      # 普通被 import 的模块在日志里一个字都没有 —— 光看日志分不清
+      # "打进去了"和"漏了"。而漏掉的表现全在**用户侧**：
+      # 诊断报告里少掉【结论 0】，或直接提示"本版本没带上 hidinfo 模块"。
+      # v1.0.5 就栽在这个盲区：诊断工具压根没进安装包，CI 却全绿。
+      # 所以这里把打好的 exe 真的跑起来，用它自己的输出当证据。
+      - name: Verify packaged bundle
+        shell: pwsh
+        run: |
+          $dir  = "dist\RemoteVoiceBridge"
+          $diag = "$dir\RemoteVoiceBridgeDiag.exe"
+          $main = "$dir\RemoteVoiceBridge.exe"
+          if (-not (Test-Path $diag)) { throw "诊断 EXE 没打出来：$diag" }
+          if (-not (Test-Path $main)) { throw "主程序没打出来：$main" }
+
+          # ① --hid：不按任何键、也不依赖插着真遥控器，适合 CI。
+          #    退出码 1 表示"本机没查到 HID 集合"，runner 上可能发生 ——
+          #    我们要验的是**代码在不在包里**，所以看输出内容，不看退出码。
+          $hid = & $diag --hid 2>&1 | Out-String
+          $global:LASTEXITCODE = 0          # 见下方说明，必须清零
+          if ($hid -match '本版本没带上') { throw "包里的诊断工具缺少 hidinfo 模块" }
+          if ($hid -notmatch '结论 0')     { throw "诊断工具没输出【结论 0】（hidinfo 没跑起来）" }
+
+          # ② --selftest：报告生成器自检，不需要真机。
+          #    它一次验到**两个**新模块 —— 报告里的【结论 0】要 hidinfo，
+          #    【结论 4】要 hidwatch，少任何一个对应断言必失败。
+          #    所以这一步同时证明"hidinfo 和 hidwatch 都进了包"。
+          $st = & $diag --selftest 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $st
+          # GitHub Actions 的 pwsh 会在步骤末尾 `exit $LASTEXITCODE`，
+          # 不清零的话上面那个"退出码 1"会把整个构建判失败。
+          $global:LASTEXITCODE = 0
+          if ($code -ne 0) { throw "打包版 --selftest 失败（退出码 $code）" }
+          if ($st -notmatch 'DIAG SELFTEST OK') { throw "打包版 --selftest 没打印 OK" }
+
+          # ③ 按键旁路（v1.0.20）：真机上**唯一**能拿到遥控器按键的那一路。
+          #    它的失效是静默的 —— 现象是「语音完全正常、除语音键外的按键一个都不灵」，
+          #    用户只会觉得"按键又坏了"，而日志里就一行 warning。
+          #    所以这里不看日志、直接证明**产物里真有它**：
+          #      · frida_tap.js        Frida 脚本本体（spec 的 tap_datas 收的）
+          #      · frida 原生扩展      没有它 frida_hid 会优雅降级成空转
+          #    递归找，不写死 `_internal` 这一层（PyInstaller 的 onedir 布局会变）。
+          $tap = @(Get-ChildItem -Path $dir -Recurse -Filter 'frida_tap.js' -ErrorAction SilentlyContinue)
+          if ($tap.Count -eq 0) {
+            throw "包里没有 frida_tap.js —— 按键旁路会静默失效（语音仍正常、按键全不灵）"
+          }
+          $core = @(Get-ChildItem -Path $dir -Recurse -Filter '_frida*.pyd' -ErrorAction SilentlyContinue)
+          if ($core.Count -eq 0) {
+            throw "包里没有 frida 原生扩展（_frida*.pyd）—— frida_hid 会降级成空转，按键不生效"
+          }
+
+          Write-Host "✅ 打包产物已验证：hidinfo + hidwatch 都在包里，--hid / --selftest 都能跑"
+          Write-Host "✅ 按键旁路已进包：$($tap[0].FullName)"
+          Write-Host "✅ frida 原生扩展已进包：$($core[0].FullName)"
+
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not found, installing..."
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          Write-Host "Using ISCC: $iscc"
+          & $iscc "/DMyAppVersion=${{ needs.checks.outputs.version }}" "installer.iss"
+
+      - name: Sign installer
+        if: steps.sign.outputs.available == 'true'
+        shell: pwsh
+        env:
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                       Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $signtool) { throw "找不到 signtool.exe（Windows SDK 没装？）" }
+          $setup = Get-ChildItem "installer\*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "installer 目录里没有 exe" }
+          & $signtool sign /f "$env:RUNNER_TEMP\signing.pfx" /p $env:SIGN_PFX_PASSWORD `
+            /fd sha256 /tr http://timestamp.digicert.com /td sha256 $setup.FullName
+          if ($LASTEXITCODE -ne 0) { throw "安装包签名失败" }
+          Write-Host "✅ 安装包已签名：$($setup.Name)"
+
+      # 这个 artifact 是**后面发布 job 唯一消费的东西** ——
+      # 发布不再自己构建一遍，"验过的"和"发出去的"因此是同一个文件。
+      - name: Upload tested installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: RemoteVoiceBridge-Setup
+          path: installer/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 构建证明（P2-7）────────────────────────────────────────────────
+      # 给安装包签一份**可验证的**声明：这个文件是在本仓库的这次 workflow 里
+      # 构建出来的。用户可以用 `gh attestation verify <file> --repo <owner/repo>`
+      # 自己验 —— 这是"下载页上的 exe 到底是不是你构建的"唯一能自证的东西。
+      # ⚠ 它**不替代** Authenticode：前者证明"从哪来"，后者证明"发布者是谁"。
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be   # v2.4.0
+        with:
+          subject-path: installer/*.exe
+
+  # ── ③ 发布：只消费 ② 的 artifact，且显式草稿 ──────────────────────────────
+  release:
+    name: 发布（草稿，待人工确认）
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # 只有这一步需要写权限
+    steps:
+      - name: Download the tested installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
+        with:
+          name: RemoteVoiceBridge-Setup
+          path: installer
+
+      - name: Download the SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
+        with:
+          name: sbom
+          path: .
+
+      - name: Show what will be published
+        run: ls -l installer/ sbom.cdx.json
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65   # v2.6.2
+        with:
+          # SBOM 与安装包一起发 —— 用户拿到的是一份"装了什么"的清单，
+          # 而不是只能相信我们的说明文字。
+          files: |
+            installer/*.exe
+            sbom.cdx.json
+          generate_release_notes: true
+          # ⚠ **显式**草稿，不依赖 Action 的默认值（P1-10）。
+          # README 声称"默认 Draft"，而 v1.0.21 事实上是直接公开发布的 ——
+          # 就是因为这里没写，靠了默认值。
+          draft: true
+          prerelease: false

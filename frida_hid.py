@@ -36,9 +36,13 @@ BLE HID（HOGP）在 Windows 上是 UMDF 驱动，跑在 WUDFHost.exe 里；它�
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
+
+import logsetup
 
 logger = logging.getLogger("rvb.frida")
 
@@ -142,21 +146,73 @@ def block_usages_for(keymap: dict | None) -> tuple[list[int], list[int]]:
 
 
 # ── 定位遥控器的 HID 驱动宿主（WUDFHost.exe）─────────────────────────
+#
+# ⚠ 本机实测的节点名长这样（2026-09-29，只读查注册表得来）：
+#   {00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&0218d1_PID&9450_REV&011b_f196a263671c
+#     ├─ 服务 UUID（0x1812 = HID over GATT）
+#     ├─ VID 段带两位前缀（`02` + `18d1`）⇒ 要比对**后 4 位**
+#     └─ 末尾是**远端 MAC**（f196a263671c）—— 比 VID/PID 更硬的"就是这台"
+#   而且**只有 0x1812 那个服务节点**带 `Device Parameters\WUDFDiagnosticInfo\HostPid`，
+#   别的服务（1800/1801/180a/…）没有 ⇒ 靠它就能唯一确定驱动宿主。
 _BTHLE_ENUM = r"SYSTEM\CurrentControlSet\Enum\BTHLEDevice"
 _HID_SVC_PREFIX = "{00001812-0000-1000-8000-00805f9b34fb}"
 _WUDF_DIAG = r"Device Parameters\WUDFDiagnosticInfo"
 READ_IOCTL = 0x80018483
 
+_VIDPID_RE = re.compile(r"vid&([0-9a-f]+)_pid&([0-9a-f]+)", re.I)
 
-def hid_devices(vid: str = "18D1", pid: str = "9450", any_hid: bool = False):
-    """[(HostPid, 服务节点名)] —— BLE HID（0x1812）设备所在的驱动宿主。
 
-    节点名里带着**这台设备是谁**（`..._Dev_VID&0218d1_PID&9450_...`），
-    顺手返回出去，日志里就能写清"挂上的是哪台设备"。
-    any_hid=True：不挑 VID/PID，任何 BLE HID 设备都要（兼容款兜底）。
+@dataclass(frozen=True)
+class HidHost:
+    """一台 BLE HID（0x1812）设备所在的驱动宿主 —— 一条**可核对**的身份。"""
+
+    host_pid: int
+    svc: str          # 服务节点名（含 UUID / VID / PID / MAC）
+    instance: str     # 该服务节点下的设备实例键
+    vid: str          # 解析出来的 VID（小写 4 位）
+    dev_pid: str      # 解析出来的 PID（小写 4 位）
+
+    @property
+    def key(self) -> str:
+        """注册表里的完整实例路径（日志/核对用）。"""
+        return f"{self.svc}\\{self.instance}"
+
+    @property
+    def mac(self) -> str | None:
+        """节点名末尾的远端 MAC（12 位小写 hex），解析不出返回 None。"""
+        m = re.search(r"_([0-9a-f]{12})$", self.svc, re.I)
+        return m.group(1).lower() if m else None
+
+    def matches(self, vid: str, pid: str) -> bool:
+        return (self.vid == str(vid).lower()[-4:]
+                and self.dev_pid == str(pid).lower()[-4:])
+
+
+def _parse_vidpid(name: str) -> tuple[str, str] | None:
+    """从 BTHLEDevice 服务节点名里抠出 (VID, PID)，各取后 4 位小写。
+
+    ⚠ 不能再用老写法的 `vid.lower() in name.lower()`（子串判断）：
+    节点名里还有 REV / 序列号 / MAC 等段，短 VID 会在别处偶然命中 ——
+    所谓"精确匹配"其实是在撞运气（2026-09-29 审查报告 P1-8）。
+    另外 Windows 的 VID 段带两位前缀（`VID&0218d1`），必须取后 4 位。
+    """
+    m = _VIDPID_RE.search(name or "")
+    if not m:
+        return None
+    return (m.group(1).lower()[-4:], m.group(2).lower()[-4:])
+
+
+def hid_hosts(vid: str = "18D1", pid: str = "9450",
+              any_hid: bool = False) -> list[HidHost]:
+    """所有 BLE HID（0x1812）设备所在的驱动宿主。
+
+    `any_hid=True`：不挑 VID/PID，任何 BLE HID 设备都要 —— 这是**兼容款兜底**，
+    默认关。为什么默认关（P1-8）：同一个 WUDFHost 里可能还服务别的蓝牙键鼠，
+    "猜第一项"等于可能去抄/改写**别人**的报告。
     """
     import winreg
-    out: list[tuple[int, str]] = []
+    out: list[HidHost] = []
+    want = (str(vid).lower()[-4:], str(pid).lower()[-4:])
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _BTHLE_ENUM) as root:
             i = 0
@@ -166,10 +222,10 @@ def hid_devices(vid: str = "18D1", pid: str = "9450", any_hid: bool = False):
                 except OSError:
                     break
                 i += 1
-                low = svc.casefold()
-                if not low.startswith(_HID_SVC_PREFIX.casefold()):
+                if not svc.casefold().startswith(_HID_SVC_PREFIX.casefold()):
                     continue
-                if not any_hid and (vid.lower() not in low or pid.lower() not in low):
+                parsed = _parse_vidpid(svc)
+                if not any_hid and parsed != want:
                     continue
                 with winreg.OpenKey(root, svc) as sk:
                     j = 0
@@ -182,20 +238,93 @@ def hid_devices(vid: str = "18D1", pid: str = "9450", any_hid: bool = False):
                         try:
                             with winreg.OpenKey(
                                     root, f"{svc}\\{inst}\\{_WUDF_DIAG}") as dk:
-                                out.append((int(winreg.QueryValueEx(dk, "HostPid")[0]),
-                                            svc))
+                                host_pid = int(winreg.QueryValueEx(dk, "HostPid")[0])
                         except (OSError, TypeError, ValueError):
                             continue
+                        v, p = parsed if parsed else ("", "")
+                        out.append(HidHost(host_pid=host_pid, svc=svc,
+                                           instance=inst, vid=v, dev_pid=p))
     except OSError:
         pass
     return out
 
 
+def hid_devices(vid: str = "18D1", pid: str = "9450", any_hid: bool = False):
+    """[(HostPid, 服务节点名)] —— 兼容老调用方的薄封装。"""
+    return [(h.host_pid, h.svc) for h in hid_hosts(vid, pid, any_hid)]
+
+
 def find_wudfhost_pid(vid: str = "18D1", pid: str = "9450",
                       any_hid: bool = False) -> int | None:
     """遥控器 HID 服务（0x1812）所在 WUDFHost 进程的 PID（找不到返回 None）。"""
-    devs = hid_devices(vid, pid, any_hid)
-    return devs[0][0] if devs else None
+    hosts = hid_hosts(vid, pid, any_hid)
+    return hosts[0].host_pid if hosts else None
+
+
+def process_image_path(pid: int) -> str | None:
+    """进程映像的完整路径（读不到返回 None）。
+
+    ⚠ 注入之前一定要看这一眼：**PID 会被回收**。我们从注册表读到的 HostPid，
+    可能在"读到"和"attach"之间那个进程已经退出、PID 被系统分配给了别人 ——
+    只看 PID 就 attach，等于把脚本注进一个**不相干**的进程。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x1000, False, int(pid))    # QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = wintypes.DWORD(len(buf))
+            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return None
+            return buf.value or None
+        finally:
+            k32.CloseHandle(h)
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def is_wudfhost(pid: int) -> bool:
+    """这个 PID 到底是不是系统的 WUDFHost.exe（P1-8 的"身份校验"）。
+
+    ⚠ 为什么要查这一眼：**PID 会被回收**。我们从注册表读到的 HostPid，可能在
+      "读到"和"attach"之间那个进程已经退出、PID 被系统分配给了别人 ——
+      只看 PID 就 attach，等于把脚本注进一个**不相干**的进程。
+
+    分三层，能查多严就查多严（两层都查不动时**放行**并留痕）：
+      ① 直接读进程映像路径（要提权；非管理员时 `OpenProcess` 会给
+         `ERROR_ACCESS_DENIED`）。读到了就必须是 `\\System32\\WUDFHost.exe`。
+      ② 退一步问 `tasklist` 要 WUDFHost 的 PID 清单，我们那个必须在里面。
+      ③ 都拿不到 → 放行。判 False 会让按键旁路**永远挂不上**，
+         代价远大于"极低概率的 PID 复用"。
+    """
+    p = process_image_path(pid)
+    if p:
+        return p.replace("/", "\\").casefold().endswith("\\system32\\wudfhost.exe")
+    known = wudfhost_pids()
+    if known:
+        return int(pid) in known
+    return True
+
+
+def identity_note(pid: int) -> str:
+    """给日志用：这次身份是怎么核实的（或为什么没核实成）。"""
+    p = process_image_path(pid)
+    if p:
+        return f"映像 {p}"
+    known = wudfhost_pids()
+    if known:
+        return f"tasklist 里 {len(known)} 个 WUDFHost 之一"
+    return "⚠ 无法核实身份（读不到映像路径、tasklist 也没输出）"
 
 
 def wudfhost_pids() -> list[int]:
@@ -228,6 +357,35 @@ def wudfhost_pids() -> list[int]:
     return pids
 
 
+# ── 当前在跑的那一个旁路（供控制台「保存后等确认」用）───────────────────
+#
+# 为什么需要它：屏蔽表的下发是**异步**的，而 JS 侧是「按这张表把报告里的
+# usage 原地写 0」。控制台保存完就回「已生效」的话，用户可能立刻按一个键，
+# 而钩子还在用旧表 —— 看到的是"改了没用"。所以控制台要能拿到在跑的那个
+# 实例、等它确认（2026-09-29 审查报告 P1-6）。
+_ACTIVE: "RemoteHidTap | None" = None
+_ACTIVE_LOCK = threading.Lock()
+
+
+def active_tap() -> "RemoteHidTap | None":
+    """当前在跑的按键旁路（没有则 None）。"""
+    with _ACTIVE_LOCK:
+        return _ACTIVE
+
+
+def push_mapping(mapping: dict | None, wait: bool = False,
+                 timeout: float = 1.5) -> bool:
+    """把新的屏蔽表下发给**当前在跑**的旁路；返回「钩子确认收到了」。
+
+    没有旁路在跑时返回 True —— 没什么要确认的，**别**让控制台把
+    「没装 frida / 旁路没起来」报成「保存失败」：那会把用户支去查配置。
+    """
+    tap = active_tap()
+    if tap is None:
+        return True
+    return tap.set_mapping(mapping, wait=wait, timeout=timeout)
+
+
 class RemoteHidTap(threading.Thread):
     """后台线程：注入 WUDFHost → 收报告 → 解 usage → 回调 on_button(btn, down)。
 
@@ -235,11 +393,20 @@ class RemoteHidTap(threading.Thread):
     所以 main.py 里两条路喂的是同一个回调、同一张映射表。
     """
 
-    def __init__(self, on_button, vidpid: tuple[str, str] = ("18D1", "9450")) -> None:
+    def __init__(self, on_button, vidpid: tuple[str, str] = ("18D1", "9450"),
+                 *, allow_any_hid: bool = False,
+                 expect_mac: str | None = None) -> None:
         super().__init__(daemon=True, name="frida-hid-tap")
         self._on = on_button
         self.vidpid = vidpid
-        self._stop = threading.Event()
+        # ⚠ 默认**不许**回退到"任意 BLE HID 的第一项"（审查报告 P1-8）：
+        #   同一个 WUDFHost 里可能还服务别的蓝牙键鼠，猜第一项 = 可能去
+        #   抄/改写**别人**的报告。兼容款要显式打开（config: hid_frida_any_hid）。
+        self.allow_any_hid = bool(allow_any_hid)
+        # 远端 MAC（12 位小写 hex）。有它就要求节点名里**必须**出现 ——
+        # 这比 VID/PID 硬：同型号的第二只遥控器 VID/PID 完全一样。
+        self.expect_mac = (expect_mac or "").lower() or None
+        self._stopped = threading.Event()
         self._script = None
         self._session = None
         self._attached_pid: int | None = None
@@ -254,23 +421,78 @@ class RemoteHidTap(threading.Thread):
         self.reports = 0
         self._compat = False
         self._av_hinted = False
+        self._target_handle = ""      # 钩子确认锁定的 FileHandle（P1-8）
         self._lock = threading.Lock()
+        # ── 屏蔽表的「序号 + 确认」（P1-6）─────────────────────────────
+        # 用一把**独立的**锁：确认回调和 set_mapping 都在等/放它，
+        # 和 _lock（只保护 _mapping 快照）分开，免得互相等出死锁。
+        self._ack_lock = threading.Lock()
+        self._ack_event = threading.Event()
+        self._ack_seq = 0            # 已下发的最大序号
+        self._acked_seq = -1         # 钩子已确认的最大序号
 
     # ── 对外 ─────────────────────────────────────────────────────────
-    def set_mapping(self, mapping: dict | None) -> None:
-        """更新 keymap，并把「要抹掉原生动作的 usage」下发给钩子。"""
+    def set_mapping(self, mapping: dict | None, wait: bool = False,
+                    timeout: float = 1.5) -> bool:
+        """更新 keymap，并把「要抹掉原生动作的 usage」下发给钩子。
+
+        `wait=True`：等到钩子回 ack 再返回；返回"是否真的等到了"。
+        没挂上脚本时返回 False（＝没有钩子可以确认，调用方据此如实说话）。
+        """
         with self._lock:
             self._mapping = dict(mapping or {})
         cc, vp = block_usages_for(self._mapping)
-        if self._script:
-            try:
-                self._script.post({"type": "block", "cc": cc, "vendor": vp})
-            except Exception:                          # noqa: BLE001
-                pass
+
+        script = self._script
+        if script is None:
+            # 还没挂上：表已经记住了，run() 挂上时会自己下发一次。
+            return False
+
+        with self._ack_lock:
+            self._ack_seq += 1
+            seq = self._ack_seq
+            self._ack_event.clear()
+        try:
+            script.post({"type": "block", "cc": cc, "vendor": vp, "seq": seq})
+        except Exception:                              # noqa: BLE001
+            return False
+        if not wait:
+            return True
+        self._ack_event.wait(timeout)
+        with self._ack_lock:
+            return self._acked_seq >= seq
 
     def stop(self) -> None:
-        self._stop.set()
+        """停掉旁路。**必须等线程真的走完**，否则会留下"没人收的注入会话"。
+
+        为什么顺序是「置位 → join → teardown」而不是「置位 → teardown」：
+        线程可能正卡在 `_try_attach()` 里（`frida.attach()` 在本机能阻塞很久）。
+        先 `_teardown()` 再 join 的话，线程会在两者之间**又挂上一个新会话** ——
+        那个会话从此没人 detach，注入一直留着，直到进程退出。
+        （审查报告 P2：`stop()` 不 join，注入竞态下可能残留会话。）
+
+        ⚠ join 有超时：`frida.attach()` 卡住时不能把调用方（托盘退出）一起吊死。
+        超时后仍然 teardown，并且 `_try_attach()` 在 attach 返回后会**再查一次**
+        `self._stopped`，所以迟到的会话也会被自己拆掉。
+        """
+        global _ACTIVE
+        self._stopped.set()
+        if self.is_alive():
+            try:
+                self.join(timeout=8.0)
+            except Exception:                          # noqa: BLE001
+                pass
         self._teardown()
+        with _ACTIVE_LOCK:
+            if _ACTIVE is self:
+                _ACTIVE = None
+
+    def start(self) -> None:
+        """登记为「当前在跑的旁路」，再起线程。"""
+        global _ACTIVE
+        with _ACTIVE_LOCK:
+            _ACTIVE = self
+        super().start()
 
     def _teardown(self) -> None:
         try:
@@ -287,6 +509,12 @@ class RemoteHidTap(threading.Thread):
         self._session = None
         self._attached_pid = None
         self.ready = False
+        self._target_handle = ""       # 新脚本要重新"认人"，旧句柄作废
+        # 脚本没了 ⇒ 它的屏蔽表也跟着没了，确认状态必须一起作废：
+        # 留着一个偏大的 _acked_seq，下一次 set_mapping(wait=True) 会**假确认**。
+        with self._ack_lock:
+            self._acked_seq = -1
+            self._ack_event.clear()
 
     # ── 主循环 ───────────────────────────────────────────────────────
     def run(self) -> None:
@@ -311,20 +539,39 @@ class RemoteHidTap(threading.Thread):
         delay = 2.0
         perm_fails = 0
         hinted = False
-        while not self._stop.is_set():
+        while not self._stopped.is_set():
             try:
                 pid, dev = self._next_host_pid()
                 if not pid:
-                    self.note = "没找到遥控器的 HID 驱动宿主（遥控器配对了吗？）"
-                    if self._stop.wait(min(delay, 10.0)):
+                    self.note = self._no_target_note()
+                    if self._stopped.wait(min(delay, 10.0)):
                         break
                     delay = min(delay * 2, 30.0)
                     continue
 
                 if self._session is None:
-                    logger.info("🔓 按键旁路：挂上蓝牙驱动宿主 WUDFHost (PID %d)%s",
-                                pid, f" ← {dev}" if dev else "")
+                    # ⚠ 注入前先核对身份：PID 会被回收，注册表里读到的 HostPid
+                    #   可能在"读到"和"attach"之间被系统分配给了别的进程。
+                    #   只看 PID 就 attach = 可能把脚本注进不相干的东西（P1-8）。
+                    if not is_wudfhost(pid):
+                        img = process_image_path(pid) or "(读不到)"
+                        self.note = f"PID {pid} 不是 WUDFHost.exe（实际：{img}）→ 不注入"
+                        logger.warning("🔓 按键旁路：%s", self.note)
+                        if self._stopped.wait(min(delay, 10.0)):
+                            break
+                        delay = min(delay * 2, 30.0)
+                        continue
+                    logger.info("🔓 按键旁路：挂上蓝牙驱动宿主 WUDFHost (PID %d)%s"
+                                "（身份核实：%s）",
+                                pid, f" ← {dev}" if dev else "", identity_note(pid))
                     self._session = frida.attach(pid)
+                    # ⚠ attach 返回后**再查一次**是否已被要求停止：`frida.attach()`
+                    #   能阻塞很久，stop() 的 join 超时后可能走到 _teardown()，
+                    #   而这一行才刚返回 —— 不查就会留下一个没人收的会话（P2）。
+                    if self._stopped.is_set():
+                        logger.info("🔓 按键旁路：attach 返回时已收到停止请求 → 立刻拆掉")
+                        self._teardown()
+                        return
                     self._script = self._session.create_script(source)
                     self._script.on("message", self._on_message)
                     # ⚠ PID 必须在 load() **之前**记上：脚本一 load 就同步发出
@@ -341,9 +588,11 @@ class RemoteHidTap(threading.Thread):
                 else:
                     # 宿主换了/没了就得重新挂：蓝牙重置、驱动重载都会让 WUDFHost
                     # 换 PID，而我们可能还挂在已经死掉的进程上。
-                    now = (find_wudfhost_pid(*self.vidpid)
-                           or find_wudfhost_pid(*self.vidpid, any_hid=True)
-                           or self._attached_pid)
+                    # ⚠ 这里也用 _next_host_pid()（走同一套精确匹配 + allow_any_hid
+                    #   开关），别再单独写一遍 `any_hid=True` 的兜底 —— 那等于
+                    #   把 P1-8 的"默认不许猜第一项"在重挂路径上又放开了一次。
+                    now, _dev = self._next_host_pid()
+                    now = now or self._attached_pid
                     if self._attached_pid and (now != self._attached_pid
                                                or not self._pid_alive(self._attached_pid)):
                         logger.info("🔓 按键旁路：宿主换了或没了（PID %s → %s），重新挂",
@@ -382,20 +631,57 @@ class RemoteHidTap(threading.Thread):
                             "放行之前语音功能不受影响，只是方向键/OK/音量用不了。")
                     delay = min(delay * 2, 60.0)
                 logger.info("🔓 按键旁路：%s（%.0f 秒后重试）", self.note, delay)
-                if self._stop.wait(delay):
+                if self._stopped.wait(delay):
                     break
 
     def _next_host_pid(self):
-        devs = hid_devices(*self.vidpid)
-        if not devs:
-            devs = hid_devices(*self.vidpid, any_hid=True)
-            if devs:
-                low = devs[0][1].casefold()
-                v, p = (self.vidpid or ("", ""))
-                self._compat = not (str(v).lower() in low and str(p).lower() in low)
-        if not devs:
+        """挑出「就是这台遥控器」的那个 WUDFHost；挑不到返回 (None, "")。
+
+        顺序（P1-8 的"精确验证"就体现在这里）：
+          1. 服务节点名必须解析出 **VID/PID 完全相等**（不是子串命中）；
+          2. 有远端 MAC 时，节点名里**必须**带这个 MAC（同型号的第二只遥控器
+             VID/PID 一模一样，只有 MAC 分得开）；
+          3. 都挑不出来时，只有显式打开 `allow_any_hid` 才退回"任意 BLE HID"，
+             并且**标记 _compat** —— 日志/自检里要能看出"这次是猜的"。
+        """
+        hosts = hid_hosts(*self.vidpid)
+        if self.expect_mac:
+            exact = [h for h in hosts if h.mac == self.expect_mac]
+            if exact:
+                self._compat = False
+                return exact[0].host_pid, exact[0].key
+            # 配对上了 MAC 却对不上：可能换了遥控器 / 地址轮换 / 记录没刷新。
+            # 退回 VID/PID 匹配（仍然精确到型号），并在日志里说一声。
+            if hosts:
+                logger.info("🔓 按键旁路：节点名里没找到远端 MAC %s，"
+                            "退回按 VID/PID 匹配（%d 个候选）",
+                            self.expect_mac, len(hosts))
+        if hosts:
+            self._compat = False
+            return hosts[0].host_pid, hosts[0].key
+        if not self.allow_any_hid:
             return None, ""
-        return devs[0][0], devs[0][1]
+        anyh = hid_hosts(*self.vidpid, any_hid=True)
+        if not anyh:
+            return None, ""
+        self._compat = True
+        logger.warning("🔓 按键旁路：没找到 VID/PID = %s/%s 的 BLE HID 设备，"
+                       "按 hid_frida_any_hid=true 退到第一台 BLE HID 设备（%s）"
+                       "—— 这台**可能不是你的遥控器**，请核对日志里的节点名。",
+                       self.vidpid[0], self.vidpid[1], anyh[0].key)
+        return anyh[0].host_pid, anyh[0].key
+
+    def _no_target_note(self) -> str:
+        """找不到目标时，写给用户看的那句话（要能指向下一步）。"""
+        n_all = len(hid_hosts(*self.vidpid, any_hid=True))
+        v, p = self.vidpid
+        if n_all:
+            return (f"没找到 VID/PID = {v}/{p} 的 BLE HID 驱动宿主"
+                    f"（本机另有 {n_all} 台别的 BLE HID 设备）。"
+                    "若这就是你的遥控器，请在 config.json 里把 "
+                    "hid_frida_any_hid 设为 true（兼容款兜底，注意可能认错设备）。")
+        return ("没找到遥控器的 HID 驱动宿主（遥控器配对了吗？"
+                "先在 Windows 设置里确认它已连接）")
 
     def _pid_alive(self, pid: int) -> bool:
         """进程还在不在。⚠ 两个坑：OpenProcess 失败不一定是"进程不存在"
@@ -435,7 +721,32 @@ class RemoteHidTap(threading.Thread):
             except ValueError:
                 return
             self._handle_report(raw)
+        elif kind == "target":
+            # 钩子锁定了目标设备的 FileHandle（P1-8）。从这一刻起它**只**改写
+            # 这一个句柄的报告；宿主里别的蓝牙键鼠一个字节都不动。
+            self._target_handle = str(payload.get("handle") or "")
+            n_h = int(payload.get("handles") or 0)
+            logger.info("🎯 按键旁路：已锁定目标设备句柄 %s（本宿主共见 %d 个句柄）"
+                        "—— 从此只改写这一个设备的报告",
+                        self._target_handle or "?", n_h)
+            if n_h > 1:
+                logger.warning(
+                    "⚠ 这个 WUDFHost 里还有别的 HID 设备（共 %d 个句柄）。"
+                    "已只对本机的目标句柄改写，其它设备的报告一个字节都不动；"
+                    "若发现按键串台，请把这段日志发出来。", n_h)
         elif kind == "block_ack":
+            # 钩子确认收到了这一版屏蔽表 → 放行在 set_mapping(wait=True) 里等的人。
+            # ⚠ 只认**序号够新**的那条：下发是异步的，乱序/迟到的 ack 如果也算数，
+            #   控制台就会在旧表还在用时报告「已生效」。
+            with self._ack_lock:
+                try:
+                    seq_i = int(payload.get("seq"))
+                except (TypeError, ValueError):
+                    # 老脚本不带 seq（兼容）→ 当作"就是当前这一版"
+                    seq_i = self._ack_seq
+                if seq_i >= self._ack_seq:
+                    self._acked_seq = seq_i
+                    self._ack_event.set()
             logger.info("🔓 按键旁路：已屏蔽 %s 个键的原生动作",
                         payload.get("count", 0))
         elif kind == "hb":
@@ -463,8 +774,10 @@ class RemoteHidTap(threading.Thread):
             self._last_down = btn
         else:
             self._last_down = None if self._last_down == btn else self._last_down
-        logger.info("🔘 按键旁路 → 按钮「%s」%s（raw=%s）",
-                    btn, "按下" if is_down else "松开", raw.hex(" "))
+        # ⚠ raw 字节默认**不记**（P2-6）：只对开发有用，且能反推用户按了什么。
+        #   要看的时候把 config.json 的 log_raw_hid 改成 true 再重启。
+        logger.info("🔘 按键旁路 → 按钮「%s」%s%s",
+                    btn, "按下" if is_down else "松开", logsetup.raw_suffix(raw))
         try:
             self._on(btn, is_down)
         except Exception as e:                          # noqa: BLE001
@@ -496,8 +809,23 @@ class RemoteHidTap(threading.Thread):
                 names.append(f"{nm}(cc:0x{code:04X})×{n}")
             else:
                 names.append(f"(vp:0x{code:02X})×{n}")
+        n_h = int(hb.get("handles") or 0)
+        locked = bool(hb.get("locked"))
+        if locked:
+            tgt = "目标句柄 已锁定"
+        else:
+            tgt = ("目标句柄 **未锁定**（还没见到遥控器格式的报文，"
+                   "这段时间一个字节都没改）")
+        extra = ""
+        if n_h > 1:
+            extra = (f"，因不是目标而放过 {int(hb.get('skipped') or 0)} 次改写")
+        compat = ""
+        if self._compat:
+            compat = " ⚠ 走的是 hid_frida_any_hid 兼容兜底（VID/PID 没对上，可能认错设备）。"
         return (f"按键旁路自检：宿主 PID {self._attached_pid}"
                 f"（本机共 {len(wudfhost_pids())} 个 WUDFHost），"
                 f"读调用 {int(hb.get('ioctl') or 0)} 次，输出长度：{dist}；"
                 f"已收到 {self.reports} 条按键报告，已屏蔽 {int(hb.get('blocked') or 0)} 次。"
+                f" {tgt}（本宿主共见 {n_h} 个句柄{extra}）。"
+                + compat
                 + (" 已见按键：" + "、".join(names) if names else ""))

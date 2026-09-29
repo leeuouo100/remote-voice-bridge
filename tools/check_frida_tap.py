@@ -316,7 +316,9 @@ console.log("OK cases=" + cases.length + " changed=" + changed);
             f.write(harness)
         try:
             r = subprocess.run([node, path], capture_output=True, text=True,
-                               timeout=60)
+                               # 解不出来也得有输出：读取线程抛异常 ⇒ stdout 空
+                               # ⇒ 这道闸会报出"解码表不一致"这种**指向错误**的结论
+                               errors="replace", timeout=60)
         except Exception as e:                 # noqa: BLE001
             return 127, "", str(e), []
 

@@ -120,6 +120,13 @@ def _bridge_running() -> str:
         p = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq RemoteVoiceBridge.exe", "/NH"],
             capture_output=True, text=True, timeout=6,
+            # ⚠ `errors="replace"` 不能省：`text=True` 是按 **locale 编码**解的，
+            #   而 tasklist 按**控制台代码页**吐字节 —— 两者不一定一致
+            #   （实测：环境里带 PYTHONUTF8=1 时 locale 是 utf-8、tasklist 吐
+            #    GBK，于是读取线程抛 UnicodeDecodeError）。异常发生在**读取线程**
+            #   里，`p.stdout` 直接变空 ⇒ 这里会判成"桥程序没在跑"——
+            #   一个**静默的错误答案**，而它正是"报告不准"的开端。
+            errors="replace",
             creationflags=0x08000000,      # CREATE_NO_WINDOW：别闪黑框
         )
         if "RemoteVoiceBridge.exe" in (p.stdout or ""):

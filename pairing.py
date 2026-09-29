@@ -123,7 +123,26 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "remote-voice-b
 REPORT_TXT = CONFIG_DIR / "pairing-fix.txt"
 REPORT_JSON = CONFIG_DIR / "pairing-fix.json"
 LOG_TXT = CONFIG_DIR / "pairing-fix.log"
-BACKUP_DIR = CONFIG_DIR / "backup"
+
+# 备份目录：**受保护**位置（%ProgramData%），单一出处在 config.BACKUP_DIR
+# （托盘里的「打开修复备份目录」用的是同一个常量，两边不会漂）。
+# 为什么不能放 %APPDATA%：见 config.py 那段长注释（P1-7：提权放大）。
+try:
+    from config import BACKUP_DIR                      # type: ignore
+except Exception:                                      # noqa: BLE001
+    BACKUP_DIR = (Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+                  / "remote-voice-bridge" / "backup")
+
+# 还原时**只接受**落在这些前缀下的注册表键。
+# ⚠ 这是"解析并限制注册表前缀"那一条的落点：备份文件是可以被改的（哪怕
+#   目录收紧过，用户也可能手改），`reg import` 却会老老实实按里面的
+#   `[HKEY_LOCAL_MACHINE\...]` 行事 —— 不校验前缀，一个被换过的 .reg
+#   就能在管理员上下文里写任意位置。
+ALLOWED_REG_PREFIXES = (
+    r"SYSTEM\CurrentControlSet\Services\BTHPORT",
+    r"SYSTEM\CurrentControlSet\Enum\BTHLE",
+    r"SYSTEM\CurrentControlSet\Enum\USB",
+)
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -788,35 +807,256 @@ def format_report(d: dict) -> str:
 
 
 # ── 备份 ─────────────────────────────────────────────────────────────────────
+#
+# 2026-09-29 审查报告 P1-7 把这里整个重做过。老版本有三个问题：
+#   ① 导出**整棵** `BTHPORT\Parameters\Keys` 和整个 `Devices` —— 本机所有
+#      蓝牙设备的链路密钥全被抄进一个用户可写目录，而我们只用得着其中一两条；
+#   ② 备份放 %APPDATA%（当前用户可写）⇒ 低权限进程能放一个更"新"的 .reg，
+#      等用户下次点「还原」时被 UAC 提权导入 —— 一次提权放大；
+#   ③ 一次修复生成好几个 .reg，还原时只 glob 最新的**一个**导进去 ——
+#      不是事务，可能只恢复一半，留下"迁移到一半"的状态。
+# 现在：最小子树 + 受保护目录 + manifest（SHA-256 / 键范围 / 事务 ID）
+#      + 关键项失败立即停止。
+
+def _reg_key_state(path: str) -> str:
+    """'ok' / 'absent' / 'denied' / 'error' —— **区分「没有」和「打不开」**。
+
+    ⚠ 为什么不能只写个 `_reg_key_exists` 返回 bool：`Keys\\<适配器>` 这一层
+      的 ACL 是"普通用户拒绝、叶子可读"（本机实测：`Keys` 与 `Keys\\<addr>`
+      都 `WinError 5`，而 `Keys\\<addr>\\<远端>` 能打开）。用 bool 的话，
+      **没有管理员权限**时会把"其实存在、只是现在读不了"的链路密钥整棵跳过 ——
+      而那恰恰是最不能丢的一份备份。
+      所以：只有明确"不存在"才跳过，其余一律照样列进清单去导。
+    """
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_READ):
+            return "ok"
+    except FileNotFoundError:
+        return "absent"
+    except PermissionError:
+        return "denied"
+    except OSError as e:
+        return "absent" if getattr(e, "winerror", None) == 2 else "error"
+
+
+def _backup_jobs(d: dict) -> list[tuple[str, str, bool]]:
+    """[(注册表路径, 文件名标签, 是否关键)] —— **最小子树**，不再整棵抄。
+
+    关键 = 导不出来就**不许动注册表**：链路密钥、以及我们真正会改的
+    适配器 Device Parameters（DeviceAddressCache 就在里面）。
+    """
+    jobs: list[tuple[str, str, bool]] = []
+
+    def _add(path: str, tag: str, critical: bool) -> None:
+        # 明确不存在的键不列（否则导出必然失败、白白当成"关键备份失败"）；
+        # "打不开"（权限）的**照样列** —— 那是现在读不了，不是没有。
+        if _reg_key_state(path) == "absent":
+            return
+        jobs.append((path, tag, critical))
+
+    # ① 目标设备的配对记录（只这一台，不是整个 Devices 树）
+    for r in d.get("records") or []:
+        _add(f"{BTHPORT_DEVICES}\\{r['remote']}", f"dev-{hex12(r['remote'])}", True)
+
+    # ② 链路密钥：只导**这次真的牵涉到**的本地地址那几棵子树
+    locals_: set[str] = set()
+    for a in d.get("adapters") or []:
+        if a.get("addr"):
+            locals_.add(hex12(a["addr"]))
+    for r in d.get("records") or []:
+        for s in r.get("services_for") or []:
+            if s.get("addr"):
+                locals_.add(hex12(s["addr"]))
+    if d.get("live_addr"):
+        locals_.add(hex12(d["live_addr"]))
+    # `read_key_material` 下钻过的那些地址也要算上（它可能从别的路径找到地址）
+    for loc in (d.get("keys") or {}).get("locals") or []:
+        if loc.get("local"):
+            locals_.add(hex12(loc["local"]))
+    for loc in sorted(locals_):
+        _add(f"{BTHPORT_KEYS}\\{loc}", f"keys-{loc}", True)
+
+    # ③ 适配器的 Device Parameters（DeviceAddressCache 在这儿）
+    for a in d.get("adapters") or []:
+        _add(f"{ENUM_USB}\\{a['reg_path']}\\Device Parameters",
+             f"addr-{a['inst']}", True)
+
+    # ④ 关联节点那几棵树（会被删改，但删了能重建 —— 关键性次一级）
+    for n in d.get("nodes") or []:
+        _add(n["key"], f"bthle-{hex12(n['remote'])}", False)
+    return jobs
+
+
+def _secure_dir(path: Path) -> tuple[bool, str]:
+    """建目录并把 DACL 收紧成「只有 Administrators/SYSTEM 可写」。
+
+    做法：**禁用继承**（去掉从父目录继承来的 Users 写权限），再补两条 ACE
+    —— Administrators 完全控制、SYSTEM 完全控制，外加 Users **只读**
+    （托盘里的「打开修复备份目录」还要能浏览）。
+    任何一步失败都**不**让备份继续：目录不可信就等于备份不可信。
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return False, f"建不了备份目录 {path}：{e}"
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+
+        # ── 先把 DACL 的属主/权限拿过来，才能改写 ──
+        SE_FILE_OBJECT = 1
+        DACL_SECURITY_INFORMATION = 0x00000004
+        PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+        GRANT_ACCESS = 1
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3
+        TRUSTEE_IS_SID = 0
+        TRUSTEE_IS_WELL_KNOWN_GROUP = 5
+
+        class TRUSTEE_W(ctypes.Structure):
+            _fields_ = [("pMultipleTrustee", ctypes.c_void_p),
+                        ("MultipleTrusteeOperation", wintypes.DWORD),
+                        ("TrusteeForm", wintypes.DWORD),
+                        ("TrusteeType", wintypes.DWORD),
+                        ("ptstrName", ctypes.c_void_p)]
+
+        class EXPLICIT_ACCESS_W(ctypes.Structure):
+            _fields_ = [("grfAccessPermissions", wintypes.DWORD),
+                        ("grfAccessMode", wintypes.DWORD),
+                        ("grfInheritance", wintypes.DWORD),
+                        ("Trustee", TRUSTEE_W)]
+
+        adv.SetEntriesInAclW.argtypes = [
+            wintypes.ULONG, ctypes.POINTER(EXPLICIT_ACCESS_W),
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        adv.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+
+        def _sid(well_known: int):
+            """按 WELL_KNOWN_SID_TYPE 造一个 SID。"""
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateWellKnownSid.argtypes = [
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.POINTER(wintypes.DWORD)]
+            size = wintypes.DWORD(68)
+            buf = ctypes.create_string_buffer(size.value)
+            if not k32.CreateWellKnownSid(well_known, None, buf,
+                                          ctypes.byref(size)):
+                raise OSError(ctypes.get_last_error(), "CreateWellKnownSid")
+            return ctypes.cast(buf, ctypes.c_void_p), buf
+
+        # WinBuiltinAdministratorsSid = 26，WinLocalSystemSid = 22
+        adm_sid, adm_buf = _sid(26)
+        sys_sid, sys_buf = _sid(22)
+
+        def _entry(sid_ptr, access: int) -> EXPLICIT_ACCESS_W:
+            e = EXPLICIT_ACCESS_W()
+            e.grfAccessPermissions = access
+            e.grfAccessMode = GRANT_ACCESS
+            e.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            e.Trustee.pMultipleTrustee = None
+            e.Trustee.MultipleTrusteeOperation = 0
+            e.Trustee.TrusteeForm = TRUSTEE_IS_SID
+            e.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP
+            e.Trustee.ptstrName = sid_ptr
+            return e
+
+        # GENERIC_READ|GENERIC_EXECUTE = 0x20000000|0x20000000（给普通用户浏览）
+        entries = (_entry(adm_sid, KEY_ALL_ACCESS),
+                   _entry(sys_sid, KEY_ALL_ACCESS),
+                   _entry(adm_sid, 0x20000000 | 0x20000000))
+        arr = (EXPLICIT_ACCESS_W * len(entries))(*entries)
+        new_dacl = ctypes.c_void_p()
+        if adv.SetEntriesInAclW(len(entries), arr, None,
+                                ctypes.byref(new_dacl)) != 0:
+            return False, "SetEntriesInAclW 失败"
+        rc = adv.SetNamedSecurityInfoW(
+            str(path), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, new_dacl, None)
+        if rc != 0:
+            return False, f"SetNamedSecurityInfoW 失败（rc={rc}）"
+        return True, "已收紧为「仅管理员/SYSTEM 可写」"
+    except Exception as e:                             # noqa: BLE001
+        return False, f"设置目录权限失败：{e.__class__.__name__}: {e}"
+
+
+def _sha256(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def backup(d: dict) -> list[str]:
-    """动注册表之前先把要动的东西导出成 .reg。返回生成的文件列表。"""
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    """动注册表之前先把**要动的那几棵子树**导出成 .reg，并写一份 manifest。
+
+    返回生成的文件列表。**关键项导出失败时返回空列表** —— 调用方据此
+    在动注册表之前停下来（P1-7：任一关键备份失败立即停止修复）。
+    """
+    ok, why = _secure_dir(BACKUP_DIR)
+    print(f"   备份目录：{BACKUP_DIR}（{why}）")
+    if not ok:
+        return []
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    tx = f"{stamp}-{os.urandom(3).hex()}"       # 事务 ID：同一次修复的文件共享它
     made: list[str] = []
+    entries: list[dict] = []
+    failed_critical: list[str] = []
 
-    jobs = [(BTHPORT_DEVICES, "bthport-devices"),
-            (BTHPORT_KEYS, "bthport-keys")]
-    for n in d["nodes"]:
-        jobs.append((n["key"], f"bthle-{hex12(n['remote'])}"))
-    for a in d["adapters"]:
-        jobs.append((f"{ENUM_USB}\\{a['reg_path']}\\Device Parameters",
-                     f"addr-{a['inst']}"))
-
-    for path, tag in jobs:
-        f = BACKUP_DIR / f"{stamp}-{tag}.reg"
-        rc, out = _run(["reg", "export", f"HKLM\\{path}", str(f), "/y"], timeout=60)
-        if rc == 0:
+    for path, tag, critical in _backup_jobs(d):
+        # 清单算好之后它没了 —— 那不是"关键备份失败"，跳过即可。
+        if _reg_key_state(path) == "absent":
+            continue
+        f = BACKUP_DIR / f"{tx}-{tag}.reg"
+        rc, out = _run(["reg", "export", f"HKLM\\{path}", str(f), "/y"],
+                       timeout=60)
+        if rc == 0 and f.is_file():
             made.append(str(f))
+            entries.append({"file": f.name, "reg_path": path,
+                            "critical": critical, "sha256": _sha256(f),
+                            "bytes": f.stat().st_size})
         else:
-            # Keys 之类受保护的键偶尔导不出来 —— 只提示，不中断备份流程
-            print(f"   （次要）导出失败：{path} —— {out.strip().splitlines()[:1]}")
+            msg = (out or "").strip().splitlines()[:1]
+            print(f"   {'❌ 关键' if critical else '（次要）'}导出失败：{path} —— {msg}")
+            if critical:
+                failed_critical.append(path)
+
+    if failed_critical:
+        print("\n❌ 关键备份失败，**已在动注册表之前停止**：")
+        for p in failed_critical:
+            print(f"     · {p}")
+        print("   备份不完整就不该往下走 —— 万一修坏了，你手里那份也救不回来。")
+        print("   常见原因：没有以管理员身份运行（受保护的 Keys 键导不出来）。")
+        return []
 
     # 地址缓存的原值单独记一份文本，万一 .reg 不好用也能照着手抄回去
-    txt = BACKUP_DIR / f"{stamp}-原始值.txt"
+    txt = BACKUP_DIR / f"{tx}-原始值.txt"
     with open(txt, "w", encoding="utf-8") as fh:
         for a in d["adapters"]:
             fh.write(f"{a['instance_id']}\tDeviceAddressCache={a['addr']}\n")
     made.append(str(txt))
+
+    manifest = {
+        "tx": tx,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "admin": is_admin(),
+        "live_addr": d.get("live_addr") or "",
+        "allowed_prefixes": list(ALLOWED_REG_PREFIXES),
+        "files": entries,
+        "extra": [txt.name],
+    }
+    mf = BACKUP_DIR / f"{tx}-manifest.json"
+    with open(mf, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    made.append(str(mf))
+    print(f"   manifest：{mf.name}（{len(entries)} 个 .reg，事务 {tx}）")
     return made
 
 
@@ -1560,26 +1800,140 @@ def verify_open(remote: str) -> tuple[bool, str]:
 
 
 # ── 回滚：把备份 .reg 导回去 ─────────────────────────────────────────────────
-def restore_backup(which: str = "") -> tuple[bool, str]:
-    """把 `backup\\` 里最近的备份 .reg 导回注册表。
+def _reg_paths_in(reg_file: Path) -> list[str]:
+    """读出一个 .reg 里所有 `[HKEY_...]` 声明的注册表路径（去掉 hive 前缀）。
 
-    为什么必须有这个入口：修复工具动的是**系统**注册表。只会"导出备份"、
-    没有"一键导回"，等于把风险留给用户自己承担 —— 那种工具不该发出去。
-    默认只导 `bthle-*.reg`（关联节点那棵树，也是唯一会被删改的一棵）；
-    想全导就传 `*`。
+    .reg 是纯文本（`reg export` 默认 UTF-16LE 带 BOM），所以直接读文本就够，
+    不需要真去"导入一次看看"。读不出来的行一律忽略 —— 判断靠的是
+    「有没有**越界**的路径」，不是"能不能全解析"。
+    """
+    try:
+        raw = reg_file.read_bytes()
+    except OSError:
+        return []
+    for enc in ("utf-16", "utf-8-sig", "utf-8", "mbcs"):
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:
+        text = raw.decode("utf-8", "replace")
+
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("["):
+            continue
+        inner = s.strip("[]").strip()
+        # `[HKEY_LOCAL_MACHINE\SYSTEM\...]` / `[HKEY_CURRENT_USER\...]`
+        for hive in ("HKEY_LOCAL_MACHINE\\", "HKLM\\"):
+            if inner.upper().startswith(hive):
+                out.append(inner[len(hive):])
+                break
+        else:
+            # 不是 HKLM 下的键 —— 记成"整条原文"，后面必然判越界
+            out.append(inner)
+    return out
+
+
+def _reg_prefix_ok(path: str) -> bool:
+    """键路径是否落在 `ALLOWED_REG_PREFIXES` 之内。
+
+    ⚠ 必须按**路径分段**匹配，不能光 `startswith` ——
+    `...\\Services\\BTHPORT_evil` 也以 `...\\Services\\BTHPORT` 开头，
+    `...\\Enum\\USBSTOR\\...` 也以 `...\\Enum\\USB` 开头。
+    （这条是 2026-09-29 的闸门 `tools/check_pairing_backup.py` D1b 抓出来的：
+     白名单写成裸 startswith 时，前缀形近的假键会被整批放行。）
+    """
+    p = path.replace("/", "\\").strip("\\").casefold()
+    for pre in ALLOWED_REG_PREFIXES:
+        q = pre.replace("/", "\\").strip("\\").casefold()
+        if p == q or p.startswith(q + "\\"):
+            return True
+    return False
+
+
+def restore_backup(which: str = "") -> tuple[bool, str]:
+    """按 **manifest** 把一次修复的备份导回注册表。
+
+    为什么必须走 manifest（2026-09-29 审查报告 P1-7）：
+      · 老版本 `glob("*bthle*.reg")` 取**最新的一个**导进去 —— 一次修复有
+        好几个 .reg，只恢复一个是**半个事务**，会留下"迁移到一半"的状态，
+        而且挑哪个完全取决于文件 mtime（谁都能改）。
+      · 现在只导 manifest 里**逐个列过、且 SHA-256 对得上**的文件。
+      · 导入前还会解析 .reg 里的键路径，**越界的一律拒绝** ——
+        `reg import` 会老老实实按文件里的 `[HKEY_LOCAL_MACHINE\...]` 写，
+        不校验前缀的话，一个被换过的 .reg 就能在管理员上下文里写任意位置。
+
+    `which`：按文件名标签过滤（默认只恢复设备/密钥/地址这几类关键文件；
+    传 `*` 恢复全部）。
     """
     if not BACKUP_DIR.is_dir():
         return False, f"没有备份目录：{BACKUP_DIR}"
-    pat = f"*{which or 'bthle'}*.reg"
-    files = sorted(BACKUP_DIR.glob(pat), key=lambda p: p.stat().st_mtime)
-    if not files:
-        return False, f"备份目录里没有匹配 {pat} 的文件"
-    f = files[-1]
-    rc, out = _run(["reg", "import", str(f)], timeout=60)
-    if rc != 0:
-        return False, f"导入失败：{out.strip()[:200]}"
-    print(f"   ↩  已导回 {f.name}")
-    return True, f"已从备份还原：{f.name}"
+
+    # ⚠ 只认 manifest，不 glob .reg
+    manifests = sorted(BACKUP_DIR.glob("*-manifest.json"),
+                       key=lambda p: p.stat().st_mtime)
+    if not manifests:
+        return False, (f"备份目录里没有 manifest（{BACKUP_DIR}）。"
+                       "老版本的裸 .reg 不再自动导入 —— 那种备份无法校验完整性，"
+                       "请手工双击确认后导入。")
+
+    # `which` 用来筛文件标签；空 = 只要关键项（critical=True 的那几个）
+    want = (which or "").strip()
+    if want == "*":
+        keep = lambda e: True                                   # noqa: E731
+    elif want:
+        keep = lambda e: want.casefold() in e["file"].casefold()  # noqa: E731
+    else:
+        keep = lambda e: bool(e.get("critical"))                # noqa: E731
+
+    # 从最新的一份往回找：第一份"能通过校验且筛得出文件"的就用它
+    tried: list[str] = []
+    for mf in reversed(manifests):
+        try:
+            man = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            tried.append(f"{mf.name}：manifest 读不出来（{e}）")
+            continue
+        entries = [e for e in (man.get("files") or []) if keep(e)]
+        if not entries:
+            tried.append(f"{mf.name}：没有匹配 {which or '关键项'} 的文件")
+            continue
+
+        bad: list[str] = []
+        for e in entries:
+            f = BACKUP_DIR / str(e.get("file") or "")
+            if not f.is_file():
+                bad.append(f"{f.name}：文件不在了")
+                continue
+            if _sha256(f) != e.get("sha256"):
+                bad.append(f"{f.name}：SHA-256 对不上（文件被改过？）")
+                continue
+            for rp in _reg_paths_in(f):
+                if not _reg_prefix_ok(rp):
+                    bad.append(f"{f.name}：里面有越界的键 `{rp}`（拒绝导入）")
+                    break
+        if bad:
+            tried.append(f"{mf.name}：\n       · " + "\n       · ".join(bad))
+            continue
+
+        # ── 逐个导入（事务 ID 一致的那一组）──
+        done = 0
+        for e in entries:
+            f = BACKUP_DIR / str(e["file"])
+            rc, out = _run(["reg", "import", str(f)], timeout=60)
+            if rc != 0:
+                return False, (f"导入 {f.name} 失败：{out.strip()[:200]}\n"
+                               f"     （已导入 {done}/{len(entries)} 个，"
+                               f"事务 {man.get('tx')}）")
+            done += 1
+            print(f"   ↩  已导回 {f.name}")
+        return True, (f"已按事务 {man.get('tx')} 还原 {done} 个键"
+                      f"（备份时间 {man.get('created')}）")
+
+    return False, ("没有可用的备份：\n     · " + "\n     · ".join(tried))
 
 
 # ── 提权 ─────────────────────────────────────────────────────────────────────
@@ -1975,8 +2329,15 @@ def main(argv: list[str] | None = None) -> int:
         print("\n① （演练）跳过注册表备份\n")
     else:
         made = backup(d)
-        print(f"\n① 已备份 {len(made)} 个注册表键 → {BACKUP_DIR}")
-        print("   出问题可以双击 .reg 文件还原。\n")
+        if not made:
+            # ⚠ P1-7：关键备份没做成 = 手里没有回滚材料 ⇒ **不许动注册表**。
+            #   老版本这里只提示"（次要）导出失败"就继续往下修 —— 修坏了
+            #   才发现那份备份里根本没有密钥。
+            print("\n❌ 备份没做成，已停止 —— 不会动注册表。")
+            print(f"   报告：{REPORT_TXT}")
+            return 1
+        print(f"\n① 已备份 {len(made)} 个文件（含 manifest）→ {BACKUP_DIR}")
+        print("   出问题可以双击 .reg 文件还原，或跑 --restore-backup。\n")
 
     # restore / migrate 能不能成，先看密钥还在不在
     k = d.get("keys") or {}

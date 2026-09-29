@@ -22,8 +22,15 @@
    绝不出现 `mic_echo_since =`）。改了时刻 = 窗口被回声续命 = 窗口永不过期
    = 按键全被吞（v1.0.13 的下场）。
 1'''. **记账必须收在 MIC_OPEN 的发送路径里**（`_on_mic_open` → `_send_tx`）：
-   排队成功记一条"欠一声回声"；**写入真正成功**时把锚点挪过去，而且
+   发出时记一条"欠一声回声"；**写入真正成功**时把锚点挪过去，而且
    **只挪时刻、不加计数**（加了 → 账永远还不清 → 真按键被吞）。
+1''''. **写入的"真实结果"必须回到状态机**（2026-09-29 审查报告 P2-2）：
+   `_send_tx` 的返回值只代表"投递到事件循环"，**不代表写成功**。
+   GATT 写失败时必须 ① 销掉那笔回声账 ② **复位 `mic_open_sent`** ——
+   不复位的话 `ensure_mic_open()` 会永远以为已经开过麦而直接 return，
+   遥控器**一帧音频都不推**，而日志上只有一行"补发成功"（静默失效）。
+   顺序铁律：`_on_mic_open` 里**先记账、再排队**（反过来的话，投递一返回
+   主循环就可能立刻回调"失败销账"，而这边还没记账 → 账永远挂着）。
 1''''. **顺序铁律：先算 `is_echo`，再补发 MIC_OPEN。**
 2. 挡掉的事件不许静默（挡了多少次要看得见）。
 3. **松手（audio_stop）绝不结束会话** —— 只能"结算统计 + 补开麦"。
@@ -163,33 +170,69 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
 
     # ── ①''' 记账收在 MIC_OPEN 发送路径里 ────────────────────────
     m_sched = _block(code, r"def _mark_mic_open_scheduled\(\):",
-                     r"def _mark_mic_open_written\(\)")
-    c.append((bool(m_sched), "①''' 有 _mark_mic_open_scheduled（排队那一刻记账）"))
+                     r"def _undo_mic_open_scheduled\(")
+    c.append((bool(m_sched), "①''' 有 _mark_mic_open_scheduled（发出那一刻记账）"))
     c.append(("pending_mic_echo += 1" in m_sched
               and "mic_echo_since = time.time()" in m_sched,
-              "①''' 排队成功时记一条「欠一声回声」+ 记时刻"))
-    m_written = _block(code, r"def _mark_mic_open_written\(\):",
-                       r"def _on_mic_open\(")
-    c.append((bool(m_written), "①''' 有 _mark_mic_open_written（写入成功那一刻挪锚点）"))
-    c.append(("mic_echo_since = time.time()" in m_written,
-              "①''' 写入真正成功时把锚点挪过去"
+              "①''' 发出时记一条「欠一声回声」+ 记时刻"))
+
+    # ── ①'''' P2-2：写入的**真实结果**必须回到状态机 ───────────────
+    # 老写法把"投递到事件循环"当成功返回，于是 GATT 写失败时状态机不回滚：
+    # mic_open_sent 一直是 True ⇒ ensure_mic_open 永远直接 return ⇒
+    # 遥控器一帧音频都不推，而日志上只有一行"补发成功"（静默失效）。
+    m_done = _block(code, r"def _on_mic_open_done\(ok: bool\):",
+                    r"def _on_mic_open\(sid: int\):")
+    c.append((bool(m_done), "①'''' 有 _on_mic_open_done（写入真实结果回传，P2-2）"))
+    c.append(("mic_echo_since = time.time()" in m_done,
+              "①'''' 写入真正成功时把锚点挪过去"
               "（GATT 写入慢到 ~1s ⇒ 回声晚 ~1s；不挪就漏出窗口 → 按下就掉）"))
-    c.append(("pending_mic_echo +=" not in m_written,
-              "①''' 写入成功**只挪时刻、不加计数**"
+    c.append(("pending_mic_echo +=" not in m_done,
+              "①'''' 写入成功**只挪时刻、不加计数**"
               "（加了＝账永远还不清 → 下一条真按键被吞）"))
-    c.append(("pending_mic_echo > 0" in m_written,
-              "①''' 挪时刻只在「还欠着回声」时做"
+    c.append(("pending_mic_echo > 0" in m_done,
+              "①'''' 挪时刻只在「还欠着回声」时做"
               "（否则一次迟到的写入回调会把已经销完账的窗口重新拉开）"))
-    m_onopen = _block(code, r"def _on_mic_open\(", r"def _on_mic_close\(")
+    c.append(("_undo_mic_open_scheduled(" in m_done,
+              "①'''' 写入**失败**时销掉「欠一声回声」那笔账"
+              "（不销＝窗口一直挂着，下一条真按键可能被误吞）"))
+    # ⚠ 复位要走 `session.mark_mic_open_failed()`，**不许**在这里直接改
+    #   `session.state.mic_open_sent` —— 那个字段是状态机的一部分，必须和相位
+    #   迁移在同一把锁里改（P2-3）。这条判据原先认的是直接赋值，P2-3 改完之后
+    #   当场报红 —— 正是它该做的事（改动跑偏了会被拦住）。
+    c.append(("mark_mic_open_failed()" in m_done,
+              "①'''' 写入失败时撤销「已开麦」标记（走 session.mark_mic_open_failed()，"
+              "与相位迁移同一把锁）"
+              "（不复位＝ensure_mic_open 永远直接 return，遥控器一帧都不推，"
+              "而日志上只有一行「补发成功」）"))
+
+    m_onopen = _block(code, r"def _on_mic_open\(sid: int\):", r"def _on_mic_close")
     c.append(("_mark_mic_open_scheduled()" in m_onopen,
-              "①''' 排队成功后立刻记账（就在 _on_mic_open 里）"))
-    c.append(("on_sent=" in m_onopen,
-              "①''' 把写入完成的回调接给了 _send_tx（on_sent）"))
+              "①'''' 发出后立刻记账（就在 _on_mic_open 里）"))
+    # ⚠ 顺序：**先记账、再排队**。反过来的话，投递一返回主循环就可能立刻
+    #   写完并回调"失败销账"，而这边还没 += 1 —— 销账销在记账之前，
+    #   账上就永远挂着 1 笔"欠一声回声"（下一条真按键可能被误吞）。
+    i_mark = m_onopen.find("_mark_mic_open_scheduled()")
+    i_send = m_onopen.find("_send_tx(")
+    c.append((i_mark >= 0 and i_send > i_mark,
+              "①'''' 顺序：先 _mark_mic_open_scheduled() 再 _send_tx()"
+              "（反了＝写入回调的销账可能跑在记账之前 → 账永远挂着）"))
+    c.append(("on_done=" in m_onopen,
+              "①'''' 把写入的**真实结果**回调接给了 _send_tx（on_done）"))
+
     m_sendtx = _block(code, r"def _send_tx\(cmd: bytes", r"def _mark_mic_open_scheduled\(\):")
-    c.append(("on_sent is not None" in m_sendtx and "on_sent()" in m_sendtx,
-              "①''' _send_tx 在写入 status=成功时才回调 on_sent"))
+    c.append(("on_done(ok)" in m_sendtx and "if on_done is None" in m_sendtx,
+              "①'''' _send_tx 把写入结果（成功/失败）都回调出去"
+              "（没有 on_done，调用方就无从回滚 —— P2-2）"))
     c.append(("GattCommunicationStatus.SUCCESS" in m_sendtx,
-              "①''' 回调的判据是 GATT status 成功（不是「排上了就算成功」）"))
+              "①'''' 回调的判据是 GATT status 成功（不是「排上了就算成功」）"))
+    # ⚠ 用**计数**而不是"有没有出现"：`_fire(False)` 在"写入抛异常"那条路上
+    #   本来就有一次，只判"出现过"的话，把"连排队都没排上"那次删掉也照样绿
+    #   （反例 4d 自证过这一点）。
+    #   三条路各一次 + 函数定义本身一次 = 4。
+    c.append((m_sendtx.count("_fire(") >= 4,
+              "①'''' 三条路都要回调 on_done：写入有结果 / 写入抛异常 / 连排队都没排上"
+              f"（当前 _fire( 出现 {m_sendtx.count('_fire(')} 次；"
+              "漏了最后一条＝那笔回声账永远挂着、销不掉）"))
 
     # ── ①'''' 顺序铁律：先判回声，再补开麦 ───────────────────────
     i_echo_calc = m_asblk.find("is_echo =")
@@ -357,14 +400,18 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
               "（麦克风可能开着 10 分钟，里面可能是环境音/旁人的话）"))
 
     # 断连/退出那条：必须**自己 await** 一次写入。
-    # ⚠ end_voice_session 的 _send_tx 只是"投递到事件循环"，而我们此刻就在
-    #   那个循环的 finally 里 —— run_bridge 一返回、循环一关，那条还没跑到的
+    # ⚠ 这段收尾原先在 `run_bridge` 的 `finally` 里；2026-09-29（P1-3）之后
+    #   搬进了 `_BridgeResources.teardown()` —— 定位跟着改，否则取到的是那层
+    #   薄壳，两条断言都会**因为找不到而变红**（闸门看着还"有效"，其实看错了地方）。
+    #   仍然必须自己 await：end_voice_session 的 _send_tx 只是"投递到事件循环"，
+    #   而我们此刻**就在**那个循环的收尾里 —— asyncio.run 一收尾，那条还没跑到的
     #   写入就被取消了：MIC_CLOSE 静默丢失，日志上还写着"已发出"。
-    m_fin = _block(src, r"    finally:", r"\n        state\.reset\(\)")
-    c.append(("mic_close_cmd(" in m_fin and "await asyncio.wait_for(" in m_fin,
+    td = _block(src, r"    async def teardown", r"\nasync def run_bridge")
+    c.append((bool(td), "⑦ 找得到 _BridgeResources.teardown（退出/断连那条收尾现在在这）"))
+    c.append(("mic_close_cmd(" in td and "await asyncio.wait_for(" in td,
               "⑦ 退出/断连那条**自己 await** 写入 MIC_CLOSE"
               "（只靠 _send_tx 投递的话，循环一关就被取消 → 命令静默丢失）"))
-    c.append(('end_voice_session("断开或退出"' in m_fin,
+    c.append(('end_voice_session("断开或退出"' in td,
               "⑦ 退出/断连那条也走同一个入口"))
 
     # 残留推流自愈：程序认为没会话、遥控器却还在推 → 补发 MIC_CLOSE。
@@ -446,10 +493,38 @@ def main() -> int:
                        r"\1\n\2mic_echo_since = time.time()", src, count=1))
 
     # 反例 4：写入成功后**也**加计数（＝账永远还不清，真按键被吞）
-    _expect_red("让 _mark_mic_open_written 也把计数加一"
+    _expect_red("让 _on_mic_open_done 成功时也把计数加一"
                 "（＝账还不清 → 下一条真按键被吞）",
-                re.sub(r"(def _mark_mic_open_written\(\):.*?if pending_mic_echo > 0:\n)",
+                re.sub(r"(def _on_mic_open_done\(ok: bool\):.*?if pending_mic_echo > 0:\n)",
                        r"\1            pending_mic_echo += 1\n", src, count=1, flags=re.S))
+
+    # 反例 4b（P2-2）：写入失败后**不回滚** mic_open_sent
+    #（＝状态机永远以为已经开麦 → ensure_mic_open 永远直接 return → 一帧都不推）
+    _expect_red("写入失败后不回滚 mic_open_sent"
+                "（＝遥控器一帧音频都不推，日志上却写着「补发成功」）",
+                src.replace(
+                    "        if session.mark_mic_open_failed():\n",
+                    "        if False:\n", 1))
+
+    # 反例 4c（P2-2）：先排队、后记账（＝回调销账可能跑在记账之前）
+    _expect_red("把 _on_mic_open 里的顺序倒过来（先 _send_tx 再记账）"
+                "（＝投递一返回就可能回调销账，而账还没记上）",
+                src.replace(
+                    "        _mark_mic_open_scheduled()\n"
+                    '        if not _send_tx(cmd, "MIC_OPEN", on_done=_on_mic_open_done):\n'
+                    "            return None\n"
+                    "        return cmd\n",
+                    '        if not _send_tx(cmd, "MIC_OPEN", on_done=_on_mic_open_done):\n'
+                    "            return None\n"
+                    "        _mark_mic_open_scheduled()\n"
+                    "        return cmd\n", 1))
+
+    # 反例 4d（P2-2）：「连排队都没排上」那条路不再回调
+    #（＝那笔回声账永远挂着，下一条真按键可能被误吞）
+    _expect_red("「连排队都没排上」那条路不再回调 on_done(False)",
+                src.replace(
+                    "            _fire(False)          # 保证 on_done 恰好被调用一次\n",
+                    "", 1))
 
     # 反例 5：让松手也去结束会话
     _expect_red("让松手也调 voice_hotkey_up()"

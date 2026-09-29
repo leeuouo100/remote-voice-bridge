@@ -26,6 +26,7 @@ import time
 
 import hidinfo
 import hidwatch
+import logsetup
 
 from config import CHROMECAST_BUTTONS
 
@@ -347,8 +348,8 @@ class RemoteHidButtons:
             sig = ("nonvendor:" + col.key, raw[:4])
             if sig not in self._unknown_seen:
                 self._unknown_seen.add(sig)
-                logger.info("📥 集合 %s 收到原始报告 %s（非厂商页，只记录不派发）",
-                            col.key, raw.hex(" "))
+                logger.info("📥 集合 %s 收到原始报告%s（非厂商页，只记录不派发）",
+                            col.key, logsetup.raw_suffix(raw))
             return
 
         btn, is_down = decode_report(raw)
@@ -361,7 +362,8 @@ class RemoteHidButtons:
             sig = ("vendor", raw[:2])
             if raw and sig not in self._unknown_seen:
                 self._unknown_seen.add(sig)
-                logger.info("🔘 厂商页报告 %s → 用法码不认识，已忽略", raw.hex(" "))
+                logger.info("🔘 厂商页报告 → 用法码不认识，已忽略%s",
+                            logsetup.raw_suffix(raw))
             return
 
         now = time.time()
@@ -375,8 +377,9 @@ class RemoteHidButtons:
         else:
             self._last_down = None if self._last_down == btn else self._last_down
 
-        logger.info("🔘 厂商页按键 → 按钮「%s」%s（raw=%s）",
-                    btn, "按下" if is_down else "松开", raw.hex(" "))
+        # raw 字节默认不记（P2-6）—— 见 logsetup.raw_suffix 的说明。
+        logger.info("🔘 厂商页按键 → 按钮「%s」%s%s",
+                    btn, "按下" if is_down else "松开", logsetup.raw_suffix(raw))
         try:
             self._on(btn, is_down)
         except Exception as e:                       # noqa: BLE001

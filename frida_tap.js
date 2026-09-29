@@ -35,6 +35,30 @@ let blocked = 0;
 let blockCC = {};            // 消费类页：16 位 usage → true（要抹掉原生动作）
 let blockVendor = {};        // 厂商页：8 位 usage → true
 
+/* ── 目标 FileHandle：先观察确认，再启用改写（审查报告 P1-8）──────────────
+ * 只按 IOCTL 号过滤是不够的：同一个 WUDFHost 里可能还服务别的蓝牙键鼠，
+ * 它们读的是**另一个** FileHandle。按 IOCTL 就改写 = 可能把别人的报告抹掉。
+ *
+ * 确认规则：第一个**发出遥控器格式报文**（3 字节 0x02 / 首字节 0x01）的
+ * FileHandle 被认定为我们的遥控器。在那之前**只观察、一个字节都不改**。
+ * 别的蓝牙键鼠吐的是 9 字节键盘报告，永远匹配不上这个形状。
+ */
+let targetHandle = null;
+let otherHandles = 0;        // 见过几个不同的 FileHandle（>1 说明宿主里有别的设备）
+const seenHandles = {};
+let skippedOther = 0;        // 因为不是目标句柄而**没敢改写**的次数
+
+function handleKey(h) {
+  return h.toString();
+}
+
+/* 这份输出看起来是不是遥控器的报文？（只看形状，不做语义判断） */
+function looksLikeRemote(buf, n) {
+  if (n === 3 && buf[0] === 0x02) return true;        // 消费类页
+  if (n >= 2 && buf[0] === 0x01) return true;         // 厂商页
+  return false;
+}
+
 /* 诊断计数：真机上出现过「钩子挂上了、界面显示就绪、却一条报文都没有」
  * （挂错了宿主 / 另一款遥控器格式不同）。只看成功与否分不清是哪种，
  * 所以把原始计数报给 Python：
@@ -98,7 +122,12 @@ recv(function (msg) {
     (msg.vendor || []).forEach(function (u) { vd[u >>> 0] = true; });
     blockCC = cc;
     blockVendor = vd;
-    send({ kind: "block_ack", count: Object.keys(cc).length + Object.keys(vd).length });
+    // ⚠ 把 Python 给的序号**原样回传**。Python 侧靠它确认「我等的就是这一条」：
+    //   下发是异步的，只回一个不带序号的 ack，控制台就没法区分
+    //   "我这次下发的表生效了"和"我收到的是上一条的迟到 ack"——
+    //   后者会让界面在旧表还在用时报告「已生效」。
+    send({ kind: "block_ack", count: Object.keys(cc).length + Object.keys(vd).length,
+           seq: msg.seq });
   }
 });
 
@@ -115,6 +144,7 @@ if (target === null) {
       total++;
       if (args[5].toUInt32() === READ_IOCTL) {
         this.cap = true;
+        this.h = args[0];                 // FileHandle：用来认"是不是同一台设备"
         this.out = args[8];
         this.outLen = args[9].toUInt32();
         ioctl++;
@@ -128,15 +158,29 @@ if (target === null) {
       if (retval.toUInt32() !== 0 || this.out.isNull() || n < 2) return;
 
       let raw;
+      let bytes = null;
       try {
         raw = toHex(this.out, n);
+        bytes = new Uint8Array(this.out.readByteArray(n));
       } catch (e) {
         return;
       }
 
+      // ── 认人：句柄 + 报文形状 ────────────────────────────────────────
+      const hk = handleKey(this.h);
+      if (!seenHandles[hk]) {
+        seenHandles[hk] = 1;
+        otherHandles++;
+      }
+      if (targetHandle === null && bytes && looksLikeRemote(bytes, n)) {
+        // 第一份"遥控器形状"的报文 → 锁定这台设备的句柄，并告诉 Python。
+        targetHandle = this.h;
+        send({ kind: "target", handle: hk, len: n, handles: otherHandles });
+      }
+
       // 记「见过哪些 usage」，用来认人（换遥控器 / 兼容款时靠这一行）
       try {
-        const b = new Uint8Array(this.out.readByteArray(n));
+        const b = bytes;
         if (n === 3 && b[0] === 0x02) {
           const u = b[1] | (b[2] << 8);
           if (u) seen["cc:" + u] = (seen["cc:" + u] || 0) + 1;
@@ -152,7 +196,17 @@ if (target === null) {
         sent++;
         send({ kind: "report", raw: raw, len: n });
       }
-      // 快照已发出，现在才可以安全改写输出缓冲区
+
+      // ── 快照已发出，现在才可以安全改写输出缓冲区 ────────────────────
+      // ⚠ 只改**已确认的那个句柄**。没确认（targetHandle 还是 null）时
+      //   一个字节都不动 —— 宁可少抹一次原生动作，也不许动别人的报告。
+      if (targetHandle === null) {
+        return;
+      }
+      if (!this.h.equals(targetHandle)) {
+        skippedOther++;
+        return;
+      }
       nullify(this.out, n);
     }
   });
@@ -161,5 +215,7 @@ if (target === null) {
 // 轻量心跳：只给 Python 做健康判断用（20 秒一次，可忽略不计）
 setInterval(function () {
   send({ kind: "hb", total: total, sent: sent, blocked: blocked,
-         ioctl: ioctl, lens: lens, weird: weird, seen: seen });
+         ioctl: ioctl, lens: lens, weird: weird, seen: seen,
+         handles: otherHandles, skipped: skippedOther,
+         locked: targetHandle !== null });
 }, 20000);

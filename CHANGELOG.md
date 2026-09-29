@@ -7,6 +7,304 @@
 
 ---
 
+## 未发布（计划 v1.0.23）：项目审查报告整改
+
+来源是 `outputs/remote-voice-bridge-项目审查与整改方案-2026-09-29.md`。
+按报告编号逐条落地，**每一条都配一道自动化闸门 + 反例自证**。
+自动化闸门从 **28 步**加到 **43 步**（`python tools\check_all.py --ci`
+端到端 43 项全绿，另 1 项「按键注入自检」需要交互桌面、CI 上不跑）。
+P2 七条全部落地（1/2/3/4/5/6/7），另修掉一个 P2 排查时撞出来的真 NameError。
+
+### 控制台（P1-1 / P1-2）
+
+- **P1-1 鉴权**：以前只绑 `127.0.0.1` + 随机端口 —— 只挡外网，挡不住同机进程，
+  也挡不住浏览器里的网页。现在所有 `/api/*` 都要令牌（页面内嵌，`hmac.compare_digest`
+  比对），并补齐精确状态码（401 / 403 / 415 / 413）。裸 socket 验，不用真浏览器。
+- **P1-2 存储型 XSS**：`renderStatusList` 把 `checklist[].value` 拼进 `innerHTML`，
+  而那个值可以是 `/api/config` 写进去的设备名。现在整个前端只剩 `iconFor` 一处
+  `innerHTML`（赋的是本文件常量），HTML 里没有内联脚本/样式/事件，服务端真发 CSP。
+  闸门带真实浏览器渲染（node + playwright）。
+
+### 生命周期（P1-3 / P1-4）
+
+- **P1-3 收尾范围**：`run_bridge` 的 `finally` 原先只包住主循环，建立阶段那十来条
+  `return False` **全都绕过它** —— `GattSession` 还举着、Frida 注入还挂着、音频流
+  没停，全靠 GC 收。现在收尾只有一处（`_BridgeResources.teardown`），
+  闸门按句柄逐个核"登记了没有 / 释放了没有 / 有没有 None 判断"。
+- **P1-4 退出优雅收尾**：托盘退出原先只设自己的事件，主循环看不见 ⇒ daemon 线程
+  被直接掐掉。现象是「退出再开就连不上」。现在托盘把退出事件**交给** `run_bridge`，
+  其中「20 秒连接等待可被打断」是真跑一遍验的（假设备）。
+
+### 并发与配置（P1-5）
+
+控制台是 `ThreadingHTTPServer`：多个请求各读各的旧快照再写回 → **丢配置**；
+`save()` 直接截断写 → 并发读拿到半截 JSON → 回退默认 → **用户设置一次全没**。
+现在所有改配置都走 `Config.update`（同一把锁里读→改→写），写盘走临时文件 +
+`os.replace`（Windows 上与并发读抢句柄要退避重试）。
+
+### 按键链路（P1-6 / P1-8）
+
+- **P1-6 屏蔽表实时下发**：原先只在启动时 `set_mapping` 一次 ⇒ 运行中关掉映射后，
+  Python 不映射了、JS 仍按旧表把 usage 原地写 0：界面写着"已停用"，实际那个键
+  彻底失效、得重连。现在随配置实时下发，并**等钩子确认**（等不到就如实说"未确认"，
+  不让界面撒谎）。
+- **P1-8 目标精确化**：原先找不到精确 VID/PID 就自动回退到"任意 BLE HID 第一项"
+  （且匹配用子串判断，REV/序列号/MAC 段里撞上短 VID 就误判）；JS 侧只按 IOCTL
+  过滤、没绑 FileHandle ⇒ 同一个 `WUDFHost` 里别的蓝牙键鼠的报告也会被**原地改写**。
+  现象是"按键串台"，完全静默。现在 Python 侧精确匹配（节点名里的 VID/PID + 远端 MAC，
+  子串判断改成按分隔符切段），JS 侧绑到具体 FileHandle；兼容款兜底默认**关**。
+
+### 配对修复（P1-7）
+
+修复工具以管理员身份动注册表，老版本的备份有三个洞：
+
+1. 整棵 `BTHPORT\Parameters\Keys` + 整个 `Devices` 全抄 —— 本机**所有**蓝牙设备的
+   链路密钥都落盘；
+2. 备份落在 `%APPDATA%`（当前用户可写）—— 低权限进程塞一个"更新"的 `.reg`，
+   等用户下次点「还原」时被 UAC 提权导入，而里面装的是**能解密链路的材料**；
+3. 还原只 glob 最新的**一个** `.reg`（半个事务，且挑哪个看 mtime）。
+
+现在：最小子树 + `manifest`（事务 ID / SHA-256）+ 解析 `.reg` 键路径时**限制前缀**
++ 落在 `%ProgramData%` 且 DACL 禁继承 + 任一关键项失败即停。
+`_reg_prefix_ok` 还抓出一个真漏洞：裸 `startswith` 会放行
+`…\Services\BTHPORT_evil`，必须按**路径分段**匹配。
+
+### CI 与文档（P1-10 / 第六节 1~9）
+
+- **P1-10**：删掉只认 tag 的老工作流，重写 `.github/workflows/ci.yml`——
+  PR / main / tag 都触发，**只跑一句** `python tools/check_all.py --ci`（闸门清单
+  唯一权威是 `check_all.py` 的 `STEPS`，不再手工列第二份），build 依赖 checks，
+  release **只下载 artifact 不重新构建**、显式 `draft: true`、权限最小化。
+  同时给 `--ci` 补上"**必需项 SKIP 算失败**"（否则环境一坏，整道闸会静默变成
+  永远绿的摆设），并输出结构化摘要。
+- **第六节 1~3 `run.bat`**：入口 `main.py` → **`tray_app.py`**（走 `main.py`
+  没有托盘、只能关窗口硬杀进程）；把"系统默认麦克风"从 `CABLE Input` 改成
+  **`CABLE Output`**（VB-CABLE 两端命名是反的，写成 Input 就是读"没人写的那只
+  端点"，症状是一点声音都没有）；pip 输出落盘 `pip-install.log` 且失败即停。
+- **第六节 4~6 文档**：教程/README 里钉死的 `1.0.8` 安装包名、"备份在
+  `%APPDATA%`"、以及一段**已被推翻的旧结论**（"密钥很可能没跟过去、必须 purge"）
+  全部改正；README 里那份停在 v1.0.14 的逐版摘要（422 行）裁掉，改成指路 CHANGELOG。
+- **第六节 7**：`run-0x1812-takeover.bat` **退役**成只读提示壳 ——
+  `DevNodeStatus` 没有 `DN_DISABLEABLE`，Windows 不许禁用那个节点。
+- **第六节 8 支持范围**：`config.py` 新增 `PY_MIN/PY_MAX`，与 `ci.yml` 的
+  `python-version`、`run.bat` 的判定区间、`requirements.txt` / README 文案
+  **四处一致**（闸门盯着不许漂）。
+- **第六节 9 许可证**：`THIRD_PARTY_NOTICES.md` 重写，覆盖 `requirements*.txt` 里
+  每一个包（`pystray` 是 LGPL-3.0、`frida` 是 wxWindows、`PyInstaller` 的 GPL
+  特殊例外都单独交代），并让 `installer.iss` 真的把 `LICENSE` + NOTICES 装进
+  `{app}\licenses\`。
+
+### 托盘里加「修复 / 诊断」菜单（武哥的建议）
+
+右键菜单原先只有「重启 / 控制台 / 重新连接」，修蓝牙得自己去找 `.bat`。
+现在把「修复蓝牙配对 / 一键诊断 / 打开修复备份目录」等收进托盘菜单。
+闸门会**真的 build 一次菜单**：菜单项指向的函数改名、工具文件名写错、传了个
+工具不认的开关、用 `subprocess.run` 把托盘线程卡死 —— 这四种洞用户看到的
+都只是「点了没反应」，日志里一个字都没有。
+
+### 日志：轮转 / 脱敏 / raw HID 默认不记（P2-6）
+
+- **轮转**：`bridge.log` 以前是 `FileHandler`，**只涨不换**，真机上到过十几 MB
+  （`tools/` 里那几个读日志的脚本都得 seek 着读尾巴）。现在 5 MB × 3 份。
+  用 `logsetup.install()` **显式替换** root 的 handlers —— `basicConfig` 在 root
+  已有 handler 时什么都不做，"轮转"会悄悄失效。
+- **脱敏**：日志里到处是蓝牙地址，而用户排错**第一件事就是把日志发出来**。
+  默认只留前 2 / 后 2 字节（`f1:96:a2:63:67:1c` → `f1:xx:xx:xx:xx:1c`）——
+  "两个地址是不是同一个"看首尾字节照样分得出来。关掉：`config.json` 的
+  `"log_redact": false`。
+  实现上必须**先格式化再脱敏**（`RedactingFormatter`）：地址在 `record.args` 里，
+  用 `Filter` 够不到（`record.msg` 上只有 `适配器 %s`）。闸门里专门有一条反例
+  自证这一点。
+- **raw HID 默认不记**：`raw=02 42 00` 只对开发有用，而且能反推"用户按了什么"。
+  要看：`config.json` 的 `"log_raw_hid": true`。
+  （`frida_hid.py` 1 处 + `remote_hid.py` 3 处裸打 `raw.hex()` 全部收掉；
+  ATVV 控制通道那几个 hex 转储**故意保留**，理由写在闸门文件头。）
+
+### 入口 `.bat`：cmd.exe 会把批处理文件读错位（真机验收时撞出来的）
+
+**现象**：双击 `修复蓝牙配对.bat` / `run-0x1812-takeover.bat`，在真正有用的
+诊断之前先滚出一屏红字：
+
+```
+'配对、就是打不开"（E_INVALIDARG）。' is not recognized as an internal
+or external command, operable program or batch file.
+```
+
+**根因**：`chcp 65001` 之后，cmd.exe 会按**切换前的字节偏移**继续读这个
+批处理文件。UTF-8 的中文是 3 字节，偏移就对不上 —— 于是**从一行的中间**
+接着读，`REM` 前缀被吃掉，剩下的半句被当成命令执行。
+
+**为什么一直没人管**：脚本其实还能跑完（我们实测过：诊断、备份、修复、验收
+全都正常）。所以它是"看起来很严重、又不影响功能"的那类毛病 ——
+而它排在**用户唯一会双击的那个入口**上。
+
+**修法**：把 5 个含中文的 `.bat` 全部改成 **GBK + `chcp 936`**，跟仓库里
+三个一直在用的 `测*.bat` 一致（936 在中文 Windows 上本来就是当前代码页，
+`chcp 936` 等于没切换，也就没有偏移可错）。踩到的两个坑：
+
+- `⚠` 和 `⇒` **不在 GBK 里**，直接转码会 `UnicodeEncodeError` ——
+  换成 `[!]` / `→`（`[!]` 是那三个 `测*.bat` 已经在用的写法）。
+  （这就是 2026-09-23 那次"转 GBK 框线字符编不出来"的真正原因：
+  不是框线字符，是这两个。）
+- 实测 20 次 `修复蓝牙配对.bat`：改前 10 次里 1 次报错（累计 8 行），
+  改后 **0 次**。
+
+**代价（写在这里，免得以后有人"顺手改回 UTF-8"）**：把输出**重定向到文件**
+时，Python 那部分会跟着 936 变成乱码。控制台里不受影响（Python 走
+`WriteConsoleW`，不看代码页），而且给用户看的体检报告是独立的 UTF-8 文件
+`pairing-fix.txt`。**别改回去** —— 改回去就是拿"每次双击都可能滚一屏红字"
+换"重定向时好看一点"。
+
+**闸门**：`check_bat_env.py` 加判据 ③（含非 ASCII 就必须 GBK + 936，
+且用「GBK 往返一致」判而不是"能不能 decode"—— UTF-8 的 `⚠` 恰好也能被
+GBK 解出来），自检从 7 条加到 9 条。⚠ 顺带修正了它原来一个**模型错误**：
+② 说"REM 里的中文不打印，无所谓"，而错位吃掉的正是 `REM` 前缀 ——
+**注释里的中文才是被当命令执行的那部分**，所以 ③ 不跳过注释。
+
+新增 `tools/_bat.py`：读这些 `.bat` 的唯一入口。转编码时有三个闸门里
+**各自写死**的 `decode("utf-8")` 当场解出乱码，判据全变成"找不到那个字符串"，
+报出来的却是「run.bat 没启动 tray_app.py」这种**指向完全错误**的结论。
+
+### 子进程输出不许"解不出来就当没有"
+
+同一个晚上顺带抓到的：`subprocess.run(..., text=True)` 是按 **locale 编码**
+解子进程输出的，而 Windows 自带工具（`tasklist` / `powershell`）按
+**控制台代码页**吐字节 —— 两者不一定一致。解错会抛在 subprocess 的
+**读取线程**里，主流程只看到 `p.stdout` 是空的，于是
+
+```python
+if "RemoteVoiceBridge.exe" in (p.stdout or ""):   # ← 永远为假
+```
+
+把「桥程序正在跑」判成「没在跑」—— 而那个判断正是"遥控器诊断报告准不准"的
+前提（报告会写成"各键 0 次"，看着像遥控器坏了）。**崩溃看得见，静默的空输出才致命。**
+
+7 处缺 `errors="replace"` 的调用补齐，并加进 `check_failure_visibility.py`
+（用 **ast** 判，不是正则 —— 这些调用几乎都跨行写），含 2 条反例自证。
+
+### 其它（P2-4 / P2-5）
+
+- **P2-4**：`RemoteHidTap` 的 `self._stop = threading.Event()` **遮住了 CPython
+  内部的 `Thread._stop()`**，线程内部一调就是 `TypeError: 'Event' object is not
+  callable`；`stop()` 原先不 `join`，线程会在"置位"和"拆掉"之间又挂上一个没人收的
+  会话。现在改名 `_stopped`，`stop()` 按「置位 → join（有超时）→ teardown」走，
+  且 `frida.attach()` 返回后**再查一次**停止标志。
+- **P2-5**：`_migrate()` 原先只在"字段真的变了"时落盘 ⇒ 版本号跳了但默认值没变时，
+  新版本号永远写不回文件，**每次 load 都再迁一遍**。改成只要迁移跑过就落盘。
+
+### 采样率：先跟遥控器协商，再建音频链（P2-1）
+
+采样率是**遥控器**在 CAPS 响应里给我们的（ADPCM 8k / 16k），而 `ATVVState` 的
+默认值就是 `sample_rate = 16000`。老代码的顺序是「发 GET_CAPS → 不等 → 建流」——
+协商出来是 8k 的遥控器就被**按 16k 建流**。
+
+这条最阴的地方是**不报错**：不崩、不刷日志，只是声音变调变速。用户只会说
+"声音怪怪的"，而日志里一个字都没有，排查时根本无从下手。
+
+现在：
+
+- 发完 CAPS 请求**先等响应**（最多 3 秒，超时就用默认值继续 —— 一条慢响应
+  不该把整个桥卡住），并把结果写进日志（超时也写，不然这类故障没有证据）。
+- 信号用 `threading.Event`：置位发生在 BLE 回调线程上，`asyncio.Event.set()`
+  不是线程安全的。
+- 响应**迟到**且协商速率不同 ⇒ 按新速率**重建整条链**。这里有个容易漏的点：
+  `SystemMic` 是按 `out_rate` 做重采样的，**只换输出流也是错的** ——
+  所以 `_make_sysmic(sr)` 和输出流一起换。
+- 闸门 `tools/check_audio_rate.py`（13 项 + 6 条反例）。
+
+### 写入没成功就要回滚，不能"排上队就算数"（P2-2）
+
+`_send_tx()` 的返回值一直只代表"**已投递到主事件循环**"，而真正的 GATT 写入
+可能几百毫秒后才失败（链路抖动、遥控器走远、特征被注销）。老代码把"排上了"
+当成功返回，于是状态机按"已经开麦"记账：
+
+- `session.state.mic_open_sent = True` ⇒ 后面的 `ensure_mic_open()` 一律直接
+  return，**再也不重发**；
+- `pending_mic_echo` 也记了一笔"欠一声回声"，而回声永远不会来 ⇒ 窗口一直挂着，
+  下一条真按键可能被误吞。
+
+现象是"按了没反应"，日志上还写着"补发成功"。现在 `_send_tx(cmd, tag, on_done=…)`
+把**真实结果**（成功/失败）都回调出去，`_on_mic_open_done` 据此：
+
+- 成功 → 把回声窗口锚点挪到"遥控器真的收到了"那一刻（"排队"与"落地"能差 1 秒）；
+- 失败 → 销掉那笔回声账 + **复位「已开麦」标记**（这条最要紧）。
+
+两条实现上的细节都是踩出来的：
+
+- `on_done` **保证恰好调用一次**（含"连排队都没排上"那条同步路）—— 否则那笔账
+  永远挂着、销不掉。
+- `_on_mic_open` 里**先记账、再排队**。反过来的话有个竞态：`_send_tx` 一返回，
+  主循环可能立刻就写完并回调"失败销账"，而这边还没 `+= 1` —— 销账销在记账之前，
+  账上永远挂着 1 笔。
+- `MIC_CLOSE` 失败也如实记日志：`end_voice_session` 那行写的是"已发出"，
+  而它其实是"排上了"。
+
+### 会话协调器：加锁 + `shutdown()`（P2-3）
+
+`SessionCoordinator` 的方法来自**两个**线程：BLE 通知回调线程（`Dummy-XXXX`）
+和 `threading.Timer` 的定时器线程。两边会同时读写 `state.phase` / `mic_open_sent`，
+没有锁就可能留下 `phase=CLOSED` 而 `mic_open_sent=True` 这种自相矛盾的状态 ——
+表现是"下一次按语音键没反应"。
+
+- 加 `threading.RLock`（可重入：公开方法之间会互相调用），所有状态迁移都在锁里。
+- **所有**定时器登记进 `self._timers`，触发时把自己摘掉。
+  原先 `_retry_open` 的定时器返回值**直接丢了**，`close()` 取消不到它 ——
+  会话已经收尾，1 秒后它到点照样把相位推回 OPENING 并**再发一次 MIC_OPEN**。
+- 新增 `shutdown()`：置 `_closed` + 取消全部定时器，之后所有入口一律 no-op。
+  为什么 `close()` 不够：`close()` 是"收尾一次会话"，对象还是活的；而**重连 /
+  退出**时旧协调器会被丢掉，它排出去的定时器却还挂在 threading 里 ——
+  此时链路可能已经换了一条。`_closed` 是硬标记，不依赖"取消得够快"
+  （`Timer.cancel()` 对已经进入回调的定时器无效）。
+- 闸门：`tools/check_ble_callback_thread.py` 新增静态判据（每个入口都持锁、
+  没有丢返回值的 `_schedule`）+ 两条行为用例，其中「对照 + 判据」那对是
+  特意设计的 —— 先证明这个定时器真会跑（不然测的是空气），再证明 `close()` 拦得住。
+
+### 供应链：Action 钉 SHA、依赖锁哈希、SBOM、构建证明、签名待命（P2-7）
+
+- **Action 全部钉 40 位 commit SHA**（原来写 `@v4`）。`@v4` 是**可变引用**：
+  上游把 v4 指到一个新 commit，我们下次构建跑的就是没审过的新代码，
+  而这件事在 diff 里**看不见**（本仓库一个字节都没变）。行尾留版本注释便于升级对照。
+- **依赖装锁文件**：新增 `requirements.lock.txt`（26 个包，**含传递依赖**，
+  每个 wheel 带 SHA-256），CI 用 `pip install --require-hashes -r requirements.lock.txt`。
+  为什么必须：`pyinstaller` 会拉进 altgraph/pefile/pywin32-ctypes/setuptools、
+  `frida` 会拉进 cffi/pycparser/six —— 这些不锁版本，**同一份代码在不同时间
+  构建出的产物不一样**；而按键旁路靠的正是 frida 的原生扩展，它一变就是
+  "语音正常、按键全不灵"的静默故障。生成/校验：`tools/make_deps_lock.py`。
+  顺带把 `frida>=17.18,<18` 钉成 `frida==17.19.0`。
+- **SBOM**：CycloneDX 生成 `sbom.cdx.json`（读的是**刚按锁文件装出来的那个环境**，
+  所以版本与打进包里的同源），生成后**真解析一遍**再上传，随 Release 一起发。
+- **构建证明**：`actions/attest-build-provenance` 给安装包签一份可验证的声明
+  （用户可 `gh attestation verify` 自查"这个 exe 是不是本仓库构建的"）。
+  它**不替代** Authenticode：前者证明"从哪来"，后者证明"发布者是谁"。
+- ⚠ **Authenticode 签名：目前没有证书，处于待命状态。** 步骤写好了
+  （签 dist 里的 exe → 跑 ISCC → 再签安装包，顺序不能反），有
+  Secret `SIGN_PFX_B64` 就自动生效；没有的时候**明确打印"本次产物未签名"**
+  并写进 job 摘要 —— 不许静默跳过（静默跳过会让"以为签了"变成默认认知，
+  而下载页上可能写着"已签名"）。
+- 闸门：`tools/check_ci_workflow.py` 新增 D 组 6 项 + 7 条反例。
+
+### 顺带修掉一个真 NameError：退出 / 断连那条收尾其实没跑
+
+推进 P2 时用 `symtable` 核 `_BridgeResources.teardown` 的名字解析，发现它调用的
+`end_voice_session(...)` 是 `_run_bridge_inner` 里的**局部函数**，而在模块级类里
+那是个**全局名** —— 模块顶层根本没有这个名字 ⇒ 运行期 `NameError`
+⇒ 被 teardown 自己那句 `except Exception: logger.warning(...)` 吞掉。
+
+后果：**退出 / 断连那条收尾路径整条没跑**（相位、UI 状态、待发送登记都没归位），
+日志上只多一行"退出前收尾异常"。P1-3 拆壳时埋下的。
+
+为什么原来那道闸（`check_teardown_scope.py`）A~E 全绿却漏了它：动态探针 E1 用的是
+"句柄全为 None"的场景，而那句调用正好包在
+`if self.atvv is not None and self.coord is not None:` 里 —— 两个都是 None ⇒
+**那一行根本不执行** ⇒ 探不到。**判据得能走到那一行**。
+
+现在：收尾入口登记到 `res.end_voice_session`，teardown 走 `self.end_voice_session(...)`；
+闸门新增 F 组（用 `symtable` 核"teardown 引用的全局名在模块顶层必须有定义"），
+反例里有一条是**拿本文件真实源码**把 `self.end_voice_session` 改回裸名 ——
+用真文件自证，比拿玩具片段自证强。
+
+---
+
 ## v1.0.22：自听自的回环 + 键盘被劫持 + 遥控器关不掉
 
 **现象**（2026-09-29 报的，前后三条）：

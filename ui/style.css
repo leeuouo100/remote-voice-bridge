@@ -201,6 +201,9 @@ main { padding: 18px 22px 40px; max-width: 1180px; margin: 0 auto; }
 }
 .mini-input:hover { border-color: #3b3b45; }
 .mini-input:focus { outline: none; border-color: var(--accent-dim); }
+/* 宽度原来写在内联 style= 上 —— CSP 禁止内联样式（P1-2），挪到这里 */
+.mini-input.w-key   { width: 7em; }
+.mini-input.w-delay { width: 5em; }
 
 .btn {
   border: 1px solid var(--line);

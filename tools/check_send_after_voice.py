@@ -61,12 +61,17 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
     """
     checks: list[tuple[bool, str]] = []
 
-    def _fn_body(text: str, header: str) -> str:
-        """取以 header 开头、到下一个「恰好 4 空格缩进」的语句为止的**原文**。
+    def _fn_body(text: str, header: str, stop_re: str = r"^    \S") -> str:
+        """取以 header 开头、到下一个匹配 stop_re 的行为止的**原文**块。
 
         ⚠ 别用注释行当结束锚点：本文件里大量"为什么"的注释会逐字引用老写法，
           拿它当边界会切错块 → 断言因为"找不到"而变绿（假绿）。
           （`check_voice_session.py` 的 `_indent4_block` 是同一个理由。）
+
+        ⚠ 也别用「从某句话往回数 N 个字符」那种窗口定位分支 —— 窗口数字会过期。
+          P1-3 把连接段重构成「壳 + 真身」时，开始分支里只多了
+          `res.voice_active = True` 和一行注释，距离就从 900 以内涨到 938，
+          检查当场变红，而代码本身一点没坏。所以按**结构**切块：给 stop_re。
         """
         lines = text.splitlines()
         i = next((k for k, l in enumerate(lines) if l.startswith(header)), -1)
@@ -74,7 +79,7 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
             return ""
         j = i + 1
         while j < len(lines):
-            if re.match(r"^    \S", lines[j]):
+            if re.match(stop_re, lines[j]):
                 break
             j += 1
         return "\n".join(lines[i:j])
@@ -130,9 +135,15 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
                    "main：再按语音键收尾 → 登记发送"))
 
     # ── 4. 开始分支取消发送（最容易漏的那一半）──────────────────────
-    j = main_src.find("语音会话【开始】")
-    head = main_src[max(0, j - 900):j] if j >= 0 else ""
-    checks.append(("cancel_voice_send(" in head,
+    # ⚠ 按**结构**切出「开始新一段」这个分支（`elif not voice_active:` 到同缩进的
+    #   `else:`），而不是从日志那句话往回数字符。字符窗口会随重构过期 ——
+    #   上一版就是这么假红过一次（见 _fn_body 的注释）。
+    start_branch = _fn_body(main_src, "                elif not voice_active:",
+                            r"^                else:")
+    checks.append((bool(start_branch),
+                   "main：找得到「开始新一段」那个分支（elif not voice_active）"
+                   "—— 切不出来就说明这段结构变了，下面那条不算数"))
+    checks.append(("cancel_voice_send(" in start_branch,
                    "main：开始新一段时**取消**待发送"
                    "（否则「说完觉得不对、接着说」会把上一条残缺消息发出去）"))
 
@@ -254,8 +265,8 @@ def run_behavior_tests() -> bool | None:
     ok = True
     calls: list[str] = []
 
-    # ⚠ `_get_cfg` 是 run_bridge 里的**闭包**，模块级拿不到。
-    #   这里直接拿 config.Config() 的真实默认值构造 cached ——
+    # ⚠ `_get_cfg` 是桥循环里的**闭包**（P1-3 之后它在 `_run_bridge_inner`
+    #   里，模块级拿不到）。这里直接拿 config.Config() 的真实默认值构造 cached ——
     #   顺带把"默认值本身对不对"也验了（必须是**关**、800ms、enter）。
     import config as _cfgmod
     _d = _cfgmod.Config()

@@ -6,6 +6,24 @@
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
+/* ── 安全建 DOM（2026-09-29 审查报告 P1-2）────────────────────────────────────
+   以前渲染状态清单 / 设备列表时是把设备名、配置值直接**拼进 innerHTML**：
+
+       $('#status-list').innerHTML = rows;   // rows 里有 ${r.value}
+
+   而 r.value 的来源包括 `system_mic_device` 这类**可以由 /api/config 写入**
+   的字段 —— 往配置里塞一个 `<img src=x onerror=...>` 就是存储型 XSS。
+   拼字符串这条路只要有一处忘了转义就中招，所以整个文件**不再拼 innerHTML**：
+   自由文本一律走 textContent（它永远当纯文本，不解析标签）。
+
+   `el()` 就是为此准备的最小构造器；`iconFor()` 是唯一例外，见那里的注释。 */
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+
 const DB_FLOOR = -60;          // 电平条最低刻度（dBFS）
 const METER_SEGS = 14;         // 电平条格数
 let   state = null;            // 最近一次 /api/state
@@ -88,16 +106,17 @@ function paintWave(key, samples) {
      分 14 格之后，亮到第几格是个可数的整数，"刚才够不够响"就有答案了。
      顶部三格过亮时转红 = 快到削顶，提醒把增益调小。 */
 function paintMeter(key, db) {
-  const el = $(`#${key}-meter`);
-  if (!el) return;
-  if (el.childElementCount !== METER_SEGS) {          // 骨架只建一次，别每帧重建
-    el.innerHTML = '<i></i>'.repeat(METER_SEGS);
+  const meter = $(`#${key}-meter`);
+  if (!meter) return;
+  if (meter.childElementCount !== METER_SEGS) {        // 骨架只建一次，别每帧重建
+    meter.replaceChildren(...Array.from({ length: METER_SEGS },
+                                        () => document.createElement('i')));
   }
   const pct = db === null || db === undefined || db <= DB_FLOOR
     ? 0
     : Math.max(0, Math.min(1, (db - DB_FLOOR) / -DB_FLOOR));
   const lit = Math.round(pct * METER_SEGS);
-  const kids = el.children;
+  const kids = meter.children;
   for (let i = 0; i < METER_SEGS; i++) {
     const on = i < lit;
     kids[i].classList.toggle('is-on', on);
@@ -221,14 +240,18 @@ function renderChannels() {
 }
 
 // ── 渲染：状态清单 ────────────────────────────────────────────────────────────
+// ⚠ 这里原来是把 name/value **拼进 innerHTML**。而 value 里可能是
+//   `system_mic_device` 这类能由 /api/config 写入的字段 —— 往配置里塞一段
+//   `<img src=x onerror=...>` 就成了存储型 XSS（2026-09-29 审查报告 P1-2）。
+//   改成 DOM 节点 + textContent：textContent 永远当纯文本，不解析标签。
 function renderStatusList() {
-  const rows = state.checklist.map(r => `
-    <div class="status-row">
-      <span class="dot ${r.ok ? 'ok' : (r.warn ? 'warn' : '')}"></span>
-      <span class="name">${r.name}</span>
-      <span class="val ${r.mono ? '' : 'muted'}">${r.value}</span>
-    </div>`).join('');
-  $('#status-list').innerHTML = rows;
+  $('#status-list').replaceChildren(...state.checklist.map(r => {
+    const row = el('div', 'status-row');
+    row.append(el('span', 'dot ' + (r.ok ? 'ok' : (r.warn ? 'warn' : ''))));
+    row.append(el('span', 'name', r.name));
+    row.append(el('span', 'val ' + (r.mono ? '' : 'muted'), r.value));
+    return row;
+  }));
 }
 
 // ── 渲染：诊断 ────────────────────────────────────────────────────────────────
@@ -251,16 +274,19 @@ function renderDiag() {
 }
 
 // ── 渲染：设备列表 + 遥控器示意 ───────────────────────────────────────────────
+// 同 renderStatusList：设备名/签名都是自由文本，走 textContent（P1-2）。
 function renderDevices() {
-  $('#device-list').innerHTML = state.supported_devices.map(d => `
-    <div class="dev-item ${d.active ? 'is-active' : ''}">
-      <span class="dot ${d.connected ? 'ok' : ''}"></span>
-      <div>
-        <div class="dev-name">${d.name}</div>
-        <div class="dev-id">${d.signature}</div>
-      </div>
-      <span class="dev-state ${d.connected ? 'ok' : ''}">${d.connected ? '已连接' : '未连接'}</span>
-    </div>`).join('');
+  $('#device-list').replaceChildren(...state.supported_devices.map(d => {
+    const item = el('div', 'dev-item ' + (d.active ? 'is-active' : ''));
+    item.append(el('span', 'dot ' + (d.connected ? 'ok' : '')));
+    const box = el('div');
+    box.append(el('div', 'dev-name', d.name));
+    box.append(el('div', 'dev-id', d.signature));
+    item.append(box);
+    item.append(el('span', 'dev-state ' + (d.connected ? 'ok' : ''),
+                   d.connected ? '已连接' : '未连接'));
+    return item;
+  }));
 
   const active = state.supported_devices.find(d => d.active) || state.supported_devices[0];
   $('#map-dev-name').textContent = active ? active.name : '遥控器';
@@ -271,7 +297,13 @@ function renderDevices() {
 const BTN_ICONS = {
   up:'M12 5l5 7h-10z', down:'M12 19l5-7h-10z', left:'M5 12l7-5v10z', right:'M19 12l-7-5v10z',
 };
-function iconFor(id) {
+
+/* 图标 SVG 的字符串形式。⚠ 这里出现的**每一个值都是本文件里的常量**
+   （BTN_ICONS 表和下面写死的 path/形状），没有任何外部数据进来。
+   它是整个 app.js 里唯一还会碰到 innerHTML 的地方 —— 因为要建 SVG 命名空间
+   下的节点，用 DOM API 逐个属性写会啰嗦十倍且更容易写错。
+   缓存 + cloneNode：解析只做一次，之后每次复用。 */
+function iconSvg(id) {
   if (BTN_ICONS[id]) return `<svg class="btn-ico" viewBox="0 0 24 24"><path d="${BTN_ICONS[id]}" fill="currentColor"/></svg>`;
   if (id === 'ok')    return `<svg class="btn-ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="2.6" fill="currentColor"/></svg>`;
   if (id === 'back')  return `<svg class="btn-ico" viewBox="0 0 24 24"><path d="M14 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
@@ -287,6 +319,18 @@ function iconFor(id) {
   return `<svg class="btn-ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>`;
 }
 
+const _iconCache = new Map();
+function iconFor(id) {
+  let node = _iconCache.get(id);
+  if (!node) {
+    const tpl = document.createElement('template');
+    tpl.innerHTML = iconSvg(id);          // ← 常量，见 iconSvg 的注释
+    node = tpl.content.firstElementChild;
+    _iconCache.set(id, node);
+  }
+  return node.cloneNode(true);
+}
+
 function renderMapping() {
   const box = $('#map-rows');
   // 只在结构变化（按键集合/可用目标集合）时重建，否则每次轮询重建会打断下拉交互
@@ -294,23 +338,38 @@ function renderMapping() {
   if (box.dataset.sig !== sig) {
     box.dataset.sig = sig;
     const groups = state.target_groups || [{ label: '', ids: Object.keys(state.targets) }];
-    const opts = groups.map(g => {
-      const items = g.ids.filter(id => id in state.targets)
-        .map(id => `<option value="${esc(id)}">${esc(state.targets[id])}</option>`).join('');
-      return g.label ? `<optgroup label="${esc(g.label)}">${items}</optgroup>` : items;
-    }).join('');
-    box.innerHTML = state.buttons.map(b => {
+
+    // 目标下拉：用 new Option() 而不是拼 <option> 字符串 —— Option 的
+    // value/label 都走 textContent 语义，自由文本进来也当纯文本（P1-2）。
+    const makeSelect = () => {
+      const sel = document.createElement('select');
+      sel.className = 'select';
+      groups.forEach(g => {
+        const ids = g.ids.filter(id => id in state.targets);
+        if (!ids.length) return;
+        const host = g.label ? document.createElement('optgroup') : sel;
+        if (g.label) host.label = g.label;
+        ids.forEach(id => host.append(new Option(state.targets[id], id)));
+        if (g.label) sel.append(host);
+      });
+      return sel;
+    };
+
+    box.replaceChildren(...state.buttons.map(b => {
       if (b.voice) {
-        return `<div class="map-item is-locked">
-          ${iconFor(b.id)}<span class="btn-name">${esc(b.label)}</span>
-          <span class="lock">由语音通道处理（不可映射）</span>
-        </div>`;
+        const item = el('div', 'map-item is-locked');
+        item.append(iconFor(b.id), el('span', 'btn-name', b.label),
+                    el('span', 'lock', '由语音通道处理（不可映射）'));
+        return item;
       }
-      return `<div class="map-item" data-btn="${esc(b.id)}">
-        ${iconFor(b.id)}<span class="btn-name">${esc(b.label)}</span>
-        <select class="select" data-map="${esc(b.id)}">${opts}</select>
-      </div>`;
-    }).join('');
+      const item = el('div', 'map-item');
+      item.dataset.btn = b.id;
+      const sel = makeSelect();
+      sel.dataset.map = b.id;
+      item.append(iconFor(b.id), el('span', 'btn-name', b.label), sel);
+      return item;
+    }));
+
     box.querySelectorAll('select[data-map]').forEach(sel => {
       sel.addEventListener('change', () => saveMapping(sel.dataset.map, sel.value));
       sel.closest('.map-item').addEventListener('mouseenter', () => highlightBtn(sel.dataset.map, true));
@@ -365,10 +424,16 @@ function highlightBtn(id, on) {
 
 async function saveMapping(btn, value) {
   try {
-    await api('/api/mapping', { button: btn, value });
+    const r = await api('/api/mapping', { button: btn, value });
     const t = state.targets[value] || value;
     $('#map-note').textContent = `✓ 已保存：${btn} → ${t}`;
     setTimeout(() => { $('#map-note').textContent = ''; }, 3000);
+    // effective === false：钩子没确认收到新表（旁路正在重挂 / 注入没起来）。
+    // 这时界面显示"已保存"而按键可能还按旧表走 —— 必须说出来，
+    // 否则用户会以为"这个键坏了"（P1-6）。
+    if (r && r.effective === false) {
+      toast('已保存，但按键钩子尚未确认（重连后生效）', true);
+    }
   } catch (e) { toast('保存失败：' + e.message, true); }
 }
 
@@ -418,7 +483,8 @@ function fillSelect(sel, values, current) {
   const sig = vals.join('\u0001');
   if (sel.dataset.sig !== sig) {
     sel.dataset.sig = sig;
-    sel.innerHTML = vals.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+    // new Option(text, value) 而不是拼 <option>：自由文本当纯文本处理（P1-2）
+    sel.replaceChildren(...vals.map(v => new Option(v, v)));
   }
   if (document.activeElement !== sel && current !== undefined) sel.value = current;
 }
@@ -490,15 +556,17 @@ async function openRecorder(target, titleText) {
   $('#rec-mask').classList.add('is-open');
   $('#rec-title').textContent = titleText;
   $('#rec-desc').textContent = '请按下要映射的组合键…（按 Esc 取消）';
-  $('#rec-keys').innerHTML = '';
+  $('#rec-keys').replaceChildren();
   await api('/api/record/start', {});
   clearInterval(recTimer);
   recTimer = setInterval(async () => {
     let r;
     try { r = await api('/api/record/poll'); } catch (_) { return; }
     if (r.status === 'recording') {
-      $('#rec-keys').innerHTML = (r.held || []).map(k => `<kbd>${esc(k)}</kbd>`).join('') ||
-        '<span class="tiny-note">等待按键…</span>';
+      const held = r.held || [];
+      $('#rec-keys').replaceChildren(...(held.length
+        ? held.map(k => el('kbd', null, k))
+        : [el('span', 'tiny-note', '等待按键…')]));
       return;
     }
     clearInterval(recTimer);
@@ -572,11 +640,19 @@ function initEvents() {
   $('#remote-enabled').addEventListener('change', e => api('/api/mix', { remote_enabled: e.target.checked }));
 
   // 映射启用开关
-  $('#mapping-enabled').addEventListener('change', e =>
-    api('/api/config', { mapping_enabled: e.target.checked }));
+  $('#mapping-enabled').addEventListener('change', async e => {
+    const r = await api('/api/config', { mapping_enabled: e.target.checked });
+    if (r && r.effective === false) {
+      toast('已保存，但按键钩子尚未确认（重连后生效）', true);
+    }
+  });
   $('#btn-reset-map').addEventListener('click', async () => {
-    await api('/api/mapping/reset', {});
-    toast('已恢复默认映射');
+    const r = await api('/api/mapping/reset', {});
+    if (r && r.effective === false) {
+      toast('已恢复默认，但按键钩子尚未确认（重连后生效）', true);
+    } else {
+      toast('已恢复默认映射');
+    }
   });
 
   // 设置页

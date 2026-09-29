@@ -22,11 +22,12 @@ import threading
 import time
 import webbrowser
 import winreg
+from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw
 
-from config import APP_VERSION, CONFIG_DIR, INPUT_METHODS, Config
+from config import APP_VERSION, BACKUP_DIR, CONFIG_DIR, INPUT_METHODS, Config
 import state
 
 APP_NAME  = "Remote Voice Bridge"
@@ -35,8 +36,17 @@ RUN_KEY   = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "RemoteVoiceBridge"
 REPO_URL  = "https://github.com/leeuouo100/remote-voice-bridge"
 
+# 修复工具的产出（路径与 pairing.py 保持一致，别各写各的）
+PAIRING_REPORT = CONFIG_DIR / "pairing-fix.txt"
+# 备份目录从 config 拿**同一个常量**（P1-7 之后它在 %ProgramData% 下，
+# 不再是 CONFIG_DIR/backup；这里再写一遍字面量迟早会漂）。
+PAIRING_BACKUP = BACKUP_DIR
+
 _stop = threading.Event()
 _icon: "pystray.Icon | None" = None
+# 桥线程的引用：`_quit` 要 join 它，等它把 GattSession / Frida / 音频流收干净
+# 再放进程走（2026-09-29 审查报告 P1-4）。
+_bridge_thread: "threading.Thread | None" = None
 
 
 # ── DPI ───────────────────────────────────────────────────────────────────────
@@ -130,10 +140,11 @@ def _status_text(item=None) -> str:
 
 def _make_im_action(key: str):
     def _act(icon, item):
-        cfg = Config.load()
-        cfg.input_method = key
-        cfg.voice_hotkey = []
-        cfg.save()
+        # 走 Config.update：同一把锁里"读→改→写"。
+        # 托盘动作和控制的 HTTP 请求是**两个线程**，各读各的旧快照再写回
+        # 会把彼此改的字段整段覆盖掉（2026-09-29 审查报告 P1-5）。
+        Config.update(lambda c: (setattr(c, "input_method", key),
+                                 setattr(c, "voice_hotkey", [])))
         icon.update_menu()
     return _act
 
@@ -179,8 +190,176 @@ def _open_config_dir(icon=None, item=None):
     os.startfile(str(CONFIG_DIR))          # noqa: S606
 
 
+# ── 修复 / 诊断工具 ───────────────────────────────────────────────────────────
+# 2026-09-29（武哥的建议）：把这些工具收进托盘右键菜单 —— 出问题时不用再去
+# 开始菜单或仓库目录里翻 .bat，「右键 → 修复 / 诊断」就有。
+#
+# 三条设计要点，每条都是踩过的坑：
+#
+#  · **只起窗口、绝不等待**。这些工具会弹 UAC、会 `pause`、会打印几十行诊断。
+#    用 `subprocess.run` 等它 = 把托盘线程**卡死**（菜单点不动、图标不刷新、
+#    连"退出"都点不了）。所以一律 `Popen` / `startfile` 后立刻返回。
+#
+#  · **提权交给工具自己**。`修复蓝牙配对.bat` 与 `RemoteVoiceBridgeDiag.exe`
+#    内部会 `ShellExecute runas` 弹 UAC（见 pairing.elevate_and_wait）。
+#    托盘进程自己不提权 —— 不把整个常驻进程的安全边界扩大。
+#
+#  · **安装版与源码版通吃**。优先用仓库里那两个 .bat：它们自己会判断
+#    "旁边是 Diag.exe 还是 .py"，还带 `pause` 让用户看清结果。只有 bat
+#    不在时才退回直接调 exe / python。
+#
+# ⚠ 这些工具**不要**改用 `os.system` —— 那会继承本进程的 stdout（GUI 版是空的），
+#   输出直接扔掉，用户看到的就是"点了没反应"。
+
+def _app_dir() -> Path:
+    """程序所在目录。安装版 = exe 旁边；源码版 = 仓库根（本文件所在目录）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _find_tool(*names: str) -> Path | None:
+    d = _app_dir()
+    for n in names:
+        p = d / n
+        if p.exists():
+            return p
+    return None
+
+
+def _spawn(cmd: list[str]) -> bool:
+    """在新控制台窗口里跑命令。返回是否成功起进程。"""
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010) if os.name == "nt" else 0
+    try:
+        subprocess.Popen(cmd, cwd=str(_app_dir()), creationflags=flags)  # noqa: S603
+        return True
+    except Exception as e:                       # noqa: BLE001
+        print(f"[tools] 启动失败：{e}", flush=True)
+        return False
+
+
+def _open_path(p: Path) -> bool:
+    try:
+        os.startfile(str(p))                     # noqa: S606
+        return True
+    except Exception as e:                       # noqa: BLE001
+        print(f"[tools] 打不开 {p}：{e}", flush=True)
+        return False
+
+
+def _notify(icon, msg: str, title: str = APP_NAME) -> None:
+    """尽力弹一条托盘气泡。pystray 在部分后端上不支持，失败就算了。"""
+    if icon is None:
+        return
+    try:
+        icon.notify(msg, title)
+    except Exception:                            # noqa: BLE001
+        pass
+
+
+def _run_pairing_tool(extra: list[str], icon=None) -> None:
+    """蓝牙配对：优先走 .bat（自己找 exe / python），否则直接调 exe / 脚本。
+
+    `extra` 里的开关对两个环境都成立：
+      · `--fix-pairing`        诊断 + 需要时弹 UAC 修复
+      · `--fix-pairing --dry-run`  只诊断、不改任何东西、不弹 UAC
+    """
+    bat = _find_tool("修复蓝牙配对.bat")
+    if bat is not None:
+        # .bat 走 ShellExecute 起新窗口：它内部 `cd /d "%~dp0"` 自己定工作目录，
+        # 而且结尾有 `pause`，用户能看清结果。
+        if _open_path(bat):
+            return
+
+    diag = _find_tool("RemoteVoiceBridgeDiag.exe")
+    if diag is not None:
+        _spawn([str(diag), *extra])
+        return
+
+    # 源码版兜底：直接跑 pairing.py（同样自己弹 UAC）
+    src = _find_tool("pairing.py")
+    if src is not None:
+        # dry-run 时把 --fix-pairing 换成纯只读（pairing.py 不带 --fix 就是只读诊断）
+        args = [a for a in extra if a != "--fix-pairing"]
+        _spawn([sys.executable, str(src), *args])
+        return
+
+    _notify(icon, "找不到修复工具（安装目录里应有「修复蓝牙配对.bat」）")
+
+
+def _fix_pairing(icon=None, item=None):
+    """蓝牙配对修复 —— 换过 USB 口 / 连不上时跑这个。"""
+    _run_pairing_tool(["--fix-pairing"], icon)
+    _notify(icon, "已在新窗口里启动「蓝牙配对修复」。\n"
+                  "它会先只读诊断，确认要改才弹 UAC。")
+
+
+def _pairing_check(icon=None, item=None):
+    """蓝牙配对体检（只读）—— 不改任何东西、不弹 UAC。"""
+    _run_pairing_tool(["--fix-pairing", "--dry-run"], icon)
+    _notify(icon, "已启动「蓝牙配对体检」（只读，不改任何设置）。")
+
+
+def _diag_remote(icon=None, item=None):
+    """遥控器诊断 —— 按键没反应时跑这个（要按几下遥控器）。"""
+    diag = _find_tool("RemoteVoiceBridgeDiag.exe")
+    if diag is not None:
+        _spawn([str(diag)])
+        return
+    bat = _find_tool("diag-remote.bat")
+    if bat is not None and _open_path(bat):
+        return
+    src = _find_tool(os.path.join("tools", "diag_remote.py"))
+    if src is not None:
+        _spawn([sys.executable, str(src)])
+        return
+    _notify(icon, "找不到诊断工具（安装目录里应有 RemoteVoiceBridgeDiag.exe）")
+
+
+def _open_pairing_report(icon=None, item=None):
+    """打开上次的配对体检报告。"""
+    if not PAIRING_REPORT.exists():
+        _notify(icon, "还没有体检报告。先跑一次「蓝牙配对体检」或「蓝牙配对修复」。")
+        return
+    _open_path(PAIRING_REPORT)
+
+
+def _open_backup_dir(icon=None, item=None):
+    """打开修复前的注册表备份目录（出问题可以双击 .reg 还原）。"""
+    if not PAIRING_BACKUP.exists():
+        _notify(icon, "还没有备份。修复工具动注册表之前会自动备份到这里。")
+        return
+    _open_path(PAIRING_BACKUP)
+
+
 def _quit(icon, item):
+    """退出：**先让桥线程自己收尾**，再关控制台和托盘。
+
+    ⚠ 原来这里只 `_stop.set()` 就去 `icon.stop()` 了。桥线程是 daemon，
+    主进程一结束就被直接掐掉 —— `run_bridge` 的 `finally`（关 GattSession /
+    停 Frida 注入 / 关音频流）**不保证执行**。现象是"退出再开就连不上"，
+    而日志里看不出任何异常（2026-09-29 审查报告 P1-4）。
+
+    现在：置位 → 等桥线程自己走完 finally → 超时才放它走（并且**说出来**）。
+    """
     _stop.set()
+    try:
+        import main
+        main.request_stop()          # 让**正在跑的** run_bridge 也能看见
+    except Exception:                # noqa: BLE001
+        pass
+
+    t = _bridge_thread
+    if t is not None and t.is_alive():
+        # 20 秒的连接等待已经会被 stop 叫醒，所以 8 秒足够；超时说明卡在别处，
+        # 这时**必须留下痕迹** —— 否则"清理没跑完"会变成一个查不到的幽灵。
+        t.join(timeout=8.0)
+        if t.is_alive():
+            print("[bridge] ⚠ 桥线程 8 秒内没退出，进程将直接结束"
+                  "（GattSession / 注入 / 音频流可能没清理干净）", flush=True)
+        else:
+            print("[bridge] ✅ 桥线程已收尾（Cleanup done）", flush=True)
+
     state.reset()
     try:
         import console_server
@@ -211,6 +390,17 @@ def build_menu(icon) -> pystray.Menu:
         pystray.MenuItem("控制台", _open_console, default=True),
         pystray.MenuItem("输入法 / 语音触发键", pystray.Menu(*im_items)),
         pystray.MenuItem("重新连接", _request_reconnect),
+        # 修复 / 诊断（2026-09-29 武哥建议）：出问题时右键就有，不用去翻目录。
+        # ⚠ 子菜单里的顺序 = 出问题的排查顺序：连不上 → 先体检 → 再修；
+        #   按键不灵 → 遥控器诊断。别把"修"排在"查"前面。
+        pystray.MenuItem("修复 / 诊断", pystray.Menu(
+            pystray.MenuItem("蓝牙配对体检（只读，不改动）", _pairing_check),
+            pystray.MenuItem("蓝牙配对修复（换过 USB 口、连不上时跑这个）", _fix_pairing),
+            pystray.MenuItem("遥控器诊断（按键没反应时跑这个）", _diag_remote),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("打开配对体检报告", _open_pairing_report),
+            pystray.MenuItem("打开修复备份目录", _open_backup_dir),
+        )),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("开机启动", _toggle_autostart,
                          checked=lambda item: _is_autostart()),
@@ -234,13 +424,17 @@ def _bridge_worker():
     #   2026-09-15 真机事故就是栽在这：桥每 3 秒崩一次、桥日志里一行报错都没有、
     #   Windows 事件日志也查不到（异常是 Python 层的，不是进程崩溃），
     #   最后只能靠手写探针才把 OSError 挖出来。异常必须走 logger（→ bridge.log）。
-    #   注：main 导入时已 basicConfig 好 FileHandler，这里拿同名 logger 即可。
+    #   注：main 导入时已由 logsetup.install() 装好「轮转文件 + 控制台」两个
+    #   handler（P2-6），这里拿同名 logger 即可。
     log = logging.getLogger("rvb")
 
     fails = 0
     while not _stop.is_set():
         try:
-            ok = asyncio.run(run_bridge())
+            # 把托盘的退出事件**交给** run_bridge：它每一轮都看，收到就走
+            # 自己的 finally 去清理（P1-4）。只设 `_stop` 是不够的 ——
+            # 桥线程看不到托盘模块里的那个事件。
+            ok = asyncio.run(run_bridge(stop_event=_stop))
             fails = 0 if ok else fails + 1
         except Exception:  # noqa: BLE001
             fails += 1
@@ -261,11 +455,13 @@ def _bridge_worker():
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 def main():
-    global _icon
+    global _icon, _bridge_thread
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     _enable_dpi_awareness()
 
-    threading.Thread(target=_bridge_worker, daemon=True).start()
+    _bridge_thread = threading.Thread(target=_bridge_worker, daemon=True,
+                                      name="rvb-bridge")
+    _bridge_thread.start()
 
     _icon = pystray.Icon(APP_NAME, _icon_image(),
                          f"{APP_NAME} v{APP_VERSION}（启动中…）")

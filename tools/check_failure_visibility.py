@@ -84,7 +84,12 @@ MAIN = read("main.py")
 worker = code_only(func_body(TRAY, "_bridge_worker"))
 status = code_only(func_body(TRAY, "_status_text"))
 open_ble = code_only(func_body(MAIN, "_open_ble_device"))
-run_bridge = code_only(func_body(MAIN, "run_bridge"))
+# ⚠ 2026-09-29（P1-3）：`run_bridge` 已拆成「壳 + 真身」。
+#   真身是 `_run_bridge_inner`，连接动作在里面；壳只负责收尾。
+#   查壳 = 查了个空壳（那一项永远红，或者更糟：以后有人把检查删掉）。
+#   所以实体定位指 `_run_bridge_inner`，壳另用一条断言盯它别自己绕过诊断。
+bridge_body = code_only(func_body(MAIN, "_run_bridge_inner"))
+bridge_shell = code_only(func_body(MAIN, "run_bridge"))
 find_remote = code_only(func_body(MAIN, "find_remote"))
 live_addr = code_only(func_body(MAIN, "_live_adapter_addr"))
 pick_live = code_only(func_body(MAIN, "_pick_live_devices"))
@@ -125,10 +130,14 @@ A("s.connected" in status and "s.streaming" in status,
   "托盘状态仍然区分 已连接 / 语音中")
 
 # ── 4) 写了必须接上（v1.0.7 同类事故：防御机制写着但没在所有路径生效）──────────
-A(re.search(r"_open_ble_device\(dev_info\)", run_bridge) is not None,
-  "run_bridge 真的调用了 _open_ble_device（而不是绕过它自己 from_id_async）")
-A("BluetoothLEDevice.from_id_async(dev_info.id)" not in run_bridge,
-  "run_bridge 里不再有裸的 from_id_async 调用（避免绕过诊断）")
+A(bridge_body, "main._run_bridge_inner 存在（真身，不是那层壳）")
+A(re.search(r"_open_ble_device\(dev_info\)", bridge_body) is not None,
+  "_run_bridge_inner 真的调用了 _open_ble_device（而不是绕过它自己 from_id_async）")
+A("BluetoothLEDevice.from_id_async(dev_info.id)" not in bridge_body,
+  "_run_bridge_inner 里不再有裸的 from_id_async 调用（避免绕过诊断）")
+# 壳也不能自己绕过诊断去连 —— 壳里出现裸调用说明有人把连接又抄了一份出去。
+A("BluetoothLEDevice.from_id_async(dev_info.id)" not in bridge_shell,
+  "壳 run_bridge 里也没有裸的 from_id_async（壳不许自己另开一条连接路）")
 
 # ── 5) 作废记录必须在**选设备**那一步就排掉（v1.0.10）─────────────────────────
 # 同一个家系里最容易漏的一条：诊断写在连接处，但选设备在更前面。
@@ -153,8 +162,8 @@ mut2 = open_ble.replace("local_addr != now_addr", "False")
 A(re.search(r"local_addr\s*!=\s*now_addr", mut2) is None,
   "[反例] 去掉地址比对后，本闸应当能发现")
 
-# ── 反例 3：把 run_bridge 里的调用换成裸调用，检查项必须翻红 ─────────────────
-mut3 = run_bridge.replace("_open_ble_device(dev_info)", "BluetoothLEDevice.from_id_async(dev_info.id)")
+# ── 反例 3：把真身里的调用换成裸调用，检查项必须翻红 ─────────────────────────
+mut3 = bridge_body.replace("_open_ble_device(dev_info)", "BluetoothLEDevice.from_id_async(dev_info.id)")
 A(re.search(r"_open_ble_device\(dev_info\)", mut3) is None
   and "BluetoothLEDevice.from_id_async(dev_info.id)" in mut3,
   "[反例] 绕过 _open_ble_device 后，本闸应当能发现")
@@ -163,6 +172,93 @@ A(re.search(r"_open_ble_device\(dev_info\)", mut3) is None
 mut4 = find_remote.replace("_pick_live_devices(devices, now_addr)", "devices, stale = devices, []")
 A("_pick_live_devices(" not in mut4,
   "[反例] find_remote 不再分流作废候选时，本闸应当能发现")
+
+# ── 6) 子进程的输出不许"解不出来就当没有"（2026-09-29）────────────────────────
+# `subprocess.run(..., text=True)` 是按 **locale 编码**解子进程输出的，而
+# Windows 自带工具（tasklist / powershell）按**控制台代码页**吐字节 ——
+# 两者不一定一致。实测（2026-09-29）：环境里带 PYTHONUTF8=1 时 locale 是
+# utf-8、而 tasklist 吐的是 GBK，于是 subprocess 的**读取线程**抛
+# `UnicodeDecodeError`，主流程只看到 `p.stdout` 是空的。
+#
+# 后果不是"崩了"，是**静默给出错误答案**：
+#   `if "RemoteVoiceBridge.exe" in (p.stdout or "")` ⇒ 判成"桥程序没在跑"，
+#   而它其实正在跑 —— 于是体检报告写成"遥控器各键 0 次"，看着像遥控器坏了。
+# 这正是本文件开头那件事的同一个家系，所以钉在这里。
+#
+# 规则：凡是 `text=True`，必须同时带 `encoding=` 或 `errors="replace"`。
+import ast
+import glob
+
+
+def text_calls_without_errors(src: str) -> list[int]:
+    """返回「`text=True` 却没带 `encoding=` / `errors=`」的行号。
+
+    ⚠ 用 ast 而不是正则：这些调用几乎都是**多行**写的，正则很难判断
+    "这个 `errors=` 到底属不属于这一次调用"（窗口式匹配会假绿或假红）。
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []
+    out: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id == "subprocess"):
+            continue
+        if f.attr not in ("run", "Popen", "check_output", "check_call", "call"):
+            continue
+        kw = {k.arg for k in node.keywords if k.arg}
+        text_on = any(
+            k.arg in ("text", "universal_newlines")
+            and isinstance(k.value, ast.Constant) and k.value.value is True
+            for k in node.keywords)
+        if text_on and "encoding" not in kw and "errors" not in kw:
+            out.append(node.lineno)
+    return out
+
+
+_sources: dict[str, str] = {}
+for _name in ("main.py", "pairing.py", "console_server.py", "tray_app.py",
+              "hidwatch.py", "remote_hid.py", "frida_hid.py"):
+    _p = os.path.join(ROOT, _name)
+    if os.path.exists(_p):
+        _sources[_name] = open(_p, encoding="utf-8", errors="replace").read()
+for _p in sorted(glob.glob(os.path.join(ROOT, "tools", "*.py"))):
+    _b = os.path.basename(_p)
+    if not _b.startswith("_"):
+        _sources[f"tools/{_b}"] = open(_p, encoding="utf-8", errors="replace").read()
+
+_offenders: list[str] = []
+_n_text = 0
+for _name, _src in _sources.items():
+    _n_text += _src.count("text=True")
+    for _ln in text_calls_without_errors(_src):
+        _offenders.append(f"{_name}:{_ln}")
+
+# 判据不是空转：扫描面里确实有这类调用（否则上面那条会**永远绿**）
+A(_n_text >= 5, f"扫描面覆盖到 {_n_text} 处 `text=True` 的子进程调用")
+A(not _offenders,
+  f"所有 `text=True` 的子进程调用都带了 `encoding=` 或 `errors=`"
+  f"（越界：{_offenders or '无'}）—— 少了它，解码失败会抛在读取线程里，"
+  f"主流程只看到空输出，于是**静默给出错误答案**")
+
+# ── 反例 5：text=True 不带 errors= 必须被报出，带了必须放过 ─────────────────
+_bad_src = ('import subprocess\n'
+            'subprocess.run(["tasklist"], capture_output=True, text=True)\n')
+_good_src = ('import subprocess\n'
+             'subprocess.run(["tasklist"], capture_output=True, text=True,\n'
+             '               errors="replace")\n')
+_good_enc = ('import subprocess\n'
+             'subprocess.run(["x"], capture_output=True, text=True,\n'
+             '               encoding="utf-8")\n')
+A(text_calls_without_errors(_bad_src) == [2],
+  "[反例] `text=True` 不带 errors= ⇒ 报出行号 2")
+A(not text_calls_without_errors(_good_src)
+  and not text_calls_without_errors(_good_enc),
+  "[反例] 带了 `errors=` 或 `encoding=` ⇒ 必须放过（多行写法也要认）")
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 fails = 0
