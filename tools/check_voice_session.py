@@ -426,6 +426,38 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
               "⑦ 那个时刻必须在 stream_active 那道门**之前**记"
               "（记在门后 → 要抓的情形里它永远不刷新 → 自愈条件永远不成立，"
               "代码在、永远跑不到）"))
+
+    # ── ⑧ 自愈的**宽限期**（2026-09-30 真机）────────────────────────────────
+    #
+    # 为什么要这一组：我们发完 MIC_CLOSE 之后，遥控器手里/空中的那几帧还会到
+    # （实测 0.16 秒内），于是**每次正常收尾都会命中自愈**、打一句
+    # 「某条收尾路径漏发了命令」—— 而上一行明明写着 `MIC_CLOSE 已发出`。
+    # 真机日志里一次会话响一次，属于"狼来了"：真出事（多推 52 秒那次）时
+    # 反而没人会看这一句。宽限期就是让这句告警重新变得可信。
+    c.append(("_MIC_CLOSE_GRACE" in code,
+              "⑧ 有 MIC_CLOSE 宽限期（没有它 → 每次正常收尾都误报「收尾漏发了命令」）"))
+    c.append((code.count("_mic_close_sent_at = time.time()") >= 2,
+              "⑧ 「我们最后一次关麦」的时刻两条路都记：排队时记一笔、"
+              "真落地（ok=True）再挪一次（排队与落地能差 1 秒，宽限期跟着差）"))
+    i_grace = code.find("<= _MIC_CLOSE_GRACE")
+    i_warn = code.find("补发 MIC_CLOSE 让它停")
+    c.append((i_grace >= 0 and i_warn > i_grace,
+              "⑧ 宽限期判断排在告警**之前**（反过来等于没有宽限期）"))
+    # ⚠ 这一条必须看**原文 src**，不能看 `code`：`_code_only` 会把
+    #   `logger.debug(...)` / `logger.warning(...)` 这类调用**整行剥掉**
+    #   （它认为日志文本不属于"代码"），于是 `logger.debug(` 在 code 里根本
+    #   搜不到 —— 判据会永远为假。第一版就栽在这儿（当场报红）。
+    s_grace = src.find("<= _MIC_CLOSE_GRACE")
+    s_warn = src.find("补发 MIC_CLOSE 让它停")
+    c.append((s_grace >= 0 and s_warn > s_grace
+              and "logger.debug(" in src[s_grace:s_warn],
+              "⑧ 宽限期内只记 debug —— 正常现象不该占 INFO 的注意力"))
+    c.append(("正常情况下不该出现" not in code,
+              "⑧ 告警文案里不再有那句误报（「正常情况下不该出现」）"))
+    c.append(("_on_mic_close_done" in code
+              and "nonlocal _mic_close_sent_at" in code,
+              "⑧ 关麦时刻在回调里被挪（成功才挪；失败不挪 —— 那说明遥控器压根"
+              "没收到，宽限期不该替它挡枪）"))
     return c
 
 
@@ -628,7 +660,36 @@ def main() -> int:
                     "            return\n"
                     "        _remote_frame_last_at = time.time()", 1))
 
-    if n_red < 15:
+    # 反例 18：去掉 MIC_CLOSE 宽限期（＝每次正常收尾都误报「收尾漏发了命令」，
+    #          真正的残留推流反而淹没在噪声里）
+    _expect_red("去掉自愈的宽限期判断（＝告警在每次正常收尾时都响）",
+                src.replace("(_now_v - _mic_close_sent_at) <= _MIC_CLOSE_GRACE",
+                            "False", 1))
+
+    # 反例 19：真落地时不再挪关麦时刻（＝宽限期按"排队时刻"起算，
+    #          落地慢 1 秒就白白多等/少等一秒）
+    _expect_red("_on_mic_close_done 成功时不再挪关麦时刻",
+                src.replace(
+                    "        nonlocal _mic_close_sent_at\n"
+                    "        if ok:\n"
+                    "            _mic_close_sent_at = time.time()\n"
+                    "            return\n",
+                    "        nonlocal _mic_close_sent_at\n"
+                    "        if ok:\n"
+                    "            return\n", 1))
+
+    # 反例 20：把那句误报文案加回去
+    _expect_red("把「正常情况下不该出现」那句误报加回告警里",
+                src.replace("这说明它**真的**没停下来",
+                            "正常情况下不该出现，这说明它**真的**没停下来", 1))
+
+    # 反例 21：宽限期内改用 warning 打（＝正常现象又变回噪声）
+    _expect_red("宽限期内改用 warning 打（＝正常现象又变回噪声）",
+                src.replace('logger.debug(\n                        "（正常）刚发过',
+                            'logger.warning(\n                        "（正常）刚发过',
+                            1))
+
+    if n_red < 19:
         ok = False
 
     print()

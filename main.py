@@ -1159,14 +1159,23 @@ async def _run_bridge_inner(device_type: str | None = None,
         而它其实是"排上了"。遥控器没收到 MIC_CLOSE 就会**继续推流** ——
         用户看到的是"程序里已经结束了，遥控器还在收音"。
         这里把它点破，主循环的「残留推流自愈」（③）才有据可依。
+
+        ⚠ 成功时要把「我们最后一次关麦」的时刻**挪到这一刻**（2026-09-30）：
+          排队与真正落到 BLE 能差 1 秒，③ 的宽限期跟着差 1 秒（与回声窗口
+          那边 `_on_mic_open_done` 同一个道理）。失败时**不动** —— 那说明
+          遥控器压根没收到，宽限期不该替它挡枪。
         """
-        if not ok:
-            logger.warning(
-                "⚠ MIC_CLOSE 真实写入失败 —— 遥控器可能还会继续推一会儿；"
-                "主循环的「残留推流自愈」会在 5 秒内补发一次"
-            )
+        nonlocal _mic_close_sent_at
+        if ok:
+            _mic_close_sent_at = time.time()
+            return
+        logger.warning(
+            "⚠ MIC_CLOSE 真实写入失败 —— 遥控器可能还会继续推一会儿；"
+            "主循环的「残留推流自愈」会在 5 秒内补发一次"
+        )
 
     def _on_mic_close(sid: int):
+        nonlocal _mic_close_sent_at
         try:
             cmd = atvv.mic_close_cmd(sid)
         except Exception as e:
@@ -1174,7 +1183,13 @@ async def _run_bridge_inner(device_type: str | None = None,
             return None
         if not cmd:
             return None
-        return cmd if _send_tx(cmd, "MIC_CLOSE", on_done=_on_mic_close_done) else None
+        if not _send_tx(cmd, "MIC_CLOSE", on_done=_on_mic_close_done):
+            return None
+        # 记在"排上队"这一刻，`_on_mic_close_done(ok=True)` 会再挪到真正落地时。
+        # 两条都记，是为了失败时也能有个（偏早的）时刻 —— 宽限期偏早结束，
+        # 真没停的那种情况反而更容易被 ③ 抓到。
+        _mic_close_sent_at = time.time()
+        return cmd
 
     session = SessionCoordinator(
         on_mic_open=_on_mic_open,
@@ -1207,6 +1222,19 @@ async def _run_bridge_inner(device_type: str | None = None,
     voice_started_at = 0.0     # 本次会话开始时刻（超时兜底用）
     # 「残留推流自愈」上一次补发 MIC_CLOSE 的时刻（冷却用，见主循环 ③）。
     _residual_close_at = 0.0
+    # 「我们最后一次**命令遥控器关麦**」的时刻（排队时记一笔、真落地了再挪一次）。
+    #
+    # ⚠ 为什么需要它：③ 的判据是「没在开会话，却还在收帧」，而我们自己发完
+    #   MIC_CLOSE 之后，遥控器**手里和空中那几帧**还会陆续到（实测 0.16 秒内）——
+    #   于是**每次正常收尾都会命中 ③**，打出一句"某条收尾路径漏发了命令"。
+    #   那句是**误报**：上一行明明写着 `MIC_CLOSE 已发出`。
+    #   2026-09-30 真机日志里它一次会话响一次，狼喊多了，真出事（多推 52 秒
+    #   那次）就没人看了。所以给它一个宽限期：刚发过关麦命令的那一小会儿，
+    #   收到帧是**正常**的，记 debug 就行。
+    _mic_close_sent_at = 0.0
+    # 宽限期长度：真机实测"回声/在途帧"最长约 1.1 秒（见 ECHO_MAX_AGE 那段
+    # 的实测数据），取 1.5 秒留足余量。超过它还在推 ⇒ 遥控器**真的**没停。
+    _MIC_CLOSE_GRACE = 1.5
     # 「我们发过 MIC_OPEN、但还没等到它那一声回声」的条数与时刻（防自激用）。
     # 判据见 ECHO_MAX_AGE 那段注释 —— 不能只看时间，还要看这笔账还没销。
     pending_mic_echo = 0
@@ -1595,7 +1623,18 @@ async def _run_bridge_inner(device_type: str | None = None,
             # UI 显示的是 dB，用 int16 满量程折算才和另外两路同一把尺子。
             state.push_levels(remote_db=state.db_from_peak(peak))
             if _audio_frames == 1:
-                logger.info(f"🔊 收到第一个音频帧：{len(raw)}B → {len(samples)} 采样")
+                # ⚠ 2026-09-30：把「从会话开始到第一帧」的耗时写出来。
+                #   用户对"语音输入好不好用"最直接的感受就是**按下到能说话之间
+                #   要等多久**，而这个数以前只能靠人在日志里数时间戳（真机上实测
+                #   快的时候 0.3 秒、慢的时候 1.7 秒，差 5 倍，但日志里看不出来）。
+                #   会话还没开始时（遥控器自己先推流的情况）不打这个数 —— 那没有
+                #   分母，打出来是误导。
+                _lag = (time.time() - voice_started_at) if voice_started_at else 0.0
+                logger.info(
+                    "🔊 收到第一个音频帧：%dB → %d 采样%s",
+                    len(raw), len(samples),
+                    f"（距会话开始 {_lag * 1000:.0f} ms）" if _lag else "",
+                )
             elif _audio_frames % 100 == 0:
                 logger.info(f"🔊 音频帧 {_audio_frames}（{len(raw)}B/帧，峰值 {_audio_peak}）")
 
@@ -2250,10 +2289,20 @@ async def _run_bridge_inner(device_type: str | None = None,
                     f" 需要用它的话请把这一行发出来。"
                 )
             else:
+                # ⚠ 2026-09-30 改文案。旧文案是「没有对应按钮，已忽略（若这是
+                #   遥控器上的键，请到控制台给它指定动作）」—— 而这条路**物理键盘
+                #   敲字母也会走**（同一段上面那行注释就写着），于是用户翻日志时
+                #   看到一串 'w' / 'a' / 'c' / 'v' / 'space'，第一反应是
+                #   "遥控器在乱发键"。真机 2026-09-30 的日志里 13 条有 11 条
+                #   属于这一类，全是误读源。日志**只说它知道的事**：
+                #   看到哪个键、不在表里、被忽略了，以及"什么时候才该怀疑遥控器"。
                 logger.info(
-                    f"🔘 HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
-                    f" → 没有对应按钮，已忽略"
-                    f"（若这是遥控器上的键，请到控制台「按键映射」页给它指定动作）"
+                    f"🔘 程序看到一个键 {e.name!r}（scan="
+                    f"{getattr(e, 'scan_code', None)}），不在映射表里 → 已忽略。"
+                    f" ⚠ 这**不是**故障：物理键盘敲的字母、"
+                    f"以及本程序自己注入的键，都会走到这条路（每个键名只报一次）。"
+                    f" 只有当你**正在按遥控器上的某个键**时它才出现，"
+                    f"才说明那个键还没被映射 —— 去控制台「按键映射」页给它指定动作即可。"
                 )
 
         return True
@@ -2562,18 +2611,35 @@ async def _run_bridge_inner(device_type: str | None = None,
             # 现在收尾会主动发 MIC_CLOSE（见 end_voice_session），这里再兜一层：
             #   只要"我们没在开会话"却"还在收帧"，就再命令它停一次。
             #   ⚠ 冷却时间是必须的 —— 主循环 200ms 一轮，没有冷却会瞬间刷爆 BLE。
+            #
+            # ⚠ 2026-09-30 加宽限期：我们**刚发完** MIC_CLOSE 的那一小会儿，
+            #   遥控器手里/空中的那几帧还会到（实测 0.16 秒内），命中这里纯属正常。
+            #   不加宽限期的话，**每次正常收尾都打一句"某条收尾路径漏发了命令"**
+            #   —— 而上一行明明写着 `MIC_CLOSE 已发出`。真机日志里它一次会话响一次，
+            #   属于"狼来了"：真出事（多推 52 秒那次）时没人会再看这句。
+            #   所以：宽限期内 = debug（在途帧）；超过宽限期还在推 = 真告警。
             if (not voice_active
                     and _remote_frame_last_at
-                    and (_now_v - _remote_frame_last_at) < 2.0
-                    and (_now_v - _residual_close_at) > 5.0):
-                _residual_close_at = _now_v
-                logger.warning(
-                    "⚠ 遥控器还在推流，但程序这边没有会话 → 补发 MIC_CLOSE 让它停"
-                    "（正常情况下不该出现，出现了说明某条收尾路径漏发了命令）"
-                )
-                session.close("残留推流自愈")
-                atvv.state.stream_active = False
-                state.end_session("语音结束（残留推流已停）")
+                    and (_now_v - _remote_frame_last_at) < 2.0):
+                if (_now_v - _mic_close_sent_at) <= _MIC_CLOSE_GRACE:
+                    # 在途帧：正常现象，留个痕就够（别占 INFO 的注意力）。
+                    logger.debug(
+                        "（正常）刚发过 MIC_CLOSE %.2fs，遥控器在途的帧还在到 —— "
+                        "不算残留推流",
+                        _now_v - _mic_close_sent_at,
+                    )
+                elif (_now_v - _residual_close_at) > 5.0:
+                    _residual_close_at = _now_v
+                    logger.warning(
+                        "⚠ 遥控器还在推流，但程序这边没有会话（距上次命令它关麦 "
+                        "%.1f 秒，已超过 %.1f 秒宽限期）→ 补发 MIC_CLOSE 让它停。"
+                        " 这说明它**真的**没停下来 —— 上一次是收尾那条命令没送到，"
+                        "或者遥控器没理它。",
+                        _now_v - _mic_close_sent_at, _MIC_CLOSE_GRACE,
+                    )
+                    session.close("残留推流自愈")
+                    atvv.state.stream_active = False
+                    state.end_session("语音结束（残留推流已停）")
 
             # ── 语音结束后的自动发送（见 request_voice_send 的注释）──────────
             # 放在主循环而不是 BLE 回调线程里，有三个好处：
