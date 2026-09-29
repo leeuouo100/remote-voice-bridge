@@ -870,7 +870,16 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 _pending_samples.clear()
                 logger.info("▶ Audio START")
                 state.clear_audio()          # 清掉上一次的波形，UI 从空开始画
-                state.update(streaming=True, last_event="语音中…")
+                # ⚠⚠ 这里**不许**写 state.update(streaming=True)！
+                #   `audio_start` 有两种含义（用户按下语音键 / 遥控器回给 MIC_OPEN 的
+                #   回声），而"是哪种"要到下面才算得出来。写在这一行 = **回声也会把
+                #   「语音中」点亮**：会话刚结束又来一条回声 → 状态被重新点亮，而唯一
+                #   能清掉它的那条 audio_stop 可能永远不来 → 控制台/托盘一直显示
+                #   "还在收音"，直到断开重连。
+                #   （2026-09-29 报的正是这个；日志里 2026-09-24 10:33:59 有一次实证：
+                #    `【结束】（确认键）` 之后 95ms 一条被吞掉的回声把状态点亮了。）
+                #   ⇒ streaming 只许由**真正开了会话**的那个分支点亮（见下面
+                #     `elif not voice_active:` 里的那句），并且必须与 voice_active 一致。
                 # ── 先判「这一下是不是我们自己引来的回声」，**再**决定补不补开麦 ──
                 # ⚠⚠ 顺序绝对不能反 —— v1.0.13 就是在这儿翻的车：
                 #   那一版把这句补发**无条件**挂在 audio_start 分支的顶上，而
@@ -975,9 +984,13 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     session.ensure_mic_open()
                 else:
                     voice_hotkey_up()        # tap=再点按结束 / hold=松开结束
+                    # ⚠ 顺序：先撤 UI 状态、再置 voice_active=False。
+                    #   反过来会留一个 `voice_active=False 而 streaming 还是 True`
+                    #   的窗口，主循环那一轮"状态归位"检查正好撞上 → 多打一条
+                    #   「状态归位」日志（结果没错，但日志会把下一个查的人带偏）。
+                    state.end_session("语音结束")
                     voice_active     = False
                     voice_started_at = 0.0
-                    state.update(streaming=False, level=0, last_event="语音结束")
                     logger.info("🎙️ 语音会话【结束】（第二次按下语音键）")
                     # 结束之后替用户按一下「发送」—— 详见 request_voice_send 的注释。
                     # 传这一段的帧数：一帧都没收到 = 这次其实是误触，不该发。
@@ -1022,7 +1035,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                     )
                 else:
                     logger.info(f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，峰值 {_audio_peak}）")
-                    state.update(streaming=False, level=0, last_event="语音结束")
+                    # 会话本来就没开（例如"按下→松手"这种一次性的短按）——
+                    # 但状态可能被别处点亮过，这里一并归位。
+                    state.end_session("语音结束")
             elif event["type"] == "mic_open_result":
                 session.on_mic_open_result(event["code"])
             elif event["type"] == "start_search":
@@ -1490,9 +1505,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         if voice_active and btn_id == "ok" and e.event_type == "down":
             swallow = bool(_get_cfg().get("swallow_ok", True))
             voice_hotkey_up()
+            state.end_session("语音结束（确认键）")
             voice_active     = False
             voice_started_at = 0.0
-            state.update(streaming=False, level=0, last_event="语音结束（确认键）")
             logger.info(
                 "🎙️ 语音会话【结束】（确认键）"
                 + ("；这一下不再当 Enter 发出" if swallow else "；Enter 照常放行")
@@ -1628,9 +1643,9 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
         # 不在这里补上，就是"按 OK 关不掉语音"。
         if is_down and voice_active and btn_id == "ok":
             voice_hotkey_up()
+            state.end_session("语音结束（确认键）")
             voice_active     = False
             voice_started_at = 0.0
-            state.update(streaming=False, level=0, last_event="语音结束（确认键）")
             logger.info("🎙️ 语音会话【结束】（厂商页确认键）")
             # 同上：这条收尾路径也要接上自动发送。下面直接 return，这一下按键被
             # 我们**吞掉了**、不会走到 resolve_button 变成 Enter → 无条件补上，
@@ -1712,26 +1727,18 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
 
     # ── Health check ──
     async def check_health(force: bool = False) -> bool:
-        nonlocal last_health_check, voice_active, voice_started_at
+        # 只改 last_health_check —— 这里已经不碰语音会话的两个变量了
+        # （超时兜底与状态归位都搬去主循环，见上面那段注释）。
+        nonlocal last_health_check
         now = time.time()
 
-        # 语音会话超时兜底：用户按了「开始」却忘了收尾，程序自己收场。
-        # 「管理好语音输入功能」包含这一条 —— 不能指望用户永远记得按第二下。
-        if voice_active and voice_started_at and (now - voice_started_at) > VOICE_MAX_SECONDS:
-            logger.warning(
-                f"⏰ 语音会话已持续 {int(now - voice_started_at)} 秒，超过上限 "
-                f"{VOICE_MAX_SECONDS} 秒 → 自动结束，避免一直挂着听"
-            )
-            voice_hotkey_up()
-            voice_active     = False
-            voice_started_at = 0.0
-            state.update(streaming=False, level=0, last_event="语音结束（超时自动收尾）")
-            # ⚠ 超时收尾**故意不自动发送** —— 别顺手改成"那也发一下吧"：
-            #   麦克风已经开着最多 10 分钟，里面很可能全是环境音、旁人的话
-            #   （用户人可能早走开了）。把这种内容自动发进聊天框，
-            #   比"少发一次"严重得多 —— 宁可不发，让用户自己看一眼再决定。
-            #   顺手取消待发送，防别处残留的登记在这一刻被触发。
-            cancel_voice_send("超时收尾：这段时间录到的内容不适合自动发")
+        # ⚠ 语音会话的「超时兜底」和「状态归位」**已经搬去主循环**（见下面
+        #   `_supervise_audio()` 之后那一段）。别把它们挪回这里 ——
+        #   `check_health()` 只在"最近 cfg.key_check_window（默认 3 秒）内按过键"
+        #   时才会被主循环调用，而"按了开始就走开"这种最需要兜底的场景
+        #   **一个按键都没有** ⇒ 兜底代码一次都不会执行。
+        #   （这是"代码在、但永远不会跑到"的静默失效，和 v1.0.5 那个
+        #     "诊断工具没进安装包"是同一类：看起来做了，其实没做。）
 
         if not force and now - last_health_check < cfg.heartbeat_cooldown:
             return True
@@ -1783,6 +1790,50 @@ async def run_bridge(device_type: str | None = None, name_hint: str | None = Non
                 await _supervise_audio()
             except Exception as e:                      # noqa: BLE001
                 logger.error("音频监护异常：%s", e)
+
+            # ── 语音会话的收尾与「状态归位」（每一轮都核一遍）──────────────
+            #
+            # ⚠ 这两件事**必须待在主循环里**，不能塞进 check_health()：
+            #   check_health() 只在"最近 cfg.key_check_window（默认 3 秒）内按过键"
+            #   时才会被调用，而"用户按了开始就走开"恰恰一个按键都没有 ⇒
+            #   放在那儿的兜底代码**一次都不会执行**（代码在、永远跑不到）。
+            #   下面两条都是"状态与事实不一致"，属于每一轮都该核的事。
+            _now_v = time.time()
+
+            # ① 超时兜底：用户按了「开始」却忘了收尾，程序自己收场。
+            #    「管理好语音输入功能」包含这一条 —— 不能指望用户永远记得按第二下。
+            if voice_active and voice_started_at and (_now_v - voice_started_at) > VOICE_MAX_SECONDS:
+                logger.warning(
+                    f"⏰ 语音会话已持续 {int(_now_v - voice_started_at)} 秒，超过上限 "
+                    f"{VOICE_MAX_SECONDS} 秒 → 自动结束，避免一直挂着听"
+                )
+                voice_hotkey_up()
+                state.end_session("语音结束（超时自动收尾）")
+                voice_active     = False
+                voice_started_at = 0.0
+                # ⚠ 超时收尾**故意不自动发送** —— 别顺手改成"那也发一下吧"：
+                #   麦克风已经开着最多 10 分钟，里面很可能全是环境音、旁人的话
+                #   （用户人可能早走开了）。把这种内容自动发进聊天框，
+                #   比"少发一次"严重得多 —— 宁可不发，让用户自己看一眼再决定。
+                #   顺手取消待发送，防别处残留的登记在这一刻被触发。
+                cancel_voice_send("超时收尾：这段时间录到的内容不适合自动发")
+
+            # ② 状态归位：`streaming` 是 UI 上「有没有在收音」的**唯一真源**
+            #    （托盘图标变橙红、控制台顶部那行「语音中」都直接读它），
+            #    所以它必须与 `voice_active` 一致。
+            #    历史上它被 `audio_start` 分支顶部一句无条件 `update(streaming=True)`
+            #    点亮过，而**回声** audio_start 也会走到那里 —— 会话刚结束又来一条
+            #    回声，状态就被重新点亮，唯一能清掉它的那条 audio_stop 却可能永远
+            #    不来 ⇒ 用户看到的就是"已经关了还在显示收音中"（2026-09-29 报的）。
+            #    根因那处已经拆掉（见 audio_start 分支的注释），这里再兜一层：
+            #    **宁可多撤一次** —— 撤错了下一帧音频就会把它点亮回来，
+            #    而漏撤的代价是 UI 一直说谎。
+            if state.get().streaming != voice_active:
+                if voice_active:
+                    state.update(streaming=True, last_event="语音中…")
+                else:
+                    logger.info("🧹 语音会话没在跑，但状态还亮着「语音中」→ 已归位")
+                    state.end_session("语音结束（状态归位）")
 
             # ── 语音结束后的自动发送（见 request_voice_send 的注释）──────────
             # 放在主循环而不是 BLE 回调线程里，有三个好处：

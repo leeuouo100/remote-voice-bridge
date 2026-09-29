@@ -57,6 +57,8 @@ _setup_utf8()
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "main.py")
+STATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "state.py")
 
 
 def _strip_docstrings(text: str) -> str:
@@ -87,6 +89,28 @@ def _block(src: str, start_pat: str, end_pat: str) -> str:
     return m.group(1) if m else ""
 
 
+def _indent4_block(text: str, header: str) -> str:
+    """取以 `header` 开头、到下一个「恰好 4 空格缩进」的语句为止的**原文**。
+
+    ⚠ 别用「正则 lookahead + 注释行当结束锚点」来切 check_health 的函数体：
+      先过 `_code_only()` 的话，`# ── Main loop ──` 这类注释行会被整行剥掉，
+      锚点落空 ⇒ 匹配不到 ⇒ 下面两条断言会**因为找不到而变绿**（假绿），
+      反例也报不出红 —— 闸门看着是好的，其实什么都没验。
+      （`check_packaging.py` 那边"不加引号会连注释一起匹配上"是同一类坑：
+        切块/匹配的边界必须用真能对上的东西。）
+    """
+    lines = text.splitlines()
+    i = next((k for k, l in enumerate(lines) if l.startswith(header)), -1)
+    if i < 0:
+        return ""
+    j = i + 1
+    while j < len(lines):
+        if re.match(r"^    \S", lines[j]):
+            break
+        j += 1
+    return "\n".join(lines[i:j])
+
+
 def _audio_start_block(code: str) -> str:
     return _block(code, r'elif event\["type"\] == "audio_start":',
                   r'elif event\["type"\] == "audio_stop":')
@@ -97,7 +121,7 @@ def _audio_stop_block(code: str) -> str:
                   r'elif event\["type"\] == "mic_open_result":')
 
 
-def audit(src: str) -> list[tuple[bool, str]]:
+def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
     c: list[tuple[bool, str]] = []
     code = _code_only(src)
 
@@ -213,12 +237,69 @@ def audit(src: str) -> list[tuple[bool, str]]:
     c.append((bool(m_end), "⑤ 结束分支（第二次按下）里有 voice_hotkey_up()"))
     c.append((bool(m_end) and "request_voice_send(" in (m_end.group(1) if m_end else ""),
               "⑤ 结束分支登记了发送（含帧数，供零帧保护判断）"))
+
+    # ── ⑥ 「关了还在显示收音中」这一族（2026-09-29 武哥报的）─────────
+    #
+    # 现象：语音输入已经关了，托盘图标还橙红、控制台还写「语音中」/「有声音」。
+    # 两个独立的成因，都要钉住：
+    #   (a) `audio_start` 分支**顶部**无条件点亮 streaming —— 而遥控器回给
+    #       MIC_OPEN 的**回声** audio_start 也会走到那儿 ⇒ 会话刚结束又来一条回声，
+    #       状态就被重新点亮，而唯一能清它的那条 audio_stop 可能永远不来。
+    #   (b) 会话结束时只写 `update(streaming=False)` —— 遥控器那一路的
+    #       **电平与波形**只在"下一次开始"时才清，于是卡片继续写「有声音」、
+    #       波形冻在最后一帧，看起来也像"还在收音"。
+    i_echo_top = m_asblk.find("is_echo")
+    head = m_asblk[:i_echo_top] if i_echo_top >= 0 else m_asblk
+    c.append(("streaming=True" not in head,
+              "⑥ audio_start 分支**顶部**没有点亮 streaming"
+              "（回声也会走到那儿 ⇒ 会话结束后被重新点亮 → 「关了还显示收音中」）"))
+
+    c.append(("state.end_session(" in code,
+              "⑥ 会话结束走 state.end_session(…)（不是裸的 update(streaming=False)）"))
+    c.append((re.search(r"update\(streaming=False", code) is None,
+              "⑥ 全文件不再有裸的 update(streaming=False, …)"
+              "（只灭 streaming 不够 —— 遥控器那一路的电平/波形也得当场撤）"))
+
+    # 主循环里必须每一轮核一遍：超时兜底 + 状态归位。
+    # ⚠ 不能待在 check_health() 里 —— 它只在"最近 3 秒按过键"时才被调用，
+    #   而"按了开始就走开"恰恰没有按键 ⇒ 那段代码一次都跑不到。
+    m_loop = re.search(r"while True:(.*)", code, re.S)
+    loop_body = m_loop.group(1) if m_loop else ""
+    c.append(("VOICE_MAX_SECONDS" in loop_body,
+              "⑥ 超时兜底在主循环里（放 check_health 里永远跑不到："
+              "它只在最近 cfg.key_check_window 秒内按过键时才被调用）"))
+    c.append(("state.get().streaming != voice_active" in loop_body,
+              "⑥ 主循环里有「streaming 必须等于 voice_active」的状态归位"))
+
+    # check_health 的函数体用**行扫描**切（见 _indent4_block 的注释：
+    # 用注释行当锚点会被 _code_only 剥掉 ⇒ 匹配不到 ⇒ 假绿）。
+    ch_body = _indent4_block(src, "    async def check_health")
+    c.append((bool(ch_body), "⑥ 找得到 check_health 函数体"))
+    c.append((bool(ch_body) and "VOICE_MAX_SECONDS" not in ch_body,
+              "⑥ 超时兜底**不在** check_health 里（挪回去 = 静默失效复发）"))
+    # ── ⑥' state.end_session 自己得把该撤的都撤掉 ─────────────────
+    if state_src:
+        st = _code_only(state_src)
+        m_es = re.search(r"def end_session\(.*?(?=\ndef )", st, re.S)
+        es = m_es.group(0) if m_es else ""
+        c.append((bool(m_es), "⑥' state.py 里有 end_session()"))
+        c.append(("streaming" in es and "False" in es,
+                  "⑥' end_session 熄灭 streaming（顶部「语音中」/ 托盘橙红）"))
+        c.append(("remote_level_db" in es,
+                  "⑥' end_session 把遥控器那一路电平归零"
+                  "（否则「遥控器麦克风」卡片会一直写「有声音」）"))
+        c.append(("_wave.clear()" in es,
+                  "⑥' end_session 清掉遥控器波形（否则波形冻在最后一帧）"))
+        c.append(("_wave_sys" not in es,
+                  "⑥' end_session **不碰**电脑麦克风那一路"
+                  "（它是独立采集的，混音器还在跑，别越权去擦）"))
     return c
 
 
 def main() -> int:
     src = open(SRC, encoding="utf-8").read()
-    checks = audit(src)
+    state_src = open(STATE, encoding="utf-8").read()
+    checks = audit(src, state_src)
     ok = True
     print("=" * 74)
     print(" 闸：语音会话状态机 —— 不许自己把自己关掉")
@@ -238,7 +319,22 @@ def main() -> int:
             print(f"  ❌ 反例没构造出来（锚点没找到）：{label}")
             ok = False
             return
-        n = sum(1 for g, _ in audit(bad) if not g)
+        n = sum(1 for g, _ in audit(bad, state_src) if not g)
+        if n:
+            n_red += 1
+            print(f"  ✅ 反例：{label} → 报了 {n} 项红")
+        else:
+            print(f"  ❌ 反例：{label} 居然全绿 —— 这道闸拦不住它复发")
+            ok = False
+
+    def _expect_red_state(label: str, bad_state: str) -> None:
+        """反例打在 state.py 上（⑥' 那几条）。"""
+        nonlocal ok, n_red
+        if bad_state == state_src:
+            print(f"  ❌ 反例没构造出来（锚点没找到）：{label}")
+            ok = False
+            return
+        n = sum(1 for g, _ in audit(src, bad_state) if not g)
         if n:
             n_red += 1
             print(f"  ✅ 反例：{label} → 报了 {n} 项红")
@@ -286,12 +382,52 @@ def main() -> int:
                             "                now = time.time()\n"
                             "                is_echo =", 1))
 
-    if n_red < 5:
+    # 反例 7：把「无条件点亮 streaming」塞回 audio_start 分支顶部
+    #（＝ 回声也点亮「语音中」→ 会话结束后被重新点亮 → 关了还显示收音中）
+    _expect_red("把 state.update(streaming=True) 塞回 audio_start 分支顶部"
+                "（＝回声也点亮「语音中」）",
+                src.replace(
+                    "                state.clear_audio()          # 清掉上一次的波形，UI 从空开始画",
+                    "                state.clear_audio()          # 清掉上一次的波形，UI 从空开始画\n"
+                    '                state.update(streaming=True, last_event="语音中…")', 1))
+
+    # 反例 8：会话结束退回裸的 update(streaming=False)
+    #（＝遥控器那一路的电平/波形不撤，卡片一直写「有声音」）
+    _expect_red("会话结束退回裸的 update(streaming=False)"
+                "（＝卡片一直写「有声音」、波形冻住）",
+                src.replace('state.end_session("语音结束")',
+                            'state.update(streaming=False, level=0, last_event="语音结束")', 1))
+
+    # 反例 9：删掉主循环里的「状态归位」
+    _expect_red("删掉主循环里的状态归位"
+                "（＝状态一旦被点亮就再没人纠正）",
+                src.replace("if state.get().streaming != voice_active:",
+                            "if False:", 1))
+
+    # 反例 10：把超时兜底挪回 check_health（＝代码在、永远跑不到）
+    _expect_red("把超时兜底挪回 check_health"
+                "（＝它只在最近 3 秒按过键时才被调用，永远跑不到）",
+                src.replace(
+                    "        if not force and now - last_health_check < cfg.heartbeat_cooldown:",
+                    "        if voice_active and (now - last_health_check) > VOICE_MAX_SECONDS:\n"
+                    "            pass\n"
+                    "        if not force and now - last_health_check < cfg.heartbeat_cooldown:", 1))
+
+    # 反例 11（打在 state.py 上）：end_session 忘了归零遥控器电平
+    _expect_red_state("end_session 忘了把遥控器电平归零"
+                      "（＝「遥控器麦克风」卡片一直写「有声音」）",
+                      state_src.replace(
+                          "        _state.last_event      = last_event\n"
+                          "        _state.remote_level_db = -96.0\n",
+                          "        _state.last_event      = last_event\n", 1))
+
+    if n_red < 10:
         ok = False
 
     print()
     print("PASS" if ok else "FAIL —— 打 ❌ 的那几条会让「按一下、刚开口，"
-                          "输入法就被程序自己关掉」复发")
+                          "输入法就被程序自己关掉」复发，"
+                          "或让「关了还显示收音中」复发")
     return 0 if ok else 1
 
 

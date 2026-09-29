@@ -268,6 +268,37 @@ def clear_audio() -> None:
         _state.remote_level_db = -96.0
 
 
+def end_session(last_event: str = "语音结束") -> None:
+    """语音会话结束：把"正在收音"的痕迹**当场**撤掉。
+
+    为什么不能只写 `update(streaming=False)`：
+      遥控器那一路的电平（`remote_level_db`，由 `push_levels(remote_db=…)` 在
+      每个音频帧里喂）与波形（`_wave`，由 `push_audio` 喂）**只在"下一次会话
+      开始"时才被 `clear_audio()` 清掉**。于是会话一结束，控制台里
+      「遥控器麦克风」那张卡还写着「有声音」、波形冻在最后一帧 ——
+      看起来就是"已经关了还在收音"。用户只会得出一个结论：这程序不知道自己在干嘛。
+      （2026-09-29 报的就是这个。）
+
+    判决书必须**当场**撤回，不能等下一条事件来擦。所以这里一次做三件事：
+      ① 熄灭 streaming（顶部「语音中」/ 托盘橙红）
+      ② 遥控器那一路的电平归零 + 波形清空（卡片回到「等待语音」）
+      ③ 只动遥控器这一路 —— 电脑麦克风是独立采集的，混音器还在跑，
+         它的电平和波形由 mixer.py 自己维护，别越权去擦。
+    """
+    with _lock:
+        _state.streaming       = False
+        _state.level           = 0
+        _state.last_event      = last_event
+        _state.remote_level_db = -96.0
+        _wave.clear()
+        _state.updated_at = time.time()
+    for fn in list(_listeners):
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def reset() -> None:
     """Clear transient runtime state (on disconnect / shutdown)."""
     update(connected=False, streaming=False, level=0, device="")
