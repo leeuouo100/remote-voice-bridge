@@ -94,6 +94,32 @@ def _naive_update(key: str) -> None:
     _naive_write(cfg)
 
 
+def _read_tolerant(path: Path) -> dict:
+    """读一份 JSON —— **允许**它是坏的，坏了就当空 dict 返回。
+
+    ⚠ 只给 A0 这个**反例**用，产品路径绝对不许这么读。
+
+    为什么必须有：A0 读的是 20 个线程刚刚**无锁并发写**过的那个文件，那一份落盘
+    本身就可能不合法（两个 doc 拼在一起 / 半截）—— 2026-09-30 的 CI 上真撞上了：
+
+        [FAIL] 配置原子写与并发
+               FAIL case_a 抛异常：JSONDecodeError: Extra data: line 54 column 2 (char 1245)
+
+    异常抛出去整道闸就红，可这是**反例**（它存在的意义就是证明「老写法不安全」），
+    而文件坏得连 JSON 都不是，恰好是比「丢更新」更强的证据 ⇒ 判它成立，但要打 INFO。
+    （本地跑两次都绿、CI 上红 —— 典型的"闸门结论依赖跑闸那台机器的时序"。）
+
+    ⚠ 只吞 `JSONDecodeError`。文件**不存在**是另一回事，必须让它抛出去 ——
+      那说明这套用例自己没摆好摊，不能靠"读不到"蒙混过关。
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"  INFO A0 反例：无锁并发写之后文件本身已不是合法 JSON"
+              f"（{type(e).__name__}: {e}）—— 比「丢更新」更严重，反例成立")
+        return {}
+
+
 # ── A. 并发 update 不丢更新 ──────────────────────────────────────────────────
 def case_a() -> None:
     N = 20
@@ -112,7 +138,7 @@ def case_a() -> None:
         t.start()
     for t in ts:
         t.join()
-    naive = json.loads(config.CONFIG_PATH.read_text(encoding="utf-8"))
+    naive = _read_tolerant(config.CONFIG_PATH)
     naive_keys = [k for k in naive.get("keymap", {}) if k.startswith("k") and k[1:].isdigit()]
     check(len(naive_keys) < N,
           f"A0 反例：老写法（load→改→save，无锁）确实丢了更新"
@@ -336,6 +362,24 @@ def case_e() -> None:
           "E0 反例：老写法（CONFIG_PATH.write_text）被判不合格")
     check(_save_is_atomic(body),
           "E4 真源码被判合格（E0 与 E4 用同一个判定函数）")
+
+    # F `_read_tolerant` 的边界：**只**吞 JSONDecodeError，别的照样抛。
+    #   不钉住的话，将来有人图省事改成 `except Exception: return {}`，
+    #   A0 就变成"读什么都当空" ⇒ 无论落盘多烂都判"丢更新成立" ⇒ 反例永远绿。
+    probe = Path(_SANDBOX) / "tolerant-probe.json"
+    probe.write_text("{ 这不是 JSON", encoding="utf-8")
+    check(_read_tolerant(probe) == {},
+          "F1 坏 JSON 被容错读成空 dict（A0 反例要的就是这个）")
+    missing_raised = False
+    try:
+        _read_tolerant(Path(_SANDBOX) / "definitely-missing.json")
+    except FileNotFoundError:
+        missing_raised = True
+    except Exception:                            # noqa: BLE001
+        pass
+    check(missing_raised,
+          "F2 文件**不存在**时照样抛 FileNotFoundError"
+          "（容错只针对「文件是坏的」，不许把「文件没了」一起吞掉）")
 
 
 def main() -> int:
