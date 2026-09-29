@@ -52,10 +52,55 @@ def _find_node() -> str | None:
 
 
 NODE = _find_node()
+
+
+def _find_npm_global() -> str | None:
+    """npm 的**全局** node_modules —— Node 的 require 解析不到它，只能靠 NODE_PATH。
+
+    ⚠ 不能写死 `%APPDATA%\\npm\\node_modules`：那是**本机** npm 的默认前缀。
+      GitHub 的 windows runner 把全局前缀设成 `C:\\npm\\prefix`，写死的话
+      CI 上 `require('playwright')` 直接抛 Cannot find module ⇒ 那道闸打
+      SKIPPED ⇒ 被"必需项不许跳过"判 FAIL ⇒ 整轮构建挂掉
+      （2026-09-29：v1.0.23 第一次 CI 就是这么红的）。
+      所以**先问 npm 自己**（`npm root -g`），再退回几个已知位置。
+    """
+    cands: list[str] = []
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if npm:
+        try:
+            p = subprocess.run([npm, "root", "-g"], capture_output=True,
+                               text=True, encoding="utf-8",
+                               errors="replace", timeout=60)
+            if p.returncode == 0 and (p.stdout or "").strip():
+                cands.append(p.stdout.strip().splitlines()[-1].strip())
+        except Exception:
+            pass
+    home = os.path.expanduser("~")
+    cands += [
+        os.path.join(home, "AppData", "Roaming", "npm", "node_modules"),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "nodejs", "node_modules"),
+        r"C:\npm\prefix\node_modules",
+        os.path.join(home, "node_modules"),
+        "/usr/lib/node_modules",
+        "/usr/local/lib/node_modules",
+    ]
+    seen: set[str] = set()
+    uniq = [c for c in cands if c and not (c in seen or seen.add(c))]
+    # 优先"目录里真有 playwright"的那个 —— 只有 PATH 上第一个存在的目录
+    # 是不够的（可能是个空的 node_modules）。
+    for d in uniq:
+        if os.path.isdir(os.path.join(d, "playwright")):
+            return d
+    for d in uniq:
+        if os.path.isdir(d):
+            return d
+    return None
+
+
 # playwright 装在哪：npm 全局目录（Node 的 require 解析不到，得靠 NODE_PATH）
-_NPM_GLOBAL = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
-                           "npm", "node_modules")
-if os.path.isdir(_NPM_GLOBAL):
+_NPM_GLOBAL = _find_npm_global()
+if _NPM_GLOBAL:
     os.environ["NODE_PATH"] = (_NPM_GLOBAL + os.pathsep
                                + os.environ.get("NODE_PATH", "")).rstrip(os.pathsep)
 

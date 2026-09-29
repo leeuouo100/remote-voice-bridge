@@ -303,6 +303,30 @@ if "RemoteVoiceBridge.exe" in (p.stdout or ""):   # ← 永远为假
 反例里有一条是**拿本文件真实源码**把 `self.end_voice_session` 改回裸名 ——
 用真文件自证，比拿玩具片段自证强。
 
+### 发版时在 CI 上撞出来的两道闸：判据不能依赖"跑闸那台机器"
+
+本地全绿、CI 全红。**闸门自己**有两个洞（产品代码没问题）：
+
+- **`check_pairing_backup.py`**：`_backup_jobs` 直接读真注册表判"这个键在不在"，
+  而 GitHub 的 runner 上**没有蓝牙适配器** —— `BTHPORT\Parameters\Keys` 与
+  `Devices` 两棵树都不存在 ⇒ 每条都被判成 `absent` ⇒ 清单恒为空 ⇒
+  **D8c/D8d 在 runner 上必红、在开发机上必绿**。
+  修法：`_backup_jobs(d, state_of=...)` 留注入点，闸门传假状态（顺带把原来
+  靠"本机注册表恰好是 denied"碰运气的那条反例也改成注入，否则它在 CI 上
+  等于从没验过）。另加 A7b 钉住**默认值必须仍读真注册表** —— 不然生产路径
+  也变成"离线的"，用户机器上"明确不存在的键"会被列进清单、导出必失败、
+  备份永远中止。
+  同一类坑 `check_pairing.py` 早踩过一次（"判定读真机注册表，CI 里没有蓝牙棒"）。
+- **`check_all.py` 找 playwright**：Node 的 `require` 解析不到 npm 全局目录，
+  只能靠 `NODE_PATH`，而**全局目录不是固定的** —— 本机是
+  `%APPDATA%\npm\node_modules`，runner 上是 `C:\npm\prefix\node_modules`。
+  写死 ⇒ 那道 XSS 闸打 `SKIPPED` ⇒ 被「必需项不许跳过」判 FAIL ⇒ 构建挂掉。
+  修法：先问 `npm root -g`，再退回几个已知位置，并**优先选目录里真有
+  `playwright` 的那个**（PATH 上第一个存在的 `node_modules` 可能是个空壳）。
+
+> 教训与"判据得能走到那一行"是同一族的：**闸门的结论不许由环境决定**。
+> 本地绿、CI 红，差的往往不是代码，而是"那台机器上有什么"。
+
 ---
 
 ## v1.0.22：自听自的回环 + 键盘被劫持 + 遥控器关不掉

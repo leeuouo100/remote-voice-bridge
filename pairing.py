@@ -840,18 +840,26 @@ def _reg_key_state(path: str) -> str:
         return "absent" if getattr(e, "winerror", None) == 2 else "error"
 
 
-def _backup_jobs(d: dict) -> list[tuple[str, str, bool]]:
+def _backup_jobs(d: dict, state_of=None) -> list[tuple[str, str, bool]]:
     """[(注册表路径, 文件名标签, 是否关键)] —— **最小子树**，不再整棵抄。
 
     关键 = 导不出来就**不许动注册表**：链路密钥、以及我们真正会改的
     适配器 Device Parameters（DeviceAddressCache 就在里面）。
+
+    `state_of` 是**可注入的键状态查询**（默认 `_reg_key_state`，读真注册表）。
+    为什么要留这个口子：闸门要验的是"清单**怎么算**"，而清单里有没有某个键
+    取决于**跑闸那台机器上注册表长什么样** —— CI 的 runner 上根本没有蓝牙
+    适配器，`BTHPORT\\Parameters\\Keys` / `Devices` 两棵树都不存在，于是
+    真注册表把每一条都判成 absent，闸门在 runner 上必红（而在开发机上必绿）。
+    注入之后这道闸才是**离线的**：同样的输入在任何机器上得同样的清单。
     """
     jobs: list[tuple[str, str, bool]] = []
+    _state = state_of or _reg_key_state
 
     def _add(path: str, tag: str, critical: bool) -> None:
         # 明确不存在的键不列（否则导出必然失败、白白当成"关键备份失败"）；
         # "打不开"（权限）的**照样列** —— 那是现在读不了，不是没有。
-        if _reg_key_state(path) == "absent":
+        if _state(path) == "absent":
             return
         jobs.append((path, tag, critical))
 

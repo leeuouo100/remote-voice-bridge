@@ -23,6 +23,15 @@ python tools\check_all.py --ci   :: CI 安全集：摘掉需要真机/交互桌�
 （目前只有 `check_injection.py` —— 它真的往系统里注入按键，需要交互桌面会话），
 并在结尾**点名报出没跑的是哪几道**（"没跑"不许被读成"过了"）。
 
+> ⚠ **"控制台 XSS 真实渲染"那道要自己找得到 playwright。** Node 的 `require`
+> 解析不到 npm 的全局目录，只能靠 `NODE_PATH`；而**全局目录不是固定的**
+> —— 本机是 `%APPDATA%\npm\node_modules`，GitHub 的 windows runner 是
+> `C:\npm\prefix\node_modules`。写死会让这道闸在 CI 上打 `SKIPPED`
+> ⇒ 被「必需项不许跳过」判 FAIL ⇒ **整轮构建挂掉**（v1.0.23 的第一次 CI
+> 就是这样红的）。现在先问 `npm root -g`，再退回几个已知位置，
+> 并**优先选目录里真有 `playwright` 的那个**（PATH 上第一个存在的
+> `node_modules` 可能是个空壳 —— 本机那个托管的 node 就是）。
+
 > ⚠ **必需项 SKIP 一律算失败。** 一条闸打印 `SKIPPED` 却退出码 0，以前会被当成
 > "过了" —— 于是环境一坏，整道闸就静默变成**永远绿的摆设**。
 > 现在只有显式标了 `required: False` 的闸才允许 SKIP。
@@ -48,6 +57,7 @@ python tools\check_all.py --ci   :: CI 安全集：摘掉需要真机/交互桌�
 | `check_version.py` | `config.py` 的 `APP_VERSION` == `installer.iss` 的 `MyAppVersion` | 防止"tag 打的是 1.0.3、装出来还写着 1.0.2"这种只能靠重新发版来修的事故 |
 | `check_ci_workflow.py` | CI 工作流与"项目声称的闸门"是否一致：唯一一份工作流、PR/main/tag 都触发、只跑 `check_all.py --ci`、build 依赖 checks、release **只下载 artifact 不重新构建**、`draft: true` 显式、权限最小化；外加 `--ci` 的判定机制本身（必需项 SKIP 算失败）；**外加供应链 D 组（P2-7）**：每个 `uses:` 都钉 40 位 commit SHA + 行尾版本注释、装依赖走带哈希的锁文件、有 SBOM（生成 + 真解析 + 上传）、有构建证明（`attest-build-provenance` + `id-token`/`attestations` 权限 + `subject-path`）、Authenticode 是"有条件执行 + 没证书时**明确说未签名**"。含 **20 条反例自证** | 老工作流只在 tag 触发（PR 不跑）、闸门手工列（和本地各自漂）、构建与发布同一个 job（发出去的包是**又构建一次**的，不是验过的那个文件）、没写 `draft` 靠 Action 默认值 —— v1.0.21 事实上就是**直接公开**发布的，而 README 声称默认 Draft。⚠ **D 组治的是另一类**：`@v4` 是**可变引用**，上游一指，我们下次构建跑的就是没审过的新代码，而这件事在 diff 里**看不见**（本仓库一个字节都没变）；签名那条判据第一版只在整份文件里搜「未签名」，结果**文件头说明注释**里也有这个词 —— 把摘要那行改成含糊的「已跳过」照样判合格（反例当场报绿），所以改成盯**真的会被看到的那一行** |
 | `check_teardown_scope.py` | `run_bridge` 的**收尾范围**：薄壳结构（`try/finally` 里调 `teardown`）、`_run_bridge_inner` 里没有第二套收尾、`_BridgeResources` 声明的每个句柄都**有登记点**、`teardown` 逐个 None 判断且**覆盖到每一个**、句柄全 None 时跑完不抛；**F 组（2026-09-29 新增）**：`teardown` 引用的**全局名**在模块顶层必须真的有定义。含 **5 条反例自证**（其中一条是**拿 main.py 真实源码**把 `self.end_voice_session` 改回裸名） | P1-3 拆壳时埋了一个**真 NameError**：`teardown`（模块级类的方法）调用了 `_run_bridge_inner` 里的**局部函数** `end_voice_session` —— 在类方法里它被解析成**全局名**，而模块顶层没有这个名字 ⇒ 运行期 NameError ⇒ 被 teardown 自己那句 `except Exception: logger.warning(...)` 吞掉 ⇒ **退出/断连那条收尾整条没跑**（相位、UI 状态、待发送登记都没归位）。⚠ 为什么 A~E 全绿却漏了它：动态探针用的是"句柄全为 None"的场景，而那句调用正好包在 `if self.atvv is not None and self.coord is not None:` 里 —— 两个都是 None ⇒ **那一行根本不执行** ⇒ 探不到。**判据得能走到那一行** |
+| `check_pairing_backup.py` | 配对修复的备份/还原是**可信事务**（P1-7）：备份落在 `%ProgramData%`（不是用户可写的 `%APPDATA%`）且建目录时**禁用继承**收紧 DACL；只导**最小子树**（`Keys\<本地地址>` + 目标设备的 `Devices\<remote>`，不再整棵抄 `Keys`/`Devices`）；关键项导出失败 → `backup()` 返回空列表并**在动注册表之前停下**；还原**只认 manifest**（逐文件 SHA-256 校验 + `.reg` 里的键路径必须落在白名单前缀内 + 不存在的键才跳过、**打不开的照样导**）。含 **15 条反例自证**，其中「键状态」全程用 `state_of=` 注入 | ⚠ 这道闸**自己**踩过一次"判据依赖跑闸那台机器"：`_backup_jobs` 原本直接读真注册表判"这个键在不在"，而 CI 的 runner 上**没有蓝牙适配器** —— `BTHPORT\Parameters\Keys` / `Devices` 两棵树都不存在，于是每条都被判成 `absent`、清单恒为空，**D8c/D8d 在 runner 上必红、在开发机上必绿**（v1.0.23 的第一次 CI 就栽在这）。修法：`_backup_jobs(d, state_of=...)` 留注入点，闸门传假状态；另加 A7b 钉住**默认值必须仍读真注册表**（不然生产路径也变成"离线的"，用户机器上"明确不存在的键"会被列进清单、导出必失败、备份永远中止）。同一类坑 `check_pairing.py` 早踩过一次（"判定读真机注册表，CI 里没有蓝牙棒"）—— **闸门本身必须是离线的** |
 | `check_run_bat.py` | 源码用户唯一会双击的入口：**最后启动的是 `tray_app.py`**（不是 `main.py`）、系统默认麦克风写的是 `CABLE Output`（不是 Input）、pip 输出落盘且失败即停。含 **5 条反例自证** | 三处都**不报错**：走 `main.py` 没有托盘、只能关窗口硬杀进程（P1-3/P1-4 做的优雅收尾根本到不了）；麦克风写成 `CABLE Input` 就是读"没人写的那只端点"，症状是一点声音都没有；pip 输出 `>nul` 全吞 + 不看退出码 ⇒ 依赖没装上也照样往下跑，最后崩在一个和"依赖没装"毫无关系的 ImportError 上 |
 | `check_licenses.py` | `THIRD_PARTY_NOTICES.md` 覆盖 `requirements*.txt` 里的**每一个**包、每个都写了许可证名、且 `installer.iss` 真的把 `LICENSE` + NOTICES 装进 `{app}\licenses\`。含 **4 条反例自证** | 安装包里分发着 15 个第三方包，其中 `pystray` 是 **LGPL-3.0**、`frida` 是 **wxWindows**（LGPL 派生）—— 都要求随分发附上许可证；`PyInstaller` 的 GPL 特殊例外也得写出来。而 NOTICES 原先只写了三个"移植来源"，实际依赖一个没列，安装包里也没有 `licenses\` |
 | `check_logging.py` | 日志三件事：**轮转**（真写满 5 MB 触发，出现 `bridge.log.1`、份数封顶）、**脱敏**（MAC / 12 位裸 hex / `DeviceAddressCache=` 都打掉，且**落盘文件里**就已打码）、**raw HID 默认不记**；外加接线（`main.py` 走 `logsetup.install` 而非 `basicConfig`、且在**第一行日志之前**应用配置；`frida_hid` / `remote_hid` 的按键日志不再裸打 `raw.hex`；`console_server` 白名单里有这两个字段）。含 **5 条反例自证** | 坏掉的现象是「`bridge.log` 涨到几十 MB，没人敢删也不敢清」和「用户把日志贴到群里，里面是他**完整的蓝牙地址**」—— 后者最要命：排错的第一步就是把日志发出来。另外 `basicConfig` 在 root 已有 handler 时**什么都不做**，"轮转"会悄悄失效（现象只是"日志又变大了"） |

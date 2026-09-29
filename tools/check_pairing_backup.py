@@ -73,6 +73,32 @@ def _manifest_only(restore_src: str) -> bool:
     return len(g) == 1 and "manifest" in g[0]
 
 
+def _jobs_body(src: str) -> str:
+    """抠出 `_backup_jobs` 的函数体（A6b / A7 / A7b 都在它里面找东西）。"""
+    m = re.search(r"def _backup_jobs\(.*?\n(?=def )", src, re.S)
+    return m.group(0) if m else ""
+
+
+def _skips_only_absent(body: str) -> bool:
+    """跳过条件必须**只**认 `absent`。
+
+    "打不开"（denied）和"没有"（absent）是两件事：读不了的链路密钥
+    **正是最该备份的那几棵**，用 bool 判断会把它们整棵漏掉。
+    """
+    return re.search(r"_state\(path\) == \"absent\"", body) is not None
+
+
+def _key_state_defaults_to_registry(body: str) -> bool:
+    """`state_of` 是给闸门留的**注入点**，默认必须仍读真注册表。
+
+    ⚠ 没有这一条，`_state = state_of or (lambda _p: "ok")` 照样绿 ——
+      而生产路径一旦变成"离线的"，用户机器上明确不存在的键也会被列进清单，
+      导出必然失败 ⇒ `backup()` 每次都在动注册表之前中止（表现为「备份总是失败」）。
+    """
+    return re.search(r"_state\s*=\s*state_of\s+or\s+_reg_key_state",
+                     body) is not None
+
+
 def _critical_fail_stops(src: str) -> bool:
     """`backup()` 里关键项导出失败时是否**返回空列表**（而不是只提示、继续）。"""
     m = re.search(r"def backup\(.*?\n(?=# ──)", src, re.S)
@@ -158,13 +184,18 @@ def case_static() -> None:
       "A5 不再把整棵 BTHPORT\\Keys / Devices 列进备份清单")
     A(re.search(r"def _backup_jobs\(", src) is not None,
       "A6 有 _backup_jobs()（把「要备份什么」抽出来，可单测）")
-    body = re.search(r"def _backup_jobs\(.*?\n(?=def )", src, re.S)
-    bsrc = body.group(0) if body else ""
+    bsrc = _jobs_body(src)
     A("BTHPORT_KEYS}\\\\{loc}" in bsrc or "BTHPORT_KEYS}\\" in bsrc,
       "A6b 密钥按**本地地址**逐棵导（Keys\\<addr>，不是 Keys 整棵）")
-    A(re.search(r"_reg_key_state\(path\) == \"absent\"", bsrc) is not None,
+    A(_skips_only_absent(bsrc),
       "A7 明确「不存在」的键才跳过；「打不开」（权限）的照样列进去导"
       "—— 用 bool 判断会把读不了的链路密钥整棵漏掉")
+    # A7b：注入点不能把**生产路径**也变成离线的（默认必须仍读真注册表）。
+    #  ⚠ 没有这一条，`_state = state_of or (lambda _p: "ok")` 这种写法照样绿 ——
+    #    而那意味着用户机器上"明确不存在的键"也会被列进清单、导出必失败、
+    #    备份直接中止（真机上表现为「备份总是失败」）。
+    A(_key_state_defaults_to_registry(bsrc),
+      "A7b 键状态默认仍走真注册表 —— state_of 只是给闸门留的注入点")
 
     # A8 关键失败 → 返回空
     A(_critical_fail_stops(src),
@@ -237,6 +268,21 @@ def case_static_negative() -> None:
     #    体检报告确实还在 APPDATA，禁掉它 A3c 就会红（那是另一条判据）。
     A(_bat_backup_path_ok(bat.replace("ProgramData", "APPDATA")) is False,
       "[反例] 两份路径全改成 APPDATA（一刀切）→ A3b 判不合格")
+
+    # ⑥ 跳过的条件放宽成"不是 ok 就跳过" → A7 必须变红
+    b6 = src.replace('if _state(path) == "absent":', 'if _state(path) != "ok":')
+    A(b6 != src, "[反例] 找得到 _backup_jobs 里那行跳过条件（锚点存在）")
+    A(_skips_only_absent(_jobs_body(src))
+      and not _skips_only_absent(_jobs_body(b6)),
+      "[反例] 放宽成「不是 ok 就跳过」→ A7 判不合格")
+
+    # ⑦ 注入默认值写成"恒 ok"（生产路径也离线）→ A7b 必须变红
+    b7 = src.replace("_state = state_of or _reg_key_state",
+                     '_state = state_of or (lambda _p: "ok")')
+    A(b7 != src, "[反例] 找得到 _backup_jobs 里那行注入默认值（锚点存在）")
+    A(_key_state_defaults_to_registry(_jobs_body(src))
+      and not _key_state_defaults_to_registry(_jobs_body(b7)),
+      "[反例] 把注入默认值改成恒 ok → A7b 判不合格")
 
 
 # ── D. 行为级（真跑，不碰注册表）────────────────────────────────────────────
@@ -427,6 +473,12 @@ def case_behavior() -> None:
             P.BACKUP_DIR, P._run = old_dir, old_run
 
     # D8 _backup_jobs：最小子树 + absent 跳过
+    #
+    # ⚠ `state_of` **必须注入**。默认那条会去读**真注册表**，而 CI 的 runner 上
+    #   没有蓝牙适配器（`BTHPORT\Parameters\Keys` 与 `Devices` 两棵树都不存在），
+    #   于是每一条都被判成 absent、清单恒为空 —— D8c/D8d 在 runner 上必红，
+    #   而开发机上必绿。闸门要验的是"清单**怎么算**"，不该由"跑闸那台机器
+    #   有没有蓝牙适配器"决定结论。（2026-09-29：v1.0.23 的第一次 CI 就栽在这。）
     d = {
         "live_addr": "047f0ef2d294",
         "records": [{"remote": "f196a263671c",
@@ -436,9 +488,15 @@ def case_behavior() -> None:
                       "addr": "047f0ef2d294"}],
         "nodes": [{"key": r"SYSTEM\CurrentControlSet\Enum\BTHLE\Dev_x\y",
                    "remote": "f196a263671c"}],
-        "keys": {"locals": [{"local": "047f0ef2d294"}]},
+        # 故意多带一个**不存在**的本地地址，好让 D8e 真的有事可验
+        "keys": {"locals": [{"local": "047f0ef2d294"},
+                            {"local": "ffffffffffff"}]},
     }
-    jobs = P._backup_jobs(d)
+
+    def _state_with_missing(path: str) -> str:
+        return "absent" if path.casefold().endswith(r"keys\ffffffffffff") else "ok"
+
+    jobs = P._backup_jobs(d, state_of=_state_with_missing)
     paths = [p for p, _t, _c in jobs]
     A(not any(p.rstrip("\\").casefold().endswith(r"parameters\keys") for p in paths),
       "D8 不再导整棵 Keys（实际清单里没有裸的 ...\\Parameters\\Keys）")
@@ -455,26 +513,40 @@ def case_behavior() -> None:
     A(keyjob and crit[keyjob[0]] is True,
       "D8f 链路密钥是**关键项**（导不出来就不许动注册表）")
 
-    # D9 反例：把"只跳过 absent"放宽成"只要不是 ok 就跳过" → D8c 变红
-    #      （＝没有管理员权限时会把读不了的链路密钥整棵漏掉）
+    # D8g/D8h 键状态真的在起作用：absent 不列、denied 照列
+    #   （"打不开"≠"没有" —— 读不了的链路密钥正是最该备份的那几棵）
+    A(P._backup_jobs(d, state_of=lambda _p: "absent") == [],
+      "D8g 全判 absent 时清单为空 —— 这就是 CI runner 上真注册表的样子"
+      "（所以 D8c/D8d 必须靠注入，不能读真注册表）")
+    A(any(p.casefold().endswith(r"keys\047f0ef2d294")
+          for p, _t, _c in P._backup_jobs(d, state_of=lambda _p: "denied")),
+      "D8h 「打不开」（denied）的键照样列 —— 那是现在读不了，不是没有")
+
+    # D9 反例：把"只跳过 absent"放宽成"只要不是 ok 就跳过" → 读不了的密钥整棵漏掉
+    #      （＝没有管理员权限时，最该备份的那几棵反而被跳过）
+    #      ⚠ 老写法是 `if "denied" in states:` 靠真注册表碰运气 —— runner 上
+    #        必然进不了那个分支，等于这条反例在 CI 上从没验过。现在全程注入。
     src = _read("pairing.py")
-    broken = src.replace('if _reg_key_state(path) == "absent":',
-                         'if _reg_key_state(path) != "ok":')
+    broken = src.replace('if _state(path) == "absent":',
+                         'if _state(path) != "ok":')
     A(broken != src, "[反例] 能构造出「放宽跳过条件」的版本（锚点存在）")
     ns_mod = __import__("types").ModuleType("pairing_broken")
     sys.modules["pairing_broken"] = ns_mod
     try:
         exec(compile(broken, "pairing_broken.py", "exec"), ns_mod.__dict__)
-        # 本机 `Keys\<addr>` 在非管理员下是 denied → 放宽后会被跳过
-        states = [P._reg_key_state(f"{P.BTHPORT_KEYS}\\047f0ef2d294")]
-        if "denied" in states:
-            jobs_b = ns_mod._backup_jobs(d)
-            A(not any(p.casefold().endswith(r"keys\047f0ef2d294")
-                      for p, _t, _c in jobs_b),
-              "[反例] 放宽成「不是 ok 就跳过」后，读不了的链路密钥真的被漏掉了"
-              " ⇒ D8c 抓的正是这个差别")
-        else:
-            A(True, "[反例] 本机 Keys 子键可读，跳过该反例（不影响结论）")
+
+        def _denied(_p: str) -> str:
+            return "denied"
+
+        good = P._backup_jobs(d, state_of=_denied)
+        bad = ns_mod._backup_jobs(d, state_of=_denied)
+        A(any(p.casefold().endswith(r"keys\047f0ef2d294")
+              for p, _t, _c in good),
+          "D9a 对照：denied 状态下本版本照样把它列进清单（差异不是环境造成的）")
+        A(not any(p.casefold().endswith(r"keys\047f0ef2d294")
+                  for p, _t, _c in bad),
+          "[反例] 放宽成「不是 ok 就跳过」后，读不了的链路密钥真的被漏掉了"
+          " ⇒ D8c/D8h 抓的正是这个差别")
     finally:
         sys.modules.pop("pairing_broken", None)
 
