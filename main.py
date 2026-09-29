@@ -35,6 +35,22 @@ import mixer
 # 不能让输入法一直挂着听。这是本程序"管好语音功能"的一部分，不能指望用户记得。
 VOICE_MAX_SECONDS = 600
 
+# 遥控器停止推流多久之后，就认定"这一段语音已经结束"（秒）。
+#
+# ⚠ 这是 v1.0.25 修的**真机实测 bug**，症状是「按语音键说话，输入法一点反应都没有」：
+#
+#   遥控器推流是**每 16 ms 一帧、连续不断**的（说话不说话都推），所以"收不到帧"
+#   只有一个含义 —— 它真的停了。可程序原先只认三条结束信号（再按一次语音键 /
+#   按确认键 / 600 秒超时），**遥控器自己停了它不知道**：
+#     遥控器 01:07:16 停推 → 程序一直以为在开会话（UI 显示「语音中」）
+#     → 用户 01:09:54 再按语音键想说话，程序把这一下读成「第二次按下＝结束」
+#     → 热键被收起、输入法关掉，用户说的话一个字都没进去。
+#   实测日志：`🎙️ 语音会话【结束】（第二次按下语音键）` —— 用户明明是想**开始**。
+#
+# 阈值取 6 秒：遥控器开机推流到第一帧实测 0.3~1.7 秒，6 秒留了 3 倍余量；
+# 而会话最长要挂 600 秒，6 秒已经能把"卡住"这件事压到用户察觉不到。
+REMOTE_SILENCE_END_SECONDS = 6.0
+
 # 我们每发一次 MIC_OPEN，遥控器就会回一个 audio_start（"我开始推流了"）。
 # 那一声不是用户按的，绝不能被当成"第二次按下"去结束会话 ——
 # 否则用户按下语音键的瞬间就会被自己关掉（"按一次它掉"）。
@@ -1352,7 +1368,7 @@ async def _run_bridge_inner(device_type: str | None = None,
     def on_control(sender, args):
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
         nonlocal pending_mic_echo, mic_echo_since
-        global _audio_frames, _audio_peak, _echo_swallowed
+        global _audio_frames, _audio_peak, _echo_swallowed, _remote_frame_last_at
         last_ble_activity = time.time()
         try:
             data = bytes(args.characteristic_value)
@@ -1482,6 +1498,12 @@ async def _run_bridge_inner(device_type: str | None = None,
                     voice_active     = True
                     res.voice_active = True
                     voice_started_at = time.time()
+                    # ⚠ 会话一开就把"遥控器最后一次推帧"的时刻清零（v1.0.25）。
+                    #   不清的话它是**上一段遗留**的旧值：两段之间隔得久了（比如
+                    #   上一段 10 分钟前结束），主循环 ④ 会拿这个旧值算出"已经静默
+                    #   10 分钟" ⇒ 会话刚开就被自己收掉。清零后 ④ 的分母退回
+                    #   `voice_started_at`，含义正是"从开会话到现在一帧都没来"。
+                    _remote_frame_last_at = 0.0
                     state.update(streaming=True, last_event="语音中…")
                     logger.info("🎙️ 语音会话【开始】—— 可以松手了，会一直听着")
                     # ── 补发 MIC_OPEN：**必须在判完回声、确认是真按键之后** ──────
@@ -2640,6 +2662,39 @@ async def _run_bridge_inner(device_type: str | None = None,
                     session.close("残留推流自愈")
                     atvv.state.stream_active = False
                     state.end_session("语音结束（残留推流已停）")
+
+            # ④ 反向兜底：程序这边**认为会话开着**，遥控器却**早就不推流了**。
+            #
+            # 这是 ③ 的镜像，补的是另一半：③ 管"我们没有会话、它还在推"，
+            # ④ 管"我们以为有会话、它其实已经停了"。
+            #
+            # ⚠ 为什么必须有：遥控器推流是每 16 ms 一帧的连续流，"收不到帧"只有
+            #   一个含义 —— 它停了。而遥控器自己停流时**不一定**会让我们收到那一下
+            #   按键（实测 2026-09-30：01:07:16 停推，之后 158 秒里日志一片空白，
+            #   程序一直显示「语音中」）。会话状态从此和事实相反，而语音键是**翻转**
+            #   语义 ⇒ 用户下一次按语音键想说话，实际是"结束"，输入法压根没被叫起来。
+            #   真机日志原样是：`🎙️ 语音会话【结束】（第二次按下语音键）`。
+            #
+            # ⚠ 分母必须"帧时刻"与"会话开始时刻"取非零的那个：
+            #   一帧都没收到时（MIC_OPEN 没发出去），从"开会话那一刻"起算 ——
+            #   否则分母是 0，这一条永远不成立（"代码在、永远跑不到"的老坑）。
+            if voice_active and voice_started_at:
+                _last_seen = _remote_frame_last_at or voice_started_at
+                _silent = _now_v - _last_seen
+                if _silent > REMOTE_SILENCE_END_SECONDS:
+                    logger.warning(
+                        "⏹ 遥控器已经 %.1f 秒没推流了（超过 %.0f 秒）→ 认定这一段"
+                        "语音已经结束，会话自动收尾。\n"
+                        "   为什么这很重要：遥控器停流后程序若继续认为「语音中」，"
+                        "用户下一次按语音键会被读成「结束」而不是「开始」——"
+                        "表现就是「按了语音键说话，输入法一点反应都没有」。",
+                        _silent, REMOTE_SILENCE_END_SECONDS,
+                    )
+                    logger.info("🎙️ 语音会话【结束】（遥控器已停止推流）")
+                    # send=True：用户是"说完了"（要么按了停、要么遥控器到时），
+                    # 不是超时走开 —— 这一段该走「自动发送」策略。
+                    # （是否真发由 config.send_after_voice 决定，默认关。）
+                    end_voice_session("遥控器已停止推流", send=True)
 
             # ── 语音结束后的自动发送（见 request_voice_send 的注释）──────────
             # 放在主循环而不是 BLE 回调线程里，有三个好处：

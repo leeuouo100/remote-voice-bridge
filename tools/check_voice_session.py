@@ -458,6 +458,45 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
               and "nonlocal _mic_close_sent_at" in code,
               "⑧ 关麦时刻在回调里被挪（成功才挪；失败不挪 —— 那说明遥控器压根"
               "没收到，宽限期不该替它挡枪）"))
+
+    # ── ⑨ 「遥控器停了，程序还在等」—— 会话挂死（v1.0.25 真机实测）──────
+    #
+    # 真机原样：遥控器 01:07:16 停推 → 程序一路以为「语音中」挂到 01:09:54，
+    # 用户再按语音键**想说话**，却被读成「第二次按下＝结束」
+    # （日志原样 `🎙️ 语音会话【结束】（第二次按下语音键）`）⇒ 热键被收起、
+    # 输入法压根没被叫起来。用户感受就是「按了语音键说话，一点反应都没有」。
+    # 根因：遥控器推流是每 16 ms 一帧的连续流，"收不到帧"只有一个含义 —— 它停了，
+    # 而程序只认三条结束信号（再按一次 / 确认键 / 600 秒），遥控器自己停了它不知道。
+    c.append(("REMOTE_SILENCE_END_SECONDS" in src,
+              "⑨ 有「遥控器静默多久就认定这段语音已结束」的常量"))
+    c.append(("REMOTE_SILENCE_END_SECONDS" in loop_body,
+              "⑨ 反向兜底在主循环里（放 check_health 里永远跑不到 —— "
+              "用户「按了开始就走开」时恰恰一个按键都没有）"))
+    c.append((bool(ch_body) and "REMOTE_SILENCE_END_SECONDS" not in ch_body,
+              "⑨ 反向兜底**不在** check_health 里"))
+    # ⚠ 切块必须用**原文**锚点（`# ④ 反向兜底` 是注释行，_code_only 会整行剥掉），
+    #   切完再各自 _code_only —— 否则注释里逐字引用的写法会把判据喂绿。
+    _m4 = re.search(r"# ④ 反向兜底(.*?)# ── 语音结束后的自动发送", src, re.S)
+    b4 = _code_only(_m4.group(1)) if _m4 else ""
+    c.append((bool(_m4), "⑨ 找得到主循环 ④ 反向兜底那一块"))
+    c.append(("_remote_frame_last_at or voice_started_at" in b4,
+              "⑨ ④ 的分母是 `_remote_frame_last_at or voice_started_at`"
+              "（一帧都没收到时退回「开会话那一刻」；只用前者会因分母为 0 永不成立）"))
+    c.append(("voice_active" in b4,
+              "⑨ ④ 先确认「会话确实开着」再收尾（否则会去收一段不存在的会话）"))
+    c.append(('end_voice_session("遥控器已停止推流"' in b4,
+              "⑨ ④ 走唯一的收尾入口 end_voice_session()"
+              "（裸写 update(streaming=False) 会漏掉 MIC_CLOSE/回声记账）"))
+    # ⚠ 本项目老病：**没有 global 声明的赋值 = 新建一个局部名** ——
+    #   写进去的是局部变量，模块级那个永远停在旧值 ⇒「开会话时复位」静默失效。
+    c.append(("global _audio_frames, _audio_peak, _echo_swallowed, _remote_frame_last_at"
+              in code,
+              "⑨ on_control 里声明了 global _remote_frame_last_at"
+              "（漏了它，复位写的是局部名，等于没复位）"))
+    asb = _audio_start_block(code)
+    c.append(("_remote_frame_last_at = 0.0" in asb,
+              "⑨ 开会话时复位「遥控器最后一次推帧」（不复位会拿着上一段的旧值"
+              "算出「已静默很久」⇒ 新会话刚开就被自己收掉）"))
     return c
 
 
@@ -689,7 +728,32 @@ def main() -> int:
                             'logger.warning(\n                        "（正常）刚发过',
                             1))
 
-    if n_red < 19:
+    # 反例 22（v1.0.25）：④ 的分母退回 `_remote_frame_last_at`（一帧都没收到时
+    #          它是 0 ⇒ 条件永不成立 ⇒ 又变回"代码在、永远跑不到"）
+    _expect_red("④ 的分母去掉 `or voice_started_at`（＝一帧都没收到时永不成立）",
+                src.replace("_remote_frame_last_at or voice_started_at",
+                            "_remote_frame_last_at", 1))
+
+    # 反例 23（v1.0.25）：漏掉 global 声明（＝复位写进局部名，模块级那个不动）
+    _expect_red("on_control 漏声明 global _remote_frame_last_at"
+                "（＝开会话时的复位静默失效）",
+                src.replace(
+                    "        global _audio_frames, _audio_peak, _echo_swallowed, "
+                    "_remote_frame_last_at",
+                    "        global _audio_frames, _audio_peak, _echo_swallowed", 1))
+
+    # 反例 24（v1.0.25）：开会话时不复位（＝拿着上一段的旧值算出「已静默很久」，
+    #          新会话刚开就被自己收掉）
+    _expect_red("开会话时不再复位「遥控器最后一次推帧」",
+                src.replace("                    _remote_frame_last_at = 0.0\n",
+                            "", 1))
+
+    # 反例 25（v1.0.25）：④ 绕过唯一收尾入口（＝不撤推流许可、不清回声记账）
+    _expect_red("④ 绕过 end_voice_session 收尾（裸写 state.update(streaming=False)）",
+                src.replace('end_voice_session("遥控器已停止推流", send=True)',
+                            'state.update(streaming=False)', 1))
+
+    if n_red < 22:
         ok = False
 
     print()
