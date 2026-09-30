@@ -58,6 +58,12 @@ a = Analysis(
         # `import frida_hid`，显式列一遍；frida 本身也列上（装不上时
         # PyInstaller 只给警告，运行时 frida_hid 会优雅降级）。
         'frida_hid', 'frida',
+        # 「遥控器优先」（v1.0.26）：把系统默认**录音**设备钉在 CABLE Output。
+        # 同样是 main.py 里**函数内部** `import audiodefault`（为了非 Windows /
+        # 精简环境下 import 失败也不拖垮桥），显式列一遍更保险 ——
+        # 漏了的表现是「插上别的麦克风后输入法又听不到了」，而日志里
+        # 只有一行 debug，极难往这上面想。
+        'audiodefault',
     ],
     hookspath=[],
     hooksconfig={},

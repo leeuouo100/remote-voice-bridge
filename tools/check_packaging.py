@@ -166,7 +166,21 @@ def collect_checks(spec: str, iss: str, root: str = ROOT) -> list[tuple[bool, st
     checks.append(("'frida_hid'" in a_block,
                    "主 EXE 的 hiddenimports 里有 'frida_hid'（否则运行时 import 直接失败）"))
 
-    # ⑦ 安装器把整个 bundle 目录拷进去 —— 上面那些 data 才能落到 {app}
+    # ⑦ 「遥控器优先」进包（v1.0.26 加的闸）
+    #
+    # 和 ⑥ 完全同款：`audiodefault` 也是 main.py 里**函数内部**才 import 的
+    # （为了非 Windows / 精简环境下 import 失败也不拖垮桥），PyInstaller 对
+    # 函数内的 import 只给 warning、有时会漏收。
+    # 漏了的表现是「插上别的麦克风之后输入法又听不到了」—— 用户报的还是
+    # "语音输入不行"，而日志里只有一行 debug，极难往这上面想。
+    # ⚠ 同样比对**带引号**的 `'audiodefault'`：spec 的注释里也写着 audiodefault
+    #   （反引号包着），不加引号会连注释一起匹配上 ⇒ 漏收也照样绿。
+    checks.append((os.path.isfile(os.path.join(root, "audiodefault.py")),
+                   "仓库根目录有 audiodefault.py（遥控器优先的实现）"))
+    checks.append(("'audiodefault'" in a_block,
+                   "主 EXE 的 hiddenimports 里有 'audiodefault'（否则运行时 import 直接失败）"))
+
+    # ⑧ 安装器把整个 bundle 目录拷进去 —— 上面那些 data 才能落到 {app}
     # 少了 recursesubdirs 只拷一层的话，PyInstaller onedir 的内部结构会缺文件。
     files_sec = _section(iss, "Files")
     checks.append(("recursesubdirs" in files_sec,
@@ -227,6 +241,11 @@ def _selftest(spec: str, iss: str) -> int:
     _case("[Files] 去掉 recursesubdirs → 必须红",
           (spec, iss.replace(" recursesubdirs", "")),
           "递归拷整个 bundle")
+
+    # ⑥ 反例：hiddenimports 里去掉 'audiodefault' ⇒ 运行时 import 失败
+    _case("hiddenimports 漏掉 'audiodefault' → 必须红",
+          (spec.replace("'audiodefault',", ""), iss),
+          "hiddenimports 里有 'audiodefault'")
 
     if fails:
         print(f"PACKAGING SELFTEST FAILED（{len(fails)} 项）")

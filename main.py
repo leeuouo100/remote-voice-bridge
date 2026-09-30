@@ -729,6 +729,56 @@ async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
     return ble.connection_status == BluetoothConnectionStatus.CONNECTED, sess
 
 
+# ── 「遥控器优先」：把系统默认录音设备钉在 CABLE Output（v1.0.26）──────────────
+#
+# 为什么要有这件事（2026-09-30 用户真机）
+# ------------------------------------
+# 输入法（微信输入法）读的是**系统默认录音设备**。用户插上一个 USB 麦克风
+# （BOYA mini）后，Windows 自动把默认录音设备换成了它 ⇒ 输入法去听 BOYA，
+# 而遥控器的声音一路好好地写进了 `CABLE Output` —— **没人听**。
+# 现象就是「按语音键说话，一个字都出不来」。
+#
+# 用户的原话：「如果和我们这个遥控器同时存在的话，优先使用我们这个遥控器，
+# 要有这种权利。」⇒ 开关 `config.force_default_capture`（默认开）。
+#
+# ⚠ 为什么不是「每轮都改」
+#   主循环一轮 0.2 秒，每轮都去问一次 COM 太浪费，而且用户若临时切到别的
+#   麦克风会被**立刻**改回去（切不动）。所以这里**节流 5 秒**：
+#   插上 USB 麦到被抢回来最多晚 5 秒，用户手动切换也有 5 秒的操作窗口。
+#   （真正的"每次都要钉"的时刻是**语音会话开始**，那一下由下面单独兜。）
+_CAPTURE_CHECK_INTERVAL = 5.0
+
+
+async def _ensure_default_capture(cfg, reason: str) -> None:
+    """默认录音设备不是 `cfg.capture_device_name` 就改回去。
+
+    ⚠ `audiodefault` **永不抛异常**（见它的模块注释）；这里再兜一层是因为
+      `import` 本身也可能失败（非 Windows / 打包漏收）。
+    ⚠ COM 调用丢进 executor —— 它内部会 `CoCreateInstance`，虽然只要几毫秒，
+      但**不该**占着事件循环（事件循环还管着 BLE 回调的投递）。
+    """
+    if not cfg.force_default_capture:
+        return
+    try:
+        import audiodefault
+    except Exception as e:                       # noqa: BLE001
+        logger.debug("audiodefault 不可用（跳过钉默认录音设备）：%r", e)
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        changed, note = await loop.run_in_executor(
+            None, audiodefault.ensure_default_capture, cfg.capture_device_name)
+    except Exception as e:                       # noqa: BLE001
+        logger.debug("钉默认录音设备时出错（已忽略）：%r", e)
+        return
+    if changed:
+        # ⚠ 用 warning 而不是 info：用户会看见自己的默认麦克风被换掉，
+        #   日志里必须有**醒目**的一条解释为什么（否则就是"程序乱改我设置"）。
+        logger.warning("🔊 %s：%s", reason, note)
+    elif note:
+        logger.info("🔊 %s：%s", reason, note)
+
+
 # ── Main bridge ────────────────────────────────────────────────────────────────
 class _BridgeResources:
     """一次 run_bridge 里所有「需要收尾」的句柄 —— 2026-09-29 审查报告 P1-3。
@@ -1506,6 +1556,22 @@ async def _run_bridge_inner(device_type: str | None = None,
                     _remote_frame_last_at = 0.0
                     state.update(streaming=True, last_event="语音中…")
                     logger.info("🎙️ 语音会话【开始】—— 可以松手了，会一直听着")
+                    # ── 「遥控器优先」：会话开始的这一刻**最要紧** ──────────────
+                    # 用户完全可能"刚插上 BOYA → 立刻按语音键"（Windows 改默认
+                    # 录音设备是**即时**的）。主循环的 5 秒巡检这时还没轮到，
+                    # 所以在这儿补一枪。
+                    # ⚠ 不能直接调：on_control 跑在 **BLE 回调线程**上，那里没有
+                    #   事件循环（v1.0.3 事故：MIC_OPEN 就是在这儿直接
+                    #   asyncio.get_event_loop() 才**一次都没发出去**）。
+                    #   走 run_coroutine_threadsafe 投递回主循环，与 _send_tx 同一套路。
+                    # ⚠ 不 await、不取 Future：_ensure_default_capture 自己吞掉
+                    #   全部异常（连 import 失败都吞），所以不会有"未取回的异常"。
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _ensure_default_capture(cfg, reason="语音会话开始"),
+                            _bridge_loop)
+                    except Exception:                   # noqa: BLE001
+                        pass
                     # ── 补发 MIC_OPEN：**必须在判完回声、确认是真按键之后** ──────
                     # 遥控器按语音键只上报 AUDIO_START(0x04)，**从不发
                     # START_SEARCH(0x08)**，而开麦命令原先只挂在 start_search 分支
@@ -1782,6 +1848,13 @@ async def _run_bridge_inner(device_type: str | None = None,
     res.stream = stream
     await loop.run_in_executor(None, stream.start)
     logger.info("✅ Audio stream started（%d Hz）", _audio_rate["sr"])
+
+    # ── 「遥控器优先」：把系统默认录音设备钉在 CABLE Output ──────────────────
+    # 桥这一侧一切就绪了，但**输入法听的是系统默认录音设备**，不是我们选的
+    # 那只 —— 用户插上 USB 麦克风后 Windows 会把默认换掉，输入法就听不到了。
+    # 这里先钉一次；运行期间由主循环每 _CAPTURE_CHECK_INTERVAL 秒复核一次
+    # （用户是**边用边插**的，只在启动时钉一次不够）。
+    await _ensure_default_capture(cfg, reason="启动时检查默认录音设备")
 
     # 起跑线：先给心跳一个初值，否则监护第一次检查时 _cb_last_at 还是 0，
     # 会被当成"已静默很久"而白重建一次。
@@ -2548,6 +2621,9 @@ async def _run_bridge_inner(device_type: str | None = None,
     logger.info("=" * 60)
 
     ran_ok = False
+    # 「遥控器优先」巡检节流（见 _CAPTURE_CHECK_INTERVAL 的注释）。
+    # 初值 0.0 ⇒ 进循环后第一轮就复核一次（幂等、已经是它时完全无声），之后每 5 秒一次。
+    _cap_last_check = 0.0
     try:
         while True:
             # ⚠ 退出请求必须在**每一轮的最前面**看：托盘点「退出」时，
@@ -2585,6 +2661,15 @@ async def _run_bridge_inner(device_type: str | None = None,
             #   放在那儿的兜底代码**一次都不会执行**（代码在、永远跑不到）。
             #   下面两条都是"状态与事实不一致"，属于每一轮都该核的事。
             _now_v = time.time()
+
+            # ── 「遥控器优先」：默认录音设备被别的麦克风抢走时抢回来 ──────────
+            # ⚠ 必须放在**主循环**里而不是只在启动时做一次：用户是**边用边插**的
+            #   （插上 BOYA，Windows 立刻改默认设备），而这时桥是好的、**不会重连**
+            #   ⇒ 启动时那一次早就过去了。节流见 _CAPTURE_CHECK_INTERVAL。
+            if (cfg.force_default_capture
+                    and (_now_v - _cap_last_check) >= _CAPTURE_CHECK_INTERVAL):
+                _cap_last_check = _now_v
+                await _ensure_default_capture(cfg, reason="巡检默认录音设备")
 
             # ① 超时兜底：用户按了「开始」却忘了收尾，程序自己收场。
             #    「管理好语音输入功能」包含这一条 —— 不能指望用户永远记得按第二下。

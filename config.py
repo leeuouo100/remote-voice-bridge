@@ -44,7 +44,7 @@ BACKUP_DIR = (Path(os.environ.get("ProgramData", r"C:\ProgramData"))
               / "remote-voice-bridge" / "backup")
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.25"
+APP_VERSION = "1.0.26"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
@@ -339,6 +339,17 @@ class Config:
     input_method:     str       = "wechat_hold_mode"
     custom_keys:      list[str] = field(default_factory=list)  # e.g. ["alt", "shift", "m"]
     audio_output:     str       = "CABLE Input"
+    # ── 「遥控器优先」（v1.0.26）────────────────────────────────────────────
+    # 输入法（微信输入法等）读的是**系统默认录音设备**。用户插上一个 USB
+    # 麦克风（BOYA mini）之后 Windows 会自动把默认录音设备换成它 ⇒ 输入法去
+    # 听 BOYA，遥控器的声音明明写进了 `CABLE Output` 却没人听 ——
+    # 现象就是「按语音键说话，一个字都出不来」。
+    #
+    # 用户的原话：「如果和我们这个遥控器同时存在的话，优先使用我们这个遥控器，
+    # 要有这种权利。」⇒ 默认**开**：程序发现默认录音设备不是下面这只，就改回来。
+    # 想反过来（开会时用耳机麦），把它设成 false 即可。
+    force_default_capture: bool = True
+    capture_device_name:   str  = "CABLE Output"
     gain:             float     = 10.0
     watchdog_timeout: int       = 180
     reconnect_delay:  int       = 5

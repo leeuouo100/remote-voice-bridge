@@ -264,6 +264,14 @@ STEPS = [
     # 守卫原先只加在下拉框（list_input_devices）上，两处真正的解析都绕过了它。
     # 用假 sounddevice 把每种情形跑一遍（含"默认设备就是回环"），7 条反例。
     ("电脑麦克风解析", [PY, "tools/check_input_device.py"]),
+    # 「遥控器优先」：把系统默认**录音**设备钉在 CABLE Output（2026-09-30 真机）。
+    # 输入法读的是系统默认录音设备；用户插上 USB 麦克风（BOYA）后 Windows 会把
+    # 默认换成它 ⇒ 输入法去听 BOYA，遥控器的声音写进了 CABLE Output 却没人听。
+    # 实现是纯 ctypes 手写**未公开**的 IPolicyConfig（Windows 没有公开的 Set API）。
+    # 这道闸钉四件静默失效：对外函数永不抛、手写 COM 的 vtable 下标（尤其
+    # SetDefaultEndpoint=13）、COM 初始化标记必须 thread-local、
+    # main.py 三处接线（启动/巡检/会话开始）缺一不可。6 条反例自证。
+    ("默认录音设备（遥控器优先）", [PY, "tools/check_audio_default.py"]),
     # "波形在动、输入法却收不到声音，重启才好"（2026-09-17 真机）——
     # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
     # 纯静态，几毫秒。
