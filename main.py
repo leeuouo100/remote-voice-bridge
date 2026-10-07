@@ -666,6 +666,107 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
 
 
 # ── BLE 链路建立 ───────────────────────────────────────────────────────────────
+async def _gatt_really_reachable(ble):
+    """这条「连接」到底通不通？—— 真的去读一次 GATT。
+
+    ⚠ 为什么必须用 `BluetoothCacheMode.UNCACHED`
+    ------------------------------------------
+    默认的 `Cached` 在**链路已经断掉时照样返回缓存里的服务表** —— 拿它当探针
+    等于什么都没验。而 UNCACHED 会真的去问设备：链路不通就失败。
+
+    ⚠ 为什么需要这个探针（2026-10-07 真机，铁证）
+    -------------------------------------------
+    上一次断开之后，Windows 的 BLE 栈会**残留** `connection_status = CONNECTED`。
+    重连时 `_hold_ble_connection` 一看它是 CONNECTED 就立刻返回 —— 日志上
+    200 毫秒就"连上"了（真连接实测要 **7 秒**），然后下游读到的是**脏缓存**：
+
+        14:57:52,944 🔗 Connecting...
+        14:57:53,144 ✅ Connected  status=1          ← 200 毫秒（假的）
+        14:57:53,384 ❌ ATVV characteristic(s) not found   ← 238 毫秒（纯读缓存）
+
+    结果是**每 30 秒失败一次、连着失败 17 次共 7 分钟**，用户看到的就是
+    「时间一停就再也连不上，只有关掉软件重来」。
+
+    返回：True = 通 / False = 不通 / **None = 这个 winrt 版本验不了**（调用方
+    自己决定怎么办 —— 绝不能因为验不了就判失败）。
+    """
+    from winrt.windows.devices.bluetooth import BluetoothCacheMode
+    from winrt.windows.devices.bluetooth.genericattributeprofile import (
+        GattCommunicationStatus,
+    )
+    try:
+        r = await ble.get_gatt_services_async(BluetoothCacheMode.UNCACHED)
+    except TypeError:
+        # pywinrt 没给这个方法生成 cache_mode 重载 ⇒ 退回"信它"（= 老行为）。
+        # ⚠ 不能在这里抛，更不能判失败 —— 那会让所有机器都连不上。
+        return None
+    except Exception as e:                       # noqa: BLE001
+        logger.debug("GATT 探针抛异常：%r", e)
+        return False
+    return bool(r is not None and r.status == GattCommunicationStatus.SUCCESS
+                and r.services)
+
+
+async def _gatt_services_uncached(ble, service_uuid: str):
+    """强制**去设备上**重新发现某个服务（而不是读缓存）。
+
+    ⚠ 失败一律返回 None，**绝不抛** —— 它只是"再试一次"，不该把桥搞崩。
+    ⚠ 返回 None 有两种含义：真的读不到，或者这个 winrt 版本没有 cache_mode
+      重载（`TypeError`）。调用方按"读不到"处理即可（退回老行为）。
+    """
+    from winrt.windows.devices.bluetooth import BluetoothCacheMode
+    try:
+        return await ble.get_gatt_services_for_uuid_async(
+            uuid.UUID(service_uuid), BluetoothCacheMode.UNCACHED)
+    except TypeError:
+        logger.debug("这个 winrt 版本没有 get_gatt_services_for_uuid_async 的 "
+                     "cache_mode 重载 → 跳过 UNCACHED 重试")
+        return None
+    except Exception as e:                       # noqa: BLE001
+        logger.debug("UNCACHED 重新发现服务失败：%r", e)
+        return None
+
+
+async def _read_atvv_chars(service, cached: bool):
+    """读 ATVV 的三个特征（TX / AUDIO / CTL），返回等长的 list。
+
+    `cached=False` ⇒ 走 UNCACHED，**真的去问设备**。
+    ⚠ 任何一步出问题都往 list 里塞 None，**绝不抛** —— 调用方统一按
+      「status 不是 SUCCESS 或 characteristics 为空」判失败。
+    """
+    from winrt.windows.devices.bluetooth import BluetoothCacheMode
+    out = []
+    for u in (TX_UUID, AUDIO_UUID, CTL_UUID):
+        try:
+            if cached:
+                out.append(await service.get_characteristics_for_uuid_async(uuid.UUID(u)))
+            else:
+                out.append(await service.get_characteristics_for_uuid_async(
+                    uuid.UUID(u), BluetoothCacheMode.UNCACHED))
+        except TypeError:
+            # 没有 cache_mode 重载 ⇒ 整组退回，让调用方走老路
+            logger.debug("这个 winrt 版本没有 get_characteristics_for_uuid_async 的 "
+                         "cache_mode 重载 → 跳过 UNCACHED 重试")
+            return [None, None, None]
+        except Exception as e:                   # noqa: BLE001
+            logger.debug("读 ATVV 特征 %s 失败：%r", u, e)
+            out.append(None)
+    return out
+
+
+def _atvv_char_ok(r) -> bool:
+    """一个特征读取结果算不算成功。"""
+    try:
+        from winrt.windows.devices.bluetooth.genericattributeprofile import (
+            GattCommunicationStatus,
+        )
+        return bool(r is not None
+                    and r.status == GattCommunicationStatus.SUCCESS
+                    and r.characteristics)
+    except Exception:                            # noqa: BLE001
+        return False
+
+
 async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
     """主动把 BLE 链路拉起来，并尽量维持住。
 
@@ -704,7 +805,38 @@ async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
         # 拿不到 GattSession 不影响后面 ②③ —— 降级即可，不要因此中断连接。
         logger.warning("⚠️  建立 GattSession 失败（降级继续）：%r", e)
 
-    if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
+    # ⚠ v1.0.27：**别一看到 CONNECTED 就走**。
+    #   上一次断开之后 Windows 会**残留**这个状态：真连接实测要 7 秒，
+    #   假连接 200 毫秒就报 CONNECTED，而此时 GATT 表是脏的。信它的后果是
+    #   "连上" 0.2 秒后报「ATVV characteristic(s) not found」，然后每 30 秒
+    #   重来一次、连着失败 7 分钟（2026-10-07 真机 17 次）。
+    #   所以 CONNECTED 之后还要**真读一次 GATT** 才算数。
+    _GATT_PROBE_INTERVAL = 4.0     # 秒：探针本身要 1~3 秒，别每轮都扎它
+    _fake_warned = False
+    _last_probe = -10.0
+
+    async def _real_link(waited: float) -> bool:
+        """系统说已连接，**并且**真读 GATT 也通（或这个 winrt 版本验不了）。"""
+        nonlocal _fake_warned, _last_probe
+        if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
+            return False
+        if (waited - _last_probe) < _GATT_PROBE_INTERVAL:
+            # 刚探过、不通 ⇒ 这一小会儿别再扎（等遥控器醒 / 等系统刷新状态）
+            return False
+        _last_probe = waited
+        if await _gatt_really_reachable(ble) is not False:
+            return True
+        if not _fake_warned:
+            _fake_warned = True
+            logger.warning(
+                "⚠️ 系统报「已连接」，但真去读 GATT 读不通 —— 这是**上一次断开"
+                "残留的连接状态**，不是遥控器坏了。\n"
+                "   多半是遥控器睡着了：按一下它上面任意一个键把它唤醒，"
+                "本程序会自己接上（**不用**关软件重开）。"
+            )
+        return False
+
+    if await _real_link(0.0):
         return True, sess
 
     # ② 触发一次 GATT 访问 —— 只读 connection_status 不会让系统去连。
@@ -721,12 +853,22 @@ async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
         if stop is not None and stop.is_set():
             logger.info("🛑 连接等待期间收到退出请求 → 提前结束")
             break
-        if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
+        if await _real_link(waited):
             return True, sess
         await asyncio.sleep(0.5)
         waited += 0.5
 
-    return ble.connection_status == BluetoothConnectionStatus.CONNECTED, sess
+    # 超时了，最后一搏：系统仍然坚持说「已连接」就先信它一次。
+    # ⚠ 为什么不在超时后一律判失败：UNCACHED 探针在某些驱动/环境下可能
+    #   **总是失败**，一判失败就会让那些机器**永远连不上**。宁可退回老行为
+    #   （让下游读 ATVV 时去发现），也不能因为"探针本身不好使"把用户挡在门外。
+    if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
+        logger.warning(
+            "⚠️ 20 秒内 GATT 一直读不通，但系统仍报「已连接」→ 先按已连接继续"
+            "（若下游真的读不到 ATVV，它会自己重连）。"
+        )
+        return True, sess
+    return False, sess
 
 
 # ── 「遥控器优先」：把系统默认录音设备钉在 CABLE Output（v1.0.26）──────────────
@@ -1035,18 +1177,30 @@ async def _run_bridge_inner(device_type: str | None = None,
     logger.info("📡 Discovering ATVV service...")
     svc = await ble.get_gatt_services_for_uuid_async(uuid.UUID(SERVICE_UUID))
     if svc.status != GattCommunicationStatus.SUCCESS or not svc.services:
+        # v1.0.27：缓存里没有 ⇒ **强制去设备上**重新发现一次。
+        #   「上一次断开残留的脏缓存」正是 2026-10-07「连不上」的根因。
+        logger.warning("⚠️ 缓存里没有 ATVV 服务 → 强制 UNCACHED 去设备上重新发现…")
+        svc = await _gatt_services_uncached(ble, SERVICE_UUID)
+    if svc is None or svc.status != GattCommunicationStatus.SUCCESS or not svc.services:
         logger.error("❌ ATVV service not found")
         return False
     service = svc.services[0]
 
-    tx_r   = await service.get_characteristics_for_uuid_async(uuid.UUID(TX_UUID))
-    aud_r  = await service.get_characteristics_for_uuid_async(uuid.UUID(AUDIO_UUID))
-    ctl_r  = await service.get_characteristics_for_uuid_async(uuid.UUID(CTL_UUID))
-
-    if not all(r.status == GattCommunicationStatus.SUCCESS and r.characteristics
-               for r in [tx_r, aud_r, ctl_r]):
-        logger.error("❌ ATVV characteristic(s) not found")
+    chars = await _read_atvv_chars(service, cached=True)
+    if not all(_atvv_char_ok(r) for r in chars):
+        bad = [n for n, r in zip(("TX", "AUDIO", "CTL"), chars) if not _atvv_char_ok(r)]
+        logger.warning("⚠️ 缓存里缺 ATVV 特征 %s → 强制 UNCACHED 去设备上重新发现…", bad)
+        chars = await _read_atvv_chars(service, cached=False)
+    if not all(_atvv_char_ok(r) for r in chars):
+        bad = [n for n, r in zip(("TX", "AUDIO", "CTL"), chars) if not _atvv_char_ok(r)]
+        logger.error(
+            "❌ ATVV characteristic(s) not found（缺 %s）。\n"
+            "   如果上面出现过「系统报已连接、但真读 GATT 读不通」，那就是"
+            "**上一次断开残留的连接状态** —— 按一下遥控器上任意一个键把它唤醒"
+            "即可（**不用**关软件重开）。", bad,
+        )
         return False
+    tx_r, aud_r, ctl_r = chars
 
     tx_char   = tx_r.characteristics[0]
     audio_char= aud_r.characteristics[0]

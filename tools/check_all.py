@@ -272,6 +272,15 @@ STEPS = [
     # SetDefaultEndpoint=13）、COM 初始化标记必须 thread-local、
     # main.py 三处接线（启动/巡检/会话开始）缺一不可。6 条反例自证。
     ("默认录音设备（遥控器优先）", [PY, "tools/check_audio_default.py"]),
+    # BLE「假连接」：`connection_status` 说已连接**不算数**（2026-10-07 真机）。
+    # 上一次断开后 Windows 会残留 CONNECTED —— 重连时 200 毫秒就"连上"（真连接
+    # 要 7 秒），下游读到脏缓存 ⇒ `ATVV characteristic(s) not found`，然后每 30 秒
+    # 重来一次、**连着失败 7 分钟**。用户报「时间一停就再也连不上，只有关掉软件重来」。
+    # 这道闸钉：探针必须 UNCACHED（Cached 在链路断掉时照样返回缓存）、
+    # 「验不了」必须返回 None 而不是 False（否则那些机器永远连不上）、
+    # 探针要节流、超时后要留活路；外加 ATVV 发现失败时用 UNCACHED 重试并报出缺哪个。
+    # 行为级用**假 ble** 跑五种情形 + 5 条反例自证。
+    ("BLE 假连接识别", [PY, "tools/check_ble_stale_connection.py"]),
     # "波形在动、输入法却收不到声音，重启才好"（2026-09-17 真机）——
     # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
     # 纯静态，几毫秒。
