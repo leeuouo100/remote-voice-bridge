@@ -83,6 +83,42 @@ REMOTE_SILENCE_END_SECONDS = 6.0
 #   · 太宽 → 真按键被当成回声吞掉 → **用户当场用不了**（v1.0.13 的病）
 ECHO_MAX_AGE = 1.5
 
+# ── 「会话刚开」保护期（v1.0.29）────────────────────────────────────────────
+#
+# 上面那套「欠一声回声」的记账假设：**一次 MIC_OPEN 只回一声 audio_start**。
+# 2026-10-09 真机把这个假设打碎了 —— 遥控器**有时一次 MIC_OPEN 回两条**。
+#
+# 真机日志（同一晚，相隔 3 分钟，两次会话各 1.4 秒就被自己关掉）：
+#
+#   15:17:34,481 ▶ Audio START            ← 用户按语音键（真）
+#   15:17:34,571 📤 MIC_OPEN 补发          → 记 1 笔账
+#   15:17:35,552 📤 MIC_OPEN [0c 00] status=0   （写入落地，用了 981ms）
+#   15:17:35,562 ▶ Audio START            ← 回声① → 销账（还欠 0 声）
+#   15:17:35,812 📤 MIC_OPEN 补发（松手重开麦）→ 再记 1 笔账
+#   15:17:35,814 ▶ Audio START            ← 回声② → 销账（还欠 0 声）
+#   15:17:35,846 ▶ Audio START            ← 回声③ → **账已销光** ⇒ 判成「第二次按下」
+#   15:17:35,847 🎙️ 语音会话【结束】（第二次按下语音键）
+#
+# ⇒ 会话只活了 **1.37 秒**，而遥控器推第一帧实测要 **1.578 秒**
+#   （见 15:14:23,085「距会话开始 1578 ms」）—— 差 0.2 秒就能收到声音。
+#   用户感受：「按了语音键、输入法弹出来了，可一个字也输入不了」。
+#
+# 对照同一晚成功那次（15:14，会话 67 秒 / 3749 帧）：2 次 MIC_OPEN 恰好配 2 条回声，
+# 账正好平 —— 所以这是**偶发**的，取决于遥控器那次回 1 条还是 2 条。
+#
+# 为什么不用「每次 MIC_OPEN 记 2 笔账」来兜：那等于把窗口放宽一倍，
+# 回声之后 1.5 秒内的**真按键**会被一起吞掉 —— 正是 v1.0.13 的病（用户当场用不了）。
+# 账多留一笔是**永久**的代价，而「一条 MIC_OPEN 回多条回声」只在**会话刚开**那一瞬。
+#
+# 所以保护期**只在**「会话开着 + 这一段还一帧都没收到 + 距开会话不到 N 秒」时生效：
+#   · 遥控器一出第一帧 ⇒ 说明用户真的在说话了 ⇒ 保护立刻解除
+#     （第一帧实测 1.578 秒到；正常说一句再按结束，远在 3 秒之后 ⇒ 不会误吞）
+#   · 时间**固定**、**不刷新** ⇒ 不会像 v1.0.13 那样「窗口永不过期」
+#   · 遥控器一直不出声（睡着了）⇒ 最多到 N 秒为止，之后照常判定
+# 代价：会话开始后 3 秒内若用户真想按第二次结束，得多按一下。可接受 ——
+#   3 秒内根本说不完一句话，这个窗口里出现的 audio_start 几乎必然是回声/杂散通知。
+ECHO_GUARD_SECONDS = 3.0
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 # 必须写到用户目录而不是程序目录：打包成 exe 后程序目录是 PyInstaller 的
 # 临时解压路径（_MEIxxxx），退出即被清理，日志会全部丢失。
@@ -147,6 +183,27 @@ _drop_frames = 0       # 因队列满而**丢掉**的音频帧数
 # 主循环的"残留推流自愈"（见 ③）必须用后者 —— 要抓的正是
 # "我们已经不认这段会话了、遥控器却还在推"的情形，前者那时根本不涨。
 _remote_frame_last_at = 0.0
+
+# 同一次收尾里 `⏹ Audio STOP` 会来**两次** —— 2026-10-09 真机日志原样：
+#
+#     12:07:56,880 ⏹ Audio STOP （本次共收到 1746 个音频帧，峰值 32768）
+#     12:07:56,890 ⏹ Audio STOP （本次共收到 1746 个音频帧，峰值 32768）
+#
+# 中间还夹着别的线程的日志（按键旁路），所以**不是** handler 双写，是
+# `on_control` 真的被 ATVV 通知触发了两次（遥控器关麦时会重复上报）。
+#
+# 功能上无害：那个分支里那两句（撤 `stream_active`、`state.end_session`）都幂等。
+# 但**排查时会误读成"停了两次"** —— 而"停了两次"会把下一个排查的人引向
+# "是不是重复收尾"，方向整个走反。所以用它给日志去重：
+# 0.5 秒内、帧数相同 ⇒ 认定为同一段收尾的第 2 次，降成 debug。
+_last_audio_stop_at = 0.0
+_last_audio_stop_frames = -1
+
+# 「等遥控器出声再叫输入法」（v1.0.29，默认关 —— 见 config.hotkey_wait_first_frame）。
+#
+# 由 `on_control`（BLE 回调线程）置位、由**主循环**消费：主循环那边能安全地
+# 读 `voice_active`（判断会话是不是已经结束了），也方便做超时兜底。
+_hotkey_pending: dict = {"at": 0.0, "armed": False}
 
 # 手动重连请求。控制台点「重新连接」时置位，主循环看到就断开重来。
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
@@ -541,6 +598,96 @@ def _soft_limit(x: float) -> float:
 _limit_win = {"n": 0, "hit": 0, "at": 0.0, "warn_at": 0.0}
 
 
+# ── 自动增益（AGC，v1.0.29）──────────────────────────────────────────────────
+# v1.0.22 的结论是「固定增益怎么选都是错的」：遥控器解码后的峰值本来就能顶到
+# 满量程，用户设 `gain = 10` 就整段被软限幅压平（语音识别在这种波形上明显
+# 退化），设成 1 又太小声。AGC 是那个结论的自然延伸：
+# **持续限幅就小步下调，长期不顶格再慢慢回调。**
+#
+# ⚠ 三条硬约束（少一条都会变成"程序偷偷动我的设置"）
+#   ① 只调**遥控器那一路**的系数，不碰系统麦克风 —— 那是用户自己的设备，
+#      它太响该由用户自己调。
+#   ② 系数**只降不升过 1.0** ⇒ 用户设的增益永远是**上限**；
+#      AGC 只在"你设太大了"时往下收，绝不会偷偷放大。
+#   ③ 有效增益**不低于 `_AGC_MIN_EFF_GAIN`** ⇒ 再糟也不会收到听不见。
+#
+# ⚠ 为什么统计的是"遥控器那一路"的限幅占比，而不是上面 `_limit_win` 的
+#   —— `_limit_win` 统计的是**混音输出**（含系统麦克风）。拿它当 AGC 的输入，
+#   系统麦克风一响就会把遥控器的增益压下去，那是错的因果。
+#
+# ⚠⚠ 这段代码跑在**音频回调线程**里（sounddevice 的播放回调，约每 15ms 一次）。
+#   所以它**只做纯算术**：不打日志、不写 state、不分配大对象。
+#   要播报的东西先记进 `_agc["pending_log"]`，由主循环去打印 ——
+#   在回调里写文件/拿锁会让声音抖（用户听到的是爆音）。
+_AGC_TARGET_PCT = 5.0        # 目标：遥控器那一路的限幅占比低于这个值
+_AGC_STEP_DOWN = 0.85        # 明显超目标（> 4 倍）时每次下调的比例
+_AGC_STEP_DOWN_SOFT = 0.96   # 略超目标时每次下调的比例
+_AGC_STEP_UP = 1.03          # 长期不顶格时回调的比例
+_AGC_QUIET_TICKS = 5         # 连续这么多秒都很安静才回调（避免来回抖）
+_AGC_MIN_EFF_GAIN = 1.0      # 有效增益下限（user_gain × factor ≥ 这个值）
+_AGC_SETTLE_SECONDS = 1.0    # 结算周期，与 `_limit_win` 对齐
+
+_agc = {
+    "factor": 1.0,           # 乘在遥控器那一路上的系数（≤ 1.0）
+    "enabled": True,
+    "hit": 0,                # 本结算窗口里被压平的遥控器采样数
+    "n": 0,                  # 本结算窗口里的遥控器采样总数（分母）
+    "at": 0.0,
+    "quiet": 0,              # 连续"很安静"的秒数
+    "pending_log": None,     # 待主循环播报的 (pct, factor)；回调只记不打印
+}
+
+
+def _agc_reset() -> None:
+    """回到"完全不介入"。
+
+    两个时机调用：① 新一轮桥启动；② **用户手动改了增益** ——
+    否则用户把滑块从 10 拖到 3，AGC 却还按 10 的旧账把系数压在 0.2，
+    实际增益只有 0.6，用户会觉得"我明明调了、怎么更小声了"。
+    """
+    _agc["factor"] = 1.0
+    _agc["hit"] = 0
+    _agc["n"] = 0
+    _agc["quiet"] = 0
+
+
+def _agc_settle(user_gain: float, now: float) -> None:
+    """每秒结算一次：按遥控器那一路的限幅占比调整系数。
+
+    ⚠ 跑在音频回调线程里 —— 只做纯算术，见上面 `_agc` 的说明。
+    """
+    n = _agc["n"]
+    hit = _agc["hit"]
+    _agc["n"] = 0
+    _agc["hit"] = 0
+    _agc["at"] = now
+    if not _agc["enabled"] or n <= 0 or user_gain <= 0.0:
+        return
+    pct = 100.0 * hit / n
+    f = _agc["factor"]
+    # 有效增益 = user_gain × f，下限 `_AGC_MIN_EFF_GAIN` ⇒ f 不能低于它。
+    # （用户把增益设得比下限还小时，f_min 取 1.0 ⇒ AGC 完全不介入。）
+    f_min = min(1.0, _AGC_MIN_EFF_GAIN / user_gain)
+    if pct > _AGC_TARGET_PCT * 4.0:
+        f = max(f_min, f * _AGC_STEP_DOWN)
+    elif pct > _AGC_TARGET_PCT:
+        f = max(f_min, f * _AGC_STEP_DOWN_SOFT)
+    elif pct < _AGC_TARGET_PCT / 10.0 and f < 1.0:
+        _agc["quiet"] += 1
+        if _agc["quiet"] >= _AGC_QUIET_TICKS:
+            f = min(1.0, f * _AGC_STEP_UP)
+            _agc["quiet"] = 0
+    else:
+        _agc["quiet"] = 0
+    if f != _agc["factor"]:
+        prev = _agc["factor"]
+        _agc["factor"] = f
+        # 首次明显下调时排队播报 —— 用户会**听见**音量变小，必须有个解释。
+        # ⚠ 只记不打印（这里是音频回调线程）。
+        if prev >= 0.9 and f < 0.9 and _agc["pending_log"] is None:
+            _agc["pending_log"] = (pct, f)
+
+
 # ── Audio stream ───────────────────────────────────────────────────────────────
 def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
     """输出流：把「遥控器麦克风」和「电脑麦克风」按各自的增益/静音/独奏相加后写出去。
@@ -567,7 +714,10 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
         wave_pts: list[int] = []
         mx = state.mix_params()
         # 增益为 0 == 这一路不发声（静音/未参与混音/被别人独奏压掉）
-        r_gain = float(mx["remote_gain"]) if state.source_audible("remote") else 0.0
+        # ⚠ v1.0.29：AGC 的系数只乘在**遥控器那一路**上（见 `_agc` 的注释）。
+        #   用户的设定值永远是上限 —— factor ≤ 1.0。
+        r_gain = (float(mx["remote_gain"]) * _agc["factor"]
+                  if state.source_audible("remote") else 0.0)
         s_gain = float(mx["sys_gain"]) if state.source_audible("sys") else 0.0
 
         sys_blk = None
@@ -613,6 +763,12 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
                 s = int(_pending_samples.popleft())
                 if r_gain > 0.0:
                     v = s * r_gain
+                    # AGC 的输入：**只看遥控器那一路**（见 `_agc` 的注释）。
+                    # 用与软限幅同一个拐点判"是不是被压了"。
+                    xr = v / 32768.0
+                    if xr > _LIMIT_KNEE or xr < -_LIMIT_KNEE:
+                        _agc["hit"] += 1
+                    _agc["n"] += 1
             if i < sys_len:
                 v += float(sys_blk[i]) * s_gain
 
@@ -658,6 +814,11 @@ def _create_stream(out_dev: int, sample_rate: int, sysmic=None):
             _limit_win["n"] = 0
             _limit_win["hit"] = 0
             _limit_win["at"] = now_cb
+
+        # ── 自动增益：与限幅统计同一个 1 秒节拍，但**独立结算** ────────────
+        #   （`_limit_win` 的分母是全部帧；AGC 的分母只有遥控器那一路的帧）
+        if now_cb - _agc["at"] >= _AGC_SETTLE_SECONDS and _agc["n"] > 0:
+            _agc_settle(float(mx["remote_gain"]), now_cb)
 
     return sd.OutputStream(
         device=out_dev, channels=1, dtype="int16",
@@ -791,6 +952,23 @@ _CONNECT_WAIT_SECONDS = 90.0
 # 等待期间多久播报一次进度。用户看不见"在等"就会以为卡死 —— 这正是
 # 他 14 秒后就去关软件的原因。
 _CONNECT_WAIT_REPORT_EVERY = 10.0
+
+# 一轮 `_run_bridge_inner` 里最多"再等几轮"。见下面连接那段的说明。
+#
+# ⚠ 为什么是 2 而不是 1（v1.0.29）
+#   老流程：超时 → 整个 `run_bridge` 返回 → `tray_app._bridge_worker` 睡一会儿
+#   → 重新 `asyncio.run(run_bridge(...))` → **重新枚举设备 + 重新
+#   `from_id_async` + 重新建 GattSession**。
+#   而这三步对"遥控器何时醒来"**毫无贡献** —— 建链的时间几乎全花在
+#   "等遥控器醒来 + Windows 去连它"上。所以重建等于**把已经等到一半的进度
+#   清零，从头再等**（2026-10-09 真机：第三次 18.18 秒才成功，前两次全白等）。
+#
+#   ⇒ 超时后**保留同一个 BluetoothLEDevice / GattSession**，直接在它上面
+#     接着等下一轮。只在用户点了「重新连接」、或遥控器真的不在时，才交给
+#     外层重建（那时重建是对的 —— 设备对象可能真的失效了）。
+#
+#   2 轮 = 最坏 180 秒。再长就该让用户看到"这台遥控器可能真没醒"的结论了。
+_CONNECT_INNER_TRIES = 2
 
 
 async def _hold_ble_connection(ble, timeout: float = _CONNECT_WAIT_SECONDS, stop=None):
@@ -1167,6 +1345,11 @@ async def _run_bridge_inner(device_type: str | None = None,
         sys_enabled=cfg.system_mic_enabled,
         remote_enabled=cfg.remote_mic_enabled,
     )
+    # AGC：按配置开关，并回到"完全不介入" —— 新一轮桥不该背着上一轮的系数。
+    _agc_reset()
+    _agc["enabled"] = bool(cfg.auto_gain)
+    _agc["pending_log"] = None
+    state.update(agc_enabled=bool(cfg.auto_gain), agc_factor=1.0)
 
     logger.info("=" * 60)
     logger.info("remote-voice-bridge starting")
@@ -1209,8 +1392,26 @@ async def _run_bridge_inner(device_type: str | None = None,
             "⏳ 遥控器还没连上（它多半在睡觉）—— 现在开始等它，最多 %.0f 秒。\n"
             "   请按一下遥控器上**任意一个键**把它唤醒；本程序会自己接上，"
             "**不用**关软件。", _CONNECT_WAIT_SECONDS)
-    connected, ble_session = await _hold_ble_connection(ble, stop=stop)
-    res.gatt_session = ble_session      # P1-3：同上，它是"举着链路"的那个
+    # ⚠ v1.0.29：超时后**不重建** device / GattSession，直接在同一个对象上接着等。
+    #   见 `_CONNECT_INNER_TRIES` 的说明 —— 重建对"遥控器何时醒来"毫无贡献，
+    #   只会把已经等到一半的进度清零（2026-10-09 真机：前两次全白等）。
+    connected = False
+    ble_session = None
+    for _attempt in range(_CONNECT_INNER_TRIES):
+        connected, ble_session = await _hold_ble_connection(ble, stop=stop)
+        res.gatt_session = ble_session  # P1-3：同上，它是"举着链路"的那个
+        if connected:
+            break
+        # 用户要退出 / 要重连 → 交给下面统一处理，不再多等一轮
+        if stop.is_set() or _reconnect_request.is_set():
+            break
+        if _attempt + 1 < _CONNECT_INNER_TRIES:
+            logger.warning(
+                "🔁 这一轮没等到遥控器，但**不重建设备对象**，直接在同一个连接上"
+                "接着等（重建 BluetoothLEDevice / GattSession 对「遥控器何时醒来」"
+                "毫无帮助，只会把已经等到一半的进度清零）—— 再等最多 %.0f 秒。",
+                _CONNECT_WAIT_SECONDS)
+            state.update(last_event="正在等遥控器醒来（复用当前连接，继续等）")
     if not connected:
         if stop.is_set():
             logger.info("🛑 收到退出请求 → 不再重试连接")
@@ -1583,7 +1784,19 @@ async def _run_bridge_inner(device_type: str | None = None,
         # ① 释放输入法热键（幂等，重复调用没有副作用）。
         #    放在最前面：万一下面任何一步抛异常，也绝不能把 Ctrl/Win 按着不放 ——
         #    那会让整台电脑的键盘都不正常。
-        voice_hotkey_up()
+        #
+        # ⚠⚠ v1.0.29：「等首帧再叫输入法」开着时（`hotkey_wait_first_frame`），
+        #   这一次的 down **可能压根没发出去**（会话在首帧到达前就结束了）。
+        #   而 tap 模式下的 up 是"**再点一下**"（见 keys.voice_hotkey_up）——
+        #   对一次没按过的键发 up，等于把输入法**叫起来**，正好和这个开关的
+        #   目的相反。所以这里必须先看 pending：还没注入过就**不发 up**。
+        _hk_never_fired = _hotkey_pending["armed"]
+        _hotkey_pending["armed"] = False
+        if _hk_never_fired:
+            logger.info("🎤 语音会话结束 → 取消「等首帧」：输入法这次**没被叫起来**"
+                        "（遥控器一直没出声）")
+        else:
+            voice_hotkey_up()
 
         # ② 命令遥控器关麦。**必须在清状态之前**，而且要**不看相位**地发。
         #    这是让遥控器真正停止推流的唯一手段。
@@ -1639,6 +1852,7 @@ async def _run_bridge_inner(device_type: str | None = None,
         nonlocal last_ble_activity, last_start_search, voice_active, voice_started_at
         nonlocal pending_mic_echo, mic_echo_since
         global _audio_frames, _audio_peak, _echo_swallowed, _remote_frame_last_at
+        global _last_audio_stop_at, _last_audio_stop_frames
         last_ble_activity = time.time()
         try:
             data = bytes(args.characteristic_value)
@@ -1715,8 +1929,21 @@ async def _run_bridge_inner(device_type: str | None = None,
                 #     可能慢到 1 秒，回声就跟着晚 1 秒，于是漏出窗口、被当成
                 #     真按键 → **按下就掉**（武哥 2026-09-23 报的正是这个）。
                 now = time.time()
-                is_echo = (pending_mic_echo > 0
-                           and (now - mic_echo_since) < ECHO_MAX_AGE)
+                # ── 「会话刚开」保护期（v1.0.29，见 ECHO_GUARD_SECONDS 那段注释）──
+                # 上面那套「欠一声回声」的账**假设一次 MIC_OPEN 只回一条**，
+                # 而 2026-10-09 真机证明它有时回**两条** —— 多出来那条把账销光，
+                # 紧接着的真回声就无账可销 ⇒ 被判成「第二次按下」⇒ 会话 1.4 秒
+                # 就被自己关掉，而遥控器推第一帧要 1.578 秒 ⇒ 用户一个字都输入不了。
+                # 判据限定三个条件，遥控器一出第一帧就自动解除（不吞真按键）：
+                #   · voice_active        —— 只对「已经开着」的会话兜底
+                #   · _audio_frames == 0  —— 这一段还一帧都没收到（＝用户还没说上话）
+                #   · 距开会话 < N 秒      —— 固定、**不刷新**，不会永不过期（v1.0.13 的病）
+                _echo_guard = (voice_active and voice_started_at
+                               and _audio_frames == 0
+                               and (now - voice_started_at) < ECHO_GUARD_SECONDS)
+                is_echo = (_echo_guard
+                           or (pending_mic_echo > 0
+                               and (now - mic_echo_since) < ECHO_MAX_AGE))
                 # ── 语音会话状态机：**每一次按下 = 一次翻转** ──────────────
                 #   第 1 次按下 → 开始   第 2 次按下 → 结束
                 # 松手（audio_stop）不参与翻转，见下面那个分支的注释。
@@ -1739,11 +1966,20 @@ async def _run_bridge_inner(device_type: str | None = None,
                     pending_mic_echo = max(0, pending_mic_echo - 1)
                     _echo_swallowed += 1
                     if _echo_swallowed <= 3:
+                        # 账已经销光、靠保护期兜住的这条，单独说清楚 ——
+                        # 否则日志里会写成「距我们发 MIC_OPEN 0.00s」，看着像回声，
+                        # 其实是「一次 MIC_OPEN 回了好几条」多出来的那一条。
+                        _why = (
+                            f"会话刚开 {now - voice_started_at:.1f}s、遥控器还没出声"
+                            f"（这一段账已销光，是保护期兜住的）"
+                            if _echo_guard and pending_mic_echo == 0 else
+                            f"距我们发 MIC_OPEN {now - mic_echo_since:.2f}s"
+                            f" < {ECHO_MAX_AGE}s"
+                        )
                         logger.info(
-                            f"↩ 忽略遥控器回给 MIC_OPEN 的回声 audio_start"
-                            f"（距我们发 MIC_OPEN {now - mic_echo_since:.2f}s"
-                            f" < {ECHO_MAX_AGE}s，本段第 {_echo_swallowed} 次，"
-                            f"还欠 {pending_mic_echo} 声）"
+                            f"↩ 忽略一条 audio_start（{_why}）"
+                            f"—— 不当成「第二次按下」。"
+                            f"本段第 {_echo_swallowed} 次，还欠 {pending_mic_echo} 声"
                         )
                     else:
                         logger.debug("↩ 又是 MIC_OPEN 引来的回声，已忽略")
@@ -1764,7 +2000,25 @@ async def _run_bridge_inner(device_type: str | None = None,
                     # 回响计数按会话归零：这样每一段的前 3 次"吞掉"都会以 INFO
                     # 出现在日志里，一眼能看出这一段有没有被回响干扰。
                     _echo_swallowed = 0
-                    voice_hotkey_down()      # tap=点按开始 / hold=按下并保持
+                    _hk_cfg = Config.load()
+                    if _hk_cfg.hotkey_wait_first_frame:
+                        # 「等遥控器出声再叫输入法」（默认关，见 config 里那段注释）。
+                        # ⚠ 每次会话开始读一次**实时**配置 —— 控制台改了立刻生效，
+                        #   不用重连。（它和 AGC 不同：AGC 在音频热路径上，不能
+                        #   每轮读文件；这里一次会话最多读一次，开销可忽略。）
+                        # ⚠ 这里**只是把注入推迟**，下面那几行记账（voice_active /
+                        #   voice_started_at / 复位 _remote_frame_last_at）必须
+                        #   照旧**立刻**做 —— 它们是状态机的账，跟"什么时候叫
+                        #   输入法"无关。一起推迟会让会话状态和事实相反。
+                        _hotkey_pending["at"] = time.time()
+                        _hotkey_pending["armed"] = True
+                        _hotkey_pending["max_ms"] = int(_hk_cfg.hotkey_wait_max_ms)
+                        logger.info(
+                            "🎤 语音会话开始 → **先不叫输入法**，等遥控器出声"
+                            "（开了「等首帧」；最多等 %d ms 兜底）",
+                            _hk_cfg.hotkey_wait_max_ms)
+                    else:
+                        voice_hotkey_down()  # tap=点按开始 / hold=按下并保持
                     voice_active     = True
                     res.voice_active = True
                     voice_started_at = time.time()
@@ -1861,7 +2115,21 @@ async def _run_bridge_inner(device_type: str | None = None,
                         f"⏹ 松手（语音仍在继续 · 本次 {_audio_frames} 帧，峰值 {_audio_peak}）"
                     )
                 else:
-                    logger.info(f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，峰值 {_audio_peak}）")
+                    # ⚠ v1.0.29：遥控器关麦时会**重复上报** AUDIO_STOP，所以这段
+                    #   代码同一秒内会跑两遍（见 `_last_audio_stop_at` 的注释）。
+                    #   下面两句都幂等 ⇒ 功能上无害；但两条一模一样的日志会让人
+                    #   误读成"停了两次"⇒ 第 2 条降成 debug。
+                    _now_stop = time.time()
+                    _dup_stop = (_now_stop - _last_audio_stop_at < 0.5
+                                 and _audio_frames == _last_audio_stop_frames)
+                    _last_audio_stop_at = _now_stop
+                    _last_audio_stop_frames = _audio_frames
+                    if _dup_stop:
+                        logger.debug("⏹ Audio STOP 重复上报（同一段收尾的第 2 次，已忽略）")
+                    else:
+                        logger.info(
+                            f"⏹ Audio STOP （本次共收到 {_audio_frames} 个音频帧，"
+                            f"峰值 {_audio_peak}）")
                     # 会话本来就没开（例如"按下→松手"这种一次性的短按）——
                     # 但状态可能被别处点亮过，这里一并归位。
                     # ⚠ 这条**不算会话收尾**：遥控器已经自己停了流，再发 MIC_CLOSE
@@ -2604,11 +2872,9 @@ async def _run_bridge_inner(device_type: str | None = None,
                 #   看起来和"按键根本没来"一模一样 —— 排查方向会整个走反。
                 logger.info(
                     f"✅ HID 按键 {e.name!r}（scan={getattr(e, 'scan_code', None)}）"
-                    f" → **已到 Windows**（这是遥控器/多媒体键盘上的功能键），"
-                    f"但目前没有对应动作，已忽略。"
-                    f" 它没进 KEY_MAP 是**刻意的**：这类键名要么语义不明确、"
-                    f"要么会被误当成普通字母，硬凑映射会劫持物理键盘。"
-                    f" 需要用它的话请把这一行发出来。"
+                    f" → 已到 Windows，但不在映射表里，已忽略"
+                    f"（这类功能键没进 KEY_MAP 是刻意的：硬凑映射会劫持物理键盘）。"
+                    f" 需要用它就把这行发出来。"
                 )
             else:
                 # ⚠ 2026-09-30 改文案。旧文案是「没有对应按钮，已忽略（若这是
@@ -2618,13 +2884,18 @@ async def _run_bridge_inner(device_type: str | None = None,
                 #   "遥控器在乱发键"。真机 2026-09-30 的日志里 13 条有 11 条
                 #   属于这一类，全是误读源。日志**只说它知道的事**：
                 #   看到哪个键、不在表里、被忽略了，以及"什么时候才该怀疑遥控器"。
+                # ⚠ v1.0.29：缩短，但**保留**闸门
+                #   `tools/check_failure_visibility.py::key_log_is_honest` 要求的三件
+                #   事（说清来源 / 给出"什么时候才该怀疑遥控器" / 不许退回旧误导句）。
+                #   那三句是这条日志存在的理由，删了就等于把这个坑重新挖开 ——
+                #   所以这里只压掉外围的冗词。
                 logger.info(
                     f"🔘 程序看到一个键 {e.name!r}（scan="
                     f"{getattr(e, 'scan_code', None)}），不在映射表里 → 已忽略。"
                     f" ⚠ 这**不是**故障：物理键盘敲的字母、"
-                    f"以及本程序自己注入的键，都会走到这条路（每个键名只报一次）。"
+                    f"以及本程序自己注入的键都会走到这条路（每个键名只报一次）。"
                     f" 只有当你**正在按遥控器上的某个键**时它才出现，"
-                    f"才说明那个键还没被映射 —— 去控制台「按键映射」页给它指定动作即可。"
+                    f"才说明它还没被映射 —— 去控制台「按键映射」指定动作。"
                 )
 
         return True
@@ -2851,6 +3122,10 @@ async def _run_bridge_inner(device_type: str | None = None,
     # 「遥控器优先」巡检节流（见 _CAPTURE_CHECK_INTERVAL 的注释）。
     # 初值 0.0 ⇒ 进循环后第一轮就复核一次（幂等、已经是它时完全无声），之后每 5 秒一次。
     _cap_last_check = 0.0
+    # AGC 的同步状态（见主循环里那段）。初值取自本轮启动时的设定 ——
+    # 否则第一轮就会误报一次「用户改了增益」。
+    _agc_reported = 1.0
+    _agc_user_gain = float(state.mix_params()["remote_gain"])
     try:
         while True:
             # ⚠ 退出请求必须在**每一轮的最前面**看：托盘点「退出」时，
@@ -2862,6 +3137,58 @@ async def _run_bridge_inner(device_type: str | None = None,
                 break
 
             await asyncio.sleep(0.2)
+
+            # ── 自动增益：把回调里算出的系数同步给 UI，并在明显下调时解释一句 ──
+            #   ⚠ 这两件事**只能**在这里做，**不能**在音频回调里 ——
+            #     回调里打日志（写文件）/写 state（拿锁）会让声音抖。
+            try:
+                _f_now = float(_agc["factor"])
+                if abs(_f_now - _agc_reported) > 1e-3:
+                    _agc_reported = _f_now
+                    state.update(agc_factor=round(_f_now, 3))
+                _pl = _agc["pending_log"]
+                if _pl is not None:
+                    _agc["pending_log"] = None
+                    logger.warning(
+                        "🎚 自动增益：遥控器那一路有 %.0f%% 的采样在被压平 → "
+                        "把它的增益收到设定值的 %.0f%%（×%.2f）。\n"
+                        "   这是为了不被削顶（压平的波形会让语音识别明显变差）。"
+                        " 想关掉：控制台 → 音频 → 「自动增益」。",
+                        _pl[0], _pl[1] * 100.0, _pl[1])
+                # 用户手动改了增益 → AGC 重新开始。
+                # 否则他把滑块从 10 拖到 3，AGC 却还按 10 的旧账把系数压在 0.2，
+                # 实际只有 0.6 —— 用户会觉得"我明明调了、怎么更小声了"。
+                _ug = float(state.mix_params()["remote_gain"])
+                if abs(_ug - _agc_user_gain) > 1e-6:
+                    if _agc_user_gain > 0.0:
+                        logger.info(
+                            "🎚 用户把麦克风增益改成 %.2f× → 自动增益重新从 1.0 开始",
+                            _ug)
+                    _agc_user_gain = _ug
+                    _agc_reset()
+            except Exception as e:                      # noqa: BLE001
+                logger.debug("自动增益同步异常（已忽略）：%r", e)
+
+            # ── 「等遥控器出声再叫输入法」（默认关，见 `_hotkey_pending` 注释）──
+            #   置位在 on_control（BLE 回调线程），消费在这里。
+            if _hotkey_pending["armed"]:
+                _hk_at = _hotkey_pending["at"]
+                if not voice_active:
+                    # 等待期间用户又按了一下（会话已经结束）→ **绝不能**补注入，
+                    # 否则输入法会在"已经结束"之后被叫起来，状态和事实相反。
+                    _hotkey_pending["armed"] = False
+                    logger.debug("🎤 等首帧期间会话已结束 → 取消注入输入法")
+                else:
+                    _hk_seen = bool(_remote_frame_last_at
+                                    and _remote_frame_last_at >= _hk_at)
+                    _hk_ms = (time.time() - _hk_at) * 1000.0
+                    if _hk_seen or _hk_ms >= float(_hotkey_pending.get("max_ms", 2000)):
+                        _hotkey_pending["armed"] = False
+                        logger.info(
+                            "🎤 叫输入法（%s，等了 %.0f ms）",
+                            "首帧已到" if _hk_seen else "等首帧超时，兜底先叫",
+                            _hk_ms)
+                        voice_hotkey_down()
 
             # 音频输出流监护：回调静默超时就重建（见 _supervise_audio 注释）。
             # 放在每一轮的最前面 —— 这是"没声音"里唯一能自愈的一条，越早发现越好。
@@ -3056,6 +3383,21 @@ async def _run_bridge_inner(device_type: str | None = None,
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 def main():
+    """**命令行入口，只服务 `--list` 与排查调试。**
+
+    ⚠⚠ 常驻入口是 `tray_app.py`，不是这里。
+    ---------------------------------------------------------------
+    打包配置 `remote-voice-bridge.spec` 的入口写的是 `['tray_app.py']`，
+    `run.bat` 跑的也是 `tray_app.py` ⇒ **下面这个重连循环在安装版里
+    永远不会执行**；真正的重连循环是 `tray_app._bridge_worker`。
+
+    2026-10-09 真机就栽在这上面：用户在设置里把「重连延时」从 5 改成 30，
+    **一点反应都没有** —— 因为他改的那份配置只有**这里**在读，而这里没人跑，
+    日志上也没有任何痕迹。
+
+    ⇒ 退避策略已抽成 `config.reconnect_backoff()`，两处共用。
+       **再往这段里加逻辑之前，先确认它不会又变成"改一份不生效"。**
+    """
     import argparse
     parser = argparse.ArgumentParser(description="remote-voice-bridge")
     parser.add_argument("--device", choices=list(DEVICES.keys()), help="Force device type")
@@ -3073,7 +3415,6 @@ def main():
             print(f"  • {d['name']}{tag}")
         return
 
-    cfg = Config.load()      # 供下方重连延时使用（原代码此处 cfg 未定义 → NameError）
     fail_count = 0
     while True:
         try:
@@ -3083,17 +3424,21 @@ def main():
             logger.error(f"💥 Fatal: {e}", exc_info=True)
             fail_count += 1
 
+        # ⚠ 与 `tray_app._bridge_worker` 共用同一个退避策略 ——
+        #   两处各写一份正是 2026-10-09 那个"改配置没反应"的成因。
+        delay = reconnect_backoff(fail_count, Config.load().reconnect_delay)
+
         if fail_count >= 1:
             logger.info("=" * 60)
             logger.info("📢 Reconnecting... Press HOME/arrow to wake remote!")
-            logger.info(f"   Retry in {Config.load().reconnect_delay}s (fail #{fail_count})")
+            logger.info(f"   Retry in {delay:g}s (fail #{fail_count})")
             logger.info("=" * 60)
 
         if fail_count >= 5:
             logger.warning("⚠️  5 failures — check battery, pairing, and Bluetooth status")
 
         try:
-            time.sleep(cfg.reconnect_delay)
+            time.sleep(delay)
         except KeyboardInterrupt:
             logger.info("👋 Bye!")
             break

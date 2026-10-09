@@ -482,6 +482,10 @@ def build_live() -> dict:
             # 混合输出里被软限幅的采样占比（%），-1 = 还没统计。
             # 「增益开太大」的唯一客观依据 —— 顶格就是这个数在涨。
             "mix_limit_pct": round(s.mix_limit_pct, 1),
+            # 自动增益（v1.0.29）：实际生效的遥控器增益 = remote_gain × agc_factor。
+            # 界面上要能看见"AGC 正在替你往下收"，否则用户只会觉得"声音怎么变小了"。
+            "agc_factor": round(s.agc_factor, 3),
+            "agc_enabled": bool(s.agc_enabled),
         },
     }
 
@@ -916,6 +920,12 @@ class Handler(BaseHTTPRequestHandler):
             # "改了 config.json 或调 API 没反应"（静默），更糟的是用户以为
             # 脱敏开着、其实没开（贴日志时把完整地址漏出去）。
             "log_redact": bool, "log_raw_hid": bool,
+            # 自动增益（v1.0.29）。**必须进白名单** —— 不进就是"界面上关了、
+            # 后端还在自动收你的增益"，方向相反，最难查。
+            "auto_gain": bool,
+            # 「等遥控器出声再叫输入法」（v1.0.29，默认关）。同样必须进白名单：
+            # 不进就是"界面上打开了、后端当没听见"，而用户只会觉得"它不听话"。
+            "hotkey_wait_first_frame": bool, "hotkey_wait_max_ms": int,
         }
         ignored: list[str] = []
 
@@ -945,6 +955,18 @@ class Handler(BaseHTTPRequestHandler):
                       sys_gain=cfg.system_mic_gain,
                       sys_enabled=cfg.system_mic_enabled,
                       remote_enabled=cfg.remote_mic_enabled)
+        # 自动增益（v1.0.29）的开关也是**热**的：面板一关立刻生效。
+        # ⚠ 必须同步到 main 里那个 `_agc` —— 音频回调读的是它。
+        #   只写 config / state 的话，界面上显示"已关闭"、回调却还在自动
+        #   往下收增益（方向相反，最难查的那种）。
+        try:
+            import main
+            main._agc["enabled"] = bool(cfg.auto_gain)
+            if not cfg.auto_gain:
+                main._agc_reset()      # 关掉就立刻回到"完全不介入"
+        except Exception:                            # noqa: BLE001
+            pass
+        state.update(agc_enabled=bool(cfg.auto_gain))
         # 日志开关是**热**的：改完立刻生效，不用重启（P2-6）。
         # ⚠ 只影响**之后**写下的行 —— 已经落盘的内容不会回头改写（那是历史，
         #   而且改写历史会让日志失去可信度）。要彻底干净就重启一次。

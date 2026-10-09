@@ -44,7 +44,7 @@ BACKUP_DIR = (Path(os.environ.get("ProgramData", r"C:\ProgramData"))
               / "remote-voice-bridge" / "backup")
 
 # 版本号唯一真源：控制台「设置 → 关于」显示它，installer.iss 的 MyAppVersion 也要跟着改。
-APP_VERSION = "1.0.28"
+APP_VERSION = "1.0.29"
 
 # 配置**结构**版本号（和 APP_VERSION 是两回事）。
 # 改默认值/改字段含义时 +1，并在 _migrate() 里补一条迁移。
@@ -351,6 +351,16 @@ class Config:
     force_default_capture: bool = True
     capture_device_name:   str  = "CABLE Output"
     gain:             float     = 10.0
+    # ── 自动增益（AGC，v1.0.29）─────────────────────────────────────────────
+    # v1.0.22 的结论是「固定增益怎么选都是错的」：遥控器解码峰值本来就能顶到
+    # 满量程，用户设 10 就整段被压平（语音识别明显变差），设 1 又太小声。
+    # AGC 是那个结论的自然延伸 —— **持续限幅就小步下调，长期不顶格再慢慢回调**。
+    #
+    # 三条硬约束（见 main.py 里 `_agc` 的注释，少一条都会变成"程序偷偷动我设置"）：
+    #   ① 只调遥控器那一路；② 系数只降不升过 1.0（用户设的永远是**上限**）；
+    #   ③ 有效增益不低于 1.0。
+    # 关掉它就退回"完全按 gain 来"的老行为。
+    auto_gain:        bool      = True
     watchdog_timeout: int       = 180
     reconnect_delay:  int       = 5
     key_check_window: float     = 3.0
@@ -362,6 +372,19 @@ class Config:
     #            配合上面的「启动语音输入」，遥控语音键按一下就能长输，松手不断。
     #   "hold" = 按住（「按住说话」PTT：长按说话、松开结束识别）
     hotkey_mode:      str       = "tap"
+    # ── 「等遥控器出声再叫输入法」（v1.0.29，默认**关**）──────────────────
+    # 2026-10-09 真机日志：
+    #     12:07:26,281 🎤 voice hotkey TAP → 输入法被叫起来了
+    #     12:07:27,940 🔊 收到第一个音频帧（距会话开始 1479 ms）
+    # 输入法在 26.281 秒就开始录了，而遥控器的麦克风到 27.940 秒才出声 ——
+    # 这 1.66 秒里用户开口，**声音根本没被采集**（遥控器麦克风还没开），
+    # 输入法录到的是一段静音 ⇒ 现象是「开头几个字没了」。
+    #
+    # 打开它：把「叫输入法」推迟到第一个音频帧到达之后（或超时兜底）。
+    # **代价**：输入法看起来晚 1.5 秒才起来（按了键要等一下才见反应）。
+    # 这两者哪个更好取决于个人手感 ⇒ **默认关**，想试再打开。
+    hotkey_wait_first_frame: bool = False
+    hotkey_wait_max_ms:      int  = 2000     # 等不到首帧就先叫，别让用户干等
     # 语音会话进行中按「确认键」时，要不要把这一下 Enter 吞掉。
     #
     # 为什么需要吞：遥控器按语音键 → 输入法进入语音输入；此时按确认键，
@@ -868,3 +891,33 @@ def find_device_by_name(name: str) -> Optional[DeviceSig]:
         if sig.name_patterns and any(p in nl for p in sig.name_patterns):
             return sig
     return None
+
+
+def reconnect_backoff(fails: int, base: float) -> float:
+    """连续失败 `fails` 次之后，这一轮该等几秒。
+
+    ⚠ 为什么必须是一个**共享**函数（2026-10-09 真机）
+    ------------------------------------------------
+    同一件事原先有**两份实现**：
+      · `tray_app._bridge_worker` —— 写死 `3 if fails <= 2 else (10 …)`；
+      · `main.main()`          —— 读 `cfg.reconnect_delay`。
+
+    而打包版的入口是 `tray_app.py`（见 `remote-voice-bridge.spec` 的
+    `['tray_app.py']`），`main.main()` **根本不会执行** ⇒ 用户在设置里把
+    「重连延时」从 5 改成 30，**一点反应都没有**，日志上也没有任何痕迹。
+
+    抽成一个函数之后两处都调它：改一处就是改全部，
+    「改一份不生效」这个坑不会再出现第二次。
+
+    `base` 是第一档延时（来自配置），后面几档只会在它之上再退避 ——
+    用户把 base 设得比默认档还大时，以用户的为准（别把他设的 30 拉回 10）。
+    """
+    try:
+        b = max(1.0, float(base))
+    except (TypeError, ValueError):
+        b = 5.0
+    if fails <= 2:
+        return b
+    if fails <= 5:
+        return max(b, 10.0)
+    return max(b, 30.0)

@@ -220,6 +220,59 @@ def check_message(verbose: bool = True) -> bool:
     return ok
 
 
+# ── 3b. 超时后**复用** device / GattSession（v1.0.29）──────────────────────
+def check_reuse(verbose: bool = True) -> bool:
+    """超时后不许把整轮连接丢掉重来。
+
+    ⚠ 为什么单独一条：`_open_ble_device` / `GattSession` 这两步对
+      「遥控器何时醒来」**毫无贡献** —— 建链的时间几乎全花在
+      "等遥控器醒来 + Windows 去连它"上。超时后整轮重建 =
+      **把已经等到一半的进度清零，从头再等**。
+      2026-10-09 真机三次连接：失败 20.85s → 用户关软件 14.07s → 成功 18.18s。
+    """
+    ok = True
+    src = (ROOT / "main.py").read_text(encoding="utf-8", errors="replace")
+
+    m = re.search(r"^_CONNECT_INNER_TRIES\s*=\s*(\d+)", src, re.M)
+    if not m:
+        print("   ❌ main.py 里没有 `_CONNECT_INNER_TRIES` —— 复用几轮必须是"
+              "**有名字的常量**，否则下一个人不知道该动哪个数")
+        return False
+    tries = int(m.group(1))
+    if tries < 2:
+        print(f"   ❌ _CONNECT_INNER_TRIES = {tries} —— 等于没做复用"
+              f"（超时后又回到「整轮重建、进度清零」）")
+        ok = False
+    elif verbose:
+        print(f"   OK 一轮内最多再等 {tries} 轮（复用同一个 device / GattSession）")
+
+    body = _code_only(_fn_body(src, "_run_bridge_inner"), keep_strings=True)
+    if "_CONNECT_INNER_TRIES" not in body:
+        print("   ❌ _run_bridge_inner 里没有用 _CONNECT_INNER_TRIES 的重试循环")
+        return False
+
+    # ⚠ 切在 `for _attempt ...` 上：函数里别处也提过 ble / device，
+    #   拿整个函数当判据会把"别处提过一嘴"当成"这里真的重建了"。
+    if "for _attempt in range(_CONNECT_INNER_TRIES)" not in body:
+        print("   ❌ 找不到重试循环（`for _attempt in range(_CONNECT_INNER_TRIES)`）"
+              "—— 改名了？闸门要跟着改")
+        return False
+    loop = body.split("for _attempt in range(_CONNECT_INNER_TRIES)", 1)[1]
+    loop = loop.split("if not connected:", 1)[0]
+
+    if "_open_ble_device" in loop:
+        print("   ❌ 重试循环里又调了 `_open_ble_device` —— 那就还是「每轮重建」，"
+              "等于把已经等到一半的进度清零（v1.0.29 修的就是这个）")
+        ok = False
+    elif "_hold_ble_connection" not in loop:
+        print("   ❌ 重试循环里没有 `_hold_ble_connection`")
+        ok = False
+    elif verbose:
+        print("   OK 重试循环里只调 _hold_ble_connection，**不重建** device / GattSession")
+
+    return ok
+
+
 # ── 4. 行为级：拿假 ble 真跑一遍 ────────────────────────────────────────────
 class _FakeBle:
     """够 `_hold_ble_connection` 用的最小替身。
@@ -449,6 +502,24 @@ def run_counter_examples() -> bool:
     else:
         print("   OK [反例] 两种模式确有区别（正向断言必须 keep_strings=True）")
 
+    # 反例 6：把 _open_ble_device 塞回重试循环 → 复用判据必须红
+    anchor6 = "        connected, ble_session = await _hold_ble_connection(ble, stop=stop)\n"
+    if anchor6 not in src:
+        print("   ❌ [反例] 找不到重试循环里那行 _hold_ble_connection（闸门锚点过期了）")
+        ok = False
+    else:
+        broken6 = src.replace(
+            anchor6,
+            "        ble = await _open_ble_device(dev_info)\n" + anchor6, 1)
+        body6 = _code_only(_fn_body(broken6, "_run_bridge_inner"), keep_strings=True)
+        loop6 = body6.split("for _attempt in range(_CONNECT_INNER_TRIES)", 1)[1]
+        loop6 = loop6.split("if not connected:", 1)[0]
+        if "_open_ble_device" not in loop6:
+            print("   ❌ [反例] 循环里塞回重建却判不出来 → 判据无效")
+            ok = False
+        else:
+            print("   OK [反例] 循环里塞回 `_open_ble_device` → 复用判据变红")
+
     return ok
 
 
@@ -465,6 +536,9 @@ def main() -> int:
 
     print("\n── 3. 失败话术：别再劝人关软件 ──")
     ok = check_message() and ok
+
+    print("\n── 3b. 超时后复用 device / GattSession（不重建）──")
+    ok = check_reuse() and ok
 
     print("\n── 4. 行为级：假 ble 跑六种情形 ──")
     ok = check_behavior() and ok

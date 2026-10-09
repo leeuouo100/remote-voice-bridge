@@ -32,6 +32,13 @@
    顺序铁律：`_on_mic_open` 里**先记账、再排队**（反过来的话，投递一返回
    主循环就可能立刻回调"失败销账"，而这边还没记账 → 账永远挂着）。
 1''''. **顺序铁律：先算 `is_echo`，再补发 MIC_OPEN。**
+1'''''. **「会话刚开」保护期**（v1.0.29，2026-10-09 真机）：上面那套「欠一声回声」
+   的账**假设一次 MIC_OPEN 只回一条**，而真机证明它有时回**两条** —— 多出来那条
+   把账销光 ⇒ 紧接着的真回声无账可销 ⇒ 被判成「第二次按下」⇒ 会话 1.37 秒就被
+   自己关掉，而遥控器推第一帧要 1.578 秒 ⇒ 用户「一个字都输入不了」。
+   保护期必须：① 常量落在 [2, 6] 秒；② 只在「这一段还一帧都没收到」时生效
+   （遥控器一出第一帧＝用户真在说话 ⇒ 立刻解除，不吞真按键）；
+   ③ **不许**拿 `mic_echo_since` 当锚点（那就是「窗口被回声续命」的变体 → 永不过期）。
 2. 挡掉的事件不许静默（挡了多少次要看得见）。
 3. **松手（audio_stop）绝不结束会话** —— 只能"结算统计 + 补开麦"。
 4. 帧计数不在 `audio_start` 分支顶部清零，**且必须在判回声之后**。
@@ -154,6 +161,41 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
               "—— 只看时间窗，回声之后 1.5s 内用户的真按键会被一起吞掉"))
     c.append(("mic_echo_since" in is_body,
               "①' 判据里比对 mic_echo_since（锚点＝写入**真正成功**那一刻）"))
+
+    # ── ①''''' 「会话刚开」保护期（v1.0.29）──────────────────────────────
+    #
+    # 上面那套「欠一声回声」的账**假设一次 MIC_OPEN 只回一条**。
+    # 2026-10-09 真机把这个假设打碎了：遥控器有时一次回**两条** —— 多出来那条
+    # 把账销光，紧接着的真回声就无账可销 ⇒ 被判成「第二次按下」⇒ 会话 1.37 秒
+    # 就被自己关掉，而遥控器推第一帧实测要 1.578 秒 ⇒ 用户一个字都输入不了。
+    # 真机原样（15:17:34,481 → 15:17:35,847）：
+    #   Audio START(真按) → 补发 MIC_OPEN → 回声①→销账 → 松手重开麦→再记账
+    #   → 回声②→销账 → **回声③（账已销光）→ 判成「第二次按下」→ 会话结束**
+    # 对照同一晚成功那次（15:14，67 秒 / 3749 帧）：2 次 MIC_OPEN 恰好配 2 条回声。
+    # ⇒ 这是**偶发**的，取决于遥控器那次回 1 条还是 2 条，不能靠运气。
+    c.append(("ECHO_GUARD_SECONDS" in code,
+              "①''''' 有「会话刚开」保护期常量"
+              "（没有它 → 一次 MIC_OPEN 回两条回声时，会话刚开就被自己关掉）"))
+    m_guard = re.search(r"^ECHO_GUARD_SECONDS\s*=\s*([0-9.]+)", code, re.M)
+    guard = float(m_guard.group(1)) if m_guard else 0.0
+    c.append((2.0 <= guard <= 6.0,
+              f"①''''' 保护期落在 [2, 6] 秒（当前 {guard}s）"
+              "—— 遥控器推第一帧实测 1.578s：太短盖不住那条多出来的回声，"
+              "太长会把用户真正的「第二次按下」也一起吞掉"))
+    c.append(("ECHO_GUARD_SECONDS" in m_asblk,
+              "①''''' 保护期判据真的用在 audio_start 分支里（定义了不用＝白定义）"))
+    c.append(("_audio_frames == 0" in m_asblk,
+              "①''''' 保护期只在「这一段还一帧都没收到」时生效"
+              "（遥控器一出第一帧＝用户真在说话 ⇒ 立刻解除，不吞真按键）"))
+    c.append((bool(re.search(r"_echo_guard\s*=\s*\(voice_active", m_asblk)),
+              "①''''' 保护期判据是「会话开着 + 还没出声 + 距开会话不到 N 秒」三合一"
+              "（缺 voice_active 会去收一段不存在的会话）"))
+    # ⚠ 保护期**不许**用 mic_echo_since 当锚点：那会让「窗口被续命」的写法复活
+    #   （v1.0.13 的窗口永不过期）。它的起点只能是 voice_started_at。
+    m_guardblk = _block(m_asblk, r"_echo_guard\s*=\s*\(", r"\n\s+is_echo\s*=")
+    c.append(("mic_echo_since" not in m_guardblk,
+              "①''''' 保护期**不**拿 mic_echo_since 当锚点"
+              "（用它就是「窗口被回声续命」的变体 → 永不过期 → 按键全被吞）"))
 
     # ── ①'' 回声分支：只销账，不许改时刻 ──────────────────────────
     m_echo = re.search(r"if is_echo:(.*?)elif not voice_active:", code, re.S)
@@ -553,9 +595,11 @@ def main() -> int:
                        src, count=1, flags=re.M))
 
     # 反例 2：判据退回"只看时间"（丢掉"欠一声回声"那笔账）
+    # ⚠ 锚点跟着 v1.0.29 的写法走：判据现在长成 `is_echo = (_echo_guard or (…))`，
+    #   所以要锚在 `or (pending_mic_echo > 0 …` 这一段上，不能还找 `is_echo = (`。
     _expect_red("把判据退回只看时间窗（丢了 pending_mic_echo）",
-                re.sub(r"is_echo = \(pending_mic_echo > 0\s*\n\s*and ",
-                       "is_echo = (True and ", src, count=1))
+                re.sub(r"or \(pending_mic_echo > 0\s*\n\s*and ",
+                       "or (True and ", src, count=1))
 
     # 反例 3：回声分支去刷新窗口（＝窗口永不过期，按键全被吞）
     _expect_red("在回声分支里刷新 mic_echo_since"
@@ -606,13 +650,14 @@ def main() -> int:
                     '                        voice_hotkey_up()', 1))
 
     # 反例 6：把补开麦挪到判回声**之前**（v1.0.13 的病）
+    # ⚠ 锚点跟着 v1.0.29 的写法走：判据第一行现在是 `is_echo = (_echo_guard`，
+    #   而它前面隔了一段保护期的注释与赋值 —— 原来那个
+    #   `now = time.time()\n is_echo =` 的相邻锚点已经对不上了。
     _expect_red("把补开麦挪到判回声**之前**"
                 "（＝ v1.0.13 真按键把自己判成回声、当场吞掉）",
-                src.replace("                now = time.time()\n"
-                            "                is_echo =",
+                src.replace("                is_echo = (_echo_guard\n",
                             "                session.ensure_mic_open()\n"
-                            "                now = time.time()\n"
-                            "                is_echo =", 1))
+                            "                is_echo = (_echo_guard\n", 1))
 
     # 反例 7：把「无条件点亮 streaming」塞回 audio_start 分支顶部
     #（＝ 回声也点亮「语音中」→ 会话结束后被重新点亮 → 关了还显示收音中）
@@ -753,7 +798,21 @@ def main() -> int:
                 src.replace('end_voice_session("遥控器已停止推流", send=True)',
                             'state.update(streaming=False)', 1))
 
-    if n_red < 22:
+    # 反例 26（v1.0.29）：保护期收成 0（＝等于没有保护，一次 MIC_OPEN 回两条
+    #          回声时，会话又会被自己关掉）
+    _expect_red("把 ECHO_GUARD_SECONDS 收成 0（＝保护期失效，"
+                "一次 MIC_OPEN 回两条回声时又会「会话刚开就被自己关掉」）",
+                re.sub(r"^ECHO_GUARD_SECONDS\s*=\s*[0-9.]+",
+                       "ECHO_GUARD_SECONDS = 0.0", src, count=1, flags=re.M))
+
+    # 反例 27（v1.0.29）：保护期去掉「还没出声」这个条件
+    #（＝遥控器出了声也还在保护期 → 用户真正的「第二次按下」被吞 → 关不掉）
+    _expect_red("保护期去掉 `_audio_frames == 0` 条件"
+                "（＝会话全程都在保护期里 → 用户按结束被吞，会话关不掉）",
+                src.replace("                               and _audio_frames == 0\n",
+                            "", 1))
+
+    if n_red < 24:
         ok = False
 
     print()

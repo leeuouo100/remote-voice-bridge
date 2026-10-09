@@ -65,6 +65,28 @@ _AUDIT_QUIET_SEC = 300.0
 _AUDIT_LOUD_TIMES = 3
 
 
+def _short_keys(cols) -> str:
+    """把「已挂哪几路集合」压成一行短标签。
+
+    ⚠ 为什么不能直接用 `c.key`：它带对齐填充（形如
+      `—      0xFF80/0000 厂商自定义`），三路拼起来 60+ 字符；而审计行
+      每 20 秒（静默期 5 分钟）就会再来一条 —— 这正是 2026-10-09 那条
+      「单条 250+ 字符」的来源之一。
+
+    判决能力**一点没少**：需要知道的是"挂了几路、是哪几路"，
+    usage page（`0xFF80/0000` 这种）已经足够定位；`0xFFxx` 一眼就是
+    厂商自定义，`0x000C` 是消费类控制 —— 那串中文标签是冗余的。
+    """
+    if not cols:
+        return "（一路都没打开）"
+    out: list[str] = []
+    for c in cols:
+        parts = str(c.key).split()
+        u = next((p for p in parts if p.startswith("0x")), None)
+        out.append(u or (parts[-1] if parts else str(c.key)))
+    return "、".join(out)
+
+
 def decode_report(raw: bytes) -> tuple[str | None, bool]:
     """把一条原始报告解成 (按钮 id, 是否按下)。
 
@@ -289,7 +311,7 @@ class RemoteHidButtons:
                     return
                 self._bypass_last = ready
                 self._bypass_note_at = now
-                heads = "、".join(c.key for c in self._cols) or "（一路都没打开）"
+                heads = _short_keys(self._cols)
                 if ready:
                     logger.info(
                         "📊 HID 通道审计：厂商页累计 **0 条**（已挂 %d 路：%s）"
@@ -312,14 +334,14 @@ class RemoteHidButtons:
                     and now - self._zero_warn_at < _AUDIT_QUIET_SEC):
                 return                               # 静默期：能力还在，只是不再刷屏
             self._zero_warn_at = now
-            heads = "、".join(c.key for c in self._cols) or "（一路都没打开）"
+            heads = _short_keys(self._cols)
             tail = ("" if self._zero_warned > 1
                     else "（这条不会再每 20 秒刷：前几次照报，之后每 5 分钟提醒一次）")
             logger.warning(
-                "📊 HID 通道审计：已挂 %d 路集合、累计 **0 条**原始报告｜%s｜"
-                "此刻按遥控器的方向/确认/返回/音量键都**不会**产生任何日志 —— "
-                "说明按键没有到达本程序，问题在蓝牙/HID 那一层，"
-                "不在按键映射表上。（语音键不走 HID，它照常工作）%s",
+                "📊 HID 通道审计：%d 路集合、累计 **0 条**原始报告｜%s｜"
+                "此刻按方向/确认/返回/音量键都不会产生日志 —— 说明按键没有"
+                "到达本程序，问题在蓝牙/HID 那一层，不在按键映射表上"
+                "（语音键不走 HID，照常工作）。%s",
                 len(self._cols), heads, tail,
             )
             return

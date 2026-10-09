@@ -27,7 +27,8 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
-from config import APP_VERSION, BACKUP_DIR, CONFIG_DIR, INPUT_METHODS, Config
+from config import (APP_VERSION, BACKUP_DIR, CONFIG_DIR, INPUT_METHODS, Config,
+                    reconnect_backoff)
 import state
 
 APP_NAME  = "Remote Voice Bridge"
@@ -351,14 +352,21 @@ def _quit(icon, item):
 
     t = _bridge_thread
     if t is not None and t.is_alive():
-        # 20 秒的连接等待已经会被 stop 叫醒，所以 8 秒足够；超时说明卡在别处，
+        # 90 秒的连接等待已经会被 stop 叫醒，所以 8 秒足够；超时说明卡在别处，
         # 这时**必须留下痕迹** —— 否则"清理没跑完"会变成一个查不到的幽灵。
+        # ⚠ 痕迹走 logger（→ bridge.log），**不要**只 print：主 exe 是
+        #   console=False，print 的流向是空的，等于把唯一的线索扔掉。
         t.join(timeout=8.0)
-        if t.is_alive():
-            print("[bridge] ⚠ 桥线程 8 秒内没退出，进程将直接结束"
-                  "（GattSession / 注入 / 音频流可能没清理干净）", flush=True)
-        else:
-            print("[bridge] ✅ 桥线程已收尾（Cleanup done）", flush=True)
+        try:
+            import logging
+            _lg = logging.getLogger("rvb")
+            if t.is_alive():
+                _lg.warning("⚠ 桥线程 8 秒内没退出 → 进程将直接结束"
+                            "（GattSession / 注入 / 音频流可能没清理干净）")
+            else:
+                _lg.info("🧹 托盘退出：桥线程已收尾")
+        except Exception:                            # noqa: BLE001
+            pass
 
     state.reset()
     try:
@@ -370,6 +378,95 @@ def _quit(icon, item):
         icon.stop()
     except Exception:
         pass
+
+    # ⚠⚠ 硬保底：`icon.stop()` 只是往托盘窗口 `PostMessage(WM_STOP)`，
+    #   要靠 MainThread 的消息循环把它翻成 `PostQuitMessage`，`icon.run()`
+    #   才会返回。任何一步没走通（消息循环抛异常、窗口句柄已失效、
+    #   stop 在消息循环起来之前被调用……），`main()` 就永远不返回 ——
+    #   用户点完「退出」什么也没发生，只能去任务管理器强杀。
+    #
+    #   清理这时已经跑完（或已按上面的超时放弃），所以这里直接退是安全的。
+    #   正常路径下 `main()` 会在这 3 秒内返回，这条**永远不会执行**。
+    def _force_exit() -> None:
+        time.sleep(3.0)
+        os._exit(0)
+
+    threading.Thread(target=_force_exit, daemon=True,
+                     name="rvb-force-exit").start()
+
+
+# ── 定时刷新 ──────────────────────────────────────────────────────────────────
+# 菜单里"会变"的那些东西 —— 只有它变了才值得重建菜单。
+_menu_fp: "tuple | None" = None
+
+
+def _menu_fingerprint() -> tuple:
+    """菜单内容的指纹（见 `_refresh` 里那段事故说明）。"""
+    s = state.get()
+    try:
+        im = Config.load().input_method
+    except Exception:                                # noqa: BLE001
+        im = ""
+    try:
+        auto = _is_autostart()
+    except Exception:                                # noqa: BLE001
+        auto = False
+    return (bool(s.connected), bool(s.streaming), s.device or "",
+            s.last_event or "", im, bool(auto))
+
+
+def _refresh(icon=None) -> None:
+    """定时刷新托盘：图标 + 标题 + **只在内容变了时**重建菜单。
+
+    ⚠⚠ 为什么菜单不能每次刷新都重建 —— 2026-10-09 真机事故
+    -----------------------------------------------------
+    用户原话：「我点退出没有反应，只能用任务管理器强制关闭。」
+
+    pystray 的 Win32 后端显示菜单是这样的（`_win32.py::_on_notify`）：
+
+        hmenu, descriptors = self._menu_handle
+        index = TrackPopupMenuEx(hmenu, ..., TPM_RETURNCMD, ...)   # 阻塞
+        if index > 0:
+            descriptors[index - 1](self)     # ← index==0 时**静默什么都不做**
+
+    而 `update_menu()` 的第一件事是 `DestroyMenu(旧句柄)`。
+    老代码在这里**每 0.8 秒无条件**调一次 `update_menu()` ⇒ 菜单只要开着
+    超过 0.8 秒，句柄就被销毁 ⇒ `TrackPopupMenuEx` 返回 0 ⇒ **点任何一项
+    都毫无反应，而且一声不响**（没有异常、日志里一个字都没有）。
+
+    py-spy 现场取证（2026-10-09 14:56，进程 PID 1356）：
+
+        MainThread   停在 pystray `_mainloop`   （正常等消息）
+        rvb-bridge   停在 asyncio `_poll`       （正常空转）
+
+    ⇒ **没有任何线程在执行 `_quit`**，进程也没卡死。
+    所以不是"退不掉"，是**那个回调根本没被调用**。
+
+    ⇒ 菜单只在内容真的变了才重建；图标与标题照旧每 0.8 秒刷新
+      （它们走 `NIM_MODIFY`，不碰菜单句柄）。
+    """
+    global _menu_fp
+    ic = icon if icon is not None else _icon
+    if ic is None:
+        return
+    s = state.get()
+    try:
+        ic.icon = _icon_image(connected=s.connected, streaming=s.streaming)
+        ic.title = f"{APP_NAME} — {_status_text()}"
+    except Exception:                                # noqa: BLE001
+        pass
+    try:
+        fp = _menu_fingerprint()
+    except Exception:                                # noqa: BLE001
+        fp = None
+    if fp != _menu_fp:
+        _menu_fp = fp
+        try:
+            ic.update_menu()
+        except Exception:                            # noqa: BLE001
+            pass
+    if not _stop.is_set():
+        threading.Timer(0.8, _refresh).start()
 
 
 # ── 菜单 ──────────────────────────────────────────────────────────────────────
@@ -450,12 +547,13 @@ def _bridge_worker():
         #   以前这里写死 3 秒，而 `main()` 里那个**没人用**的循环读的才是
         #   `cfg.reconnect_delay` —— 用户在设置里把重连延时从 5 改成 30，
         #   装的却是托盘版，**改了完全没反应**，而且日志上一点痕迹都没有。
-        #   现在两处都以配置为准，托盘的多次失败再往上退避。
+        # ⚠ v1.0.29：退避策略抽成 `config.reconnect_backoff()`，两处共用 ——
+        #   同一件事不再有两份实现（那正是上面那个坑的成因）。
         try:
-            base = max(1.0, float(Config.load().reconnect_delay))
+            base = float(Config.load().reconnect_delay)
         except Exception:                            # noqa: BLE001
             base = 5.0
-        delay = base if fails <= 2 else (max(base, 10.0) if fails <= 5 else max(base, 30.0))
+        delay = reconnect_backoff(fails, base)
         if fails and not state.get().last_event:
             # 不覆盖 run_bridge 写下的具体原因（如"配对记录已失效"），
             # 那比"启动失败"有用得多。
@@ -477,17 +575,8 @@ def main():
                          f"{APP_NAME} v{APP_VERSION}（启动中…）")
     _icon.menu = build_menu(_icon)
 
-    def _refresh(icon=None):
-        s = state.get()
-        _icon.icon = _icon_image(connected=s.connected, streaming=s.streaming)
-        _icon.title = f"{APP_NAME} — {_status_text()}"
-        try:
-            _icon.update_menu()
-        except Exception:
-            pass
-        if not _stop.is_set():
-            threading.Timer(0.8, _refresh).start()
-
+    # 刷新是**模块级**函数（见 `_refresh` 的事故说明）—— 这样闸门能直接调它，
+    # 不用去 main() 的闭包里捞。Timer 会无参调用它，所以它自己取全局 `_icon`。
     threading.Timer(0.8, _refresh).start()
 
     # 首次启动自动弹一次控制台：装完就能看见界面，
