@@ -767,7 +767,33 @@ def _atvv_char_ok(r) -> bool:
         return False
 
 
-async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
+# ── 连接等待窗口（v1.0.28）────────────────────────────────────────────────────
+#
+# 2026-10-09 真机实测（v1.0.27 装上后的头三次连接，原样）：
+#
+#   12:05:50 → 12:06:11  失败    20.85s   ← 撞上当时的 20 秒超时
+#   12:06:14 → 12:06:28  用户关掉软件  14.07s
+#   12:06:32 → 12:06:50  成功    18.18s   ← **余量只剩 1.8 秒**
+#
+# 也就是说：这台机器上"遥控器醒来 → 链路建起来"要 **18 秒上下**，
+# 而窗口只有 20 秒 —— 用户看到的"连接很不顺畅、要关软件重开"，一半是
+# 真慢、一半是**我们在第 20 秒主动放弃了已经等到一半的进度**。
+#
+# ⚠ 为什么"超时就断开重来"是反模式
+#   建链的时间几乎全花在"等遥控器醒来 + Windows 去连它"，跟"我们从哪一刻
+#   开始等"无关。第 20 秒放弃 ⇒ 外层 `_bridge_worker` 重建 ⇒ 重新
+#   `from_id_async` + 重新建 GattSession ⇒ 进度清零、从头再等。
+#   所以窗口必须**显著大于**最坏观测值，而不是贴着它。
+#
+# 90 秒 = 最坏观测值(18.2s) 的约 5 倍。真等到 90 秒还没连上，那基本就是
+# 遥控器没醒 / 没电 / 配对失效，外层重试与日志提示才是有意义的。
+_CONNECT_WAIT_SECONDS = 90.0
+# 等待期间多久播报一次进度。用户看不见"在等"就会以为卡死 —— 这正是
+# 他 14 秒后就去关软件的原因。
+_CONNECT_WAIT_REPORT_EVERY = 10.0
+
+
+async def _hold_ble_connection(ble, timeout: float = _CONNECT_WAIT_SECONDS, stop=None):
     """主动把 BLE 链路拉起来，并尽量维持住。
 
     为什么不能只"看一眼 connection_status"：
@@ -781,6 +807,10 @@ async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
     从"设备对象就绪"到 connection_status 变成 1 需要约 **10 秒** —— 5 秒窗口
     必然判失败，于是每轮重连都在半路放弃、下一轮又重新 from_id_async 把进度清零，
     日志里只剩「Connection failed」，看着像"遥控器没醒"，其实是**等得不够久**。
+
+    v1.0.28 再把窗口从 20 秒提到 90 秒（见上面 `_CONNECT_WAIT_SECONDS` 的实测），
+    并且**等待期间每 10 秒播报一次进度**：用户必须能看见"它在等"，
+    否则就会以为卡死、去关软件重开 —— 而那恰好会把进度清零。
 
     返回 (是否已连接, GattSession 或 None)。
     ⚠ 调用方**必须持有**返回的 GattSession —— 它被 GC 回收时链路会跟着断。
@@ -849,12 +879,32 @@ async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
     #    ⚠ 每轮都要看 stop：用户点了「退出」不该还要在这儿干等 20 秒
     #      （托盘 join 有超时，等超了就会把清理直接掐掉 —— 那正是 P1-4 要修的）。
     waited = 0.0
+    next_report = _CONNECT_WAIT_REPORT_EVERY
     while waited < timeout:
         if stop is not None and stop.is_set():
             logger.info("🛑 连接等待期间收到退出请求 → 提前结束")
             break
+        # ⚠ v1.0.28：托盘菜单的「重新连接」只置 `_reconnect_request`。
+        #   以前这里只看 `stop`，于是 20 秒（现在 90 秒）的等待期间点
+        #   「重新连接」**完全没有反应** —— 用户以为菜单坏了，只好关软件。
+        #
+        # ⚠ 这里**故意不 clear** 这个事件：由调用方 `_run_bridge_inner` 清。
+        #   两边都清的话，调用方就分不清"是被重新连接打断"还是"真超时"，
+        #   会把「用户点了重新连接」误报成「90 秒没能连上」。
+        #   而如果两边都不清，下一轮一进来又立刻被打断 ⇒ **无限重连**。
+        if _reconnect_request.is_set():
+            logger.info("♻️ 连接等待期间收到「重新连接」请求 → 提前结束，立刻重建")
+            return False, sess
         if await _real_link(waited):
             return True, sess
+        # 让用户**看见它在等**。看不见就会以为卡死 → 关软件重开 → 进度清零。
+        if waited >= next_report:
+            next_report += _CONNECT_WAIT_REPORT_EVERY
+            logger.info(
+                "⏳ 还在等遥控器醒来… 已等 %.0f 秒（最多 %.0f 秒）。"
+                "请按一下遥控器上**任意一个键**（不用关软件）。",
+                waited, timeout)
+            state.update(last_event=f"正在等遥控器醒来（已等 {waited:.0f} 秒）")
         await asyncio.sleep(0.5)
         waited += 0.5
 
@@ -864,8 +914,8 @@ async def _hold_ble_connection(ble, timeout: float = 20.0, stop=None):
     #   （让下游读 ATVV 时去发现），也不能因为"探针本身不好使"把用户挡在门外。
     if ble.connection_status == BluetoothConnectionStatus.CONNECTED:
         logger.warning(
-            "⚠️ 20 秒内 GATT 一直读不通，但系统仍报「已连接」→ 先按已连接继续"
-            "（若下游真的读不到 ATVV，它会自己重连）。"
+            "⚠️ %.0f 秒内 GATT 一直读不通，但系统仍报「已连接」→ 先按已连接继续"
+            "（若下游真的读不到 ATVV，它会自己重连）。", timeout,
         )
         return True, sess
     return False, sess
@@ -1155,20 +1205,36 @@ async def _run_bridge_inner(device_type: str | None = None,
     #   它就不会被 GC 回收，链路也就能一直维持住。
     ble_session = None
     if ble.connection_status != BluetoothConnectionStatus.CONNECTED:
-        logger.warning("⚠️  Not connected yet — remote may be sleeping. Press any button to wake.")
+        logger.warning(
+            "⏳ 遥控器还没连上（它多半在睡觉）—— 现在开始等它，最多 %.0f 秒。\n"
+            "   请按一下遥控器上**任意一个键**把它唤醒；本程序会自己接上，"
+            "**不用**关软件。", _CONNECT_WAIT_SECONDS)
     connected, ble_session = await _hold_ble_connection(ble, stop=stop)
     res.gatt_session = ble_session      # P1-3：同上，它是"举着链路"的那个
     if not connected:
         if stop.is_set():
             logger.info("🛑 收到退出请求 → 不再重试连接")
             return True
+        if _reconnect_request.is_set():
+            # ⚠ 只在这里 clear（`_hold_ble_connection` 故意不清）——
+            #   清早了调用方就分不清"被重新连接打断"和"真超时"；
+            #   不清则下一轮立刻又被打断 ⇒ 无限重连。
+            _reconnect_request.clear()
+            logger.info("♻️ 收到「重新连接」请求 → 本轮放弃，立刻重建")
+            return False
+        # ⚠ v1.0.28：**别再让用户"关软件重开"**。
+        #   2026-10-09 真机：用户在等待第 14 秒时就去关软件了 —— 因为他看不见
+        #   "在等"，只看见"没反应"。而他关软件重开，恰好把已经等到一半的
+        #   建链进度清零，于是"关了重开才连得上"变成了他的固定操作。
+        #   正确的话术：告诉他**不用**关、本程序会自己接上。
         logger.error(
-            "❌ Connection failed —— 20 秒内没能建立 BLE 链路。\n"
-            "   处置：按一下遥控器上任意一个键把它唤醒（别只按一次就等），\n"
-            "   然后点托盘菜单里的「重新连接」。"
+            "❌ %.0f 秒内没能连上遥控器（它多半睡着了）。\n"
+            "   请按一下遥控器上**任意一个键**把它唤醒 —— 本程序会**自己**接上，\n"
+            "   **不用**关软件重开，也**不用**点「重新连接」。",
+            _CONNECT_WAIT_SECONDS,
         )
         # 让托盘/控制台说真话，而不是继续显示「按遥控器任意键唤醒」
-        state.update(last_event="连接超时（遥控器可能没醒）")
+        state.update(last_event="连接超时（遥控器可能没醒）—— 按它任意一个键即可")
         return False
     logger.info(f"✅ Connected  status={ble.connection_status}")
     state.update(connected=True, device=dev_info.name or "", last_event="已连接")
@@ -1878,7 +1944,14 @@ async def _run_bridge_inner(device_type: str | None = None,
                     f"（距会话开始 {_lag * 1000:.0f} ms）" if _lag else "",
                 )
             elif _audio_frames % 100 == 0:
-                logger.info(f"🔊 音频帧 {_audio_frames}（{len(raw)}B/帧，峰值 {_audio_peak}）")
+                # ⚠ v1.0.28：降为 debug。一次 3 分钟的语音会话会打 100+ 行
+                #   「音频帧 N」，而它在**正常运行时没有任何信息量** ——
+                #   真出事时用户翻日志，全是这种行，真正的线索（连接、限幅、
+                #   会话收尾）被淹掉。要看进度把日志级别调到 DEBUG 即可。
+                logger.debug(
+                    "🔊 音频帧 %d（%dB/帧，峰值 %d）",
+                    _audio_frames, len(raw), _audio_peak,
+                )
 
             # ⚠ 只能走队列这一条路。
             # 早前这里还额外做了一次 `_pending_samples.extend(samples)`，

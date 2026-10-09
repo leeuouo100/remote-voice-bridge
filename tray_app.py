@@ -445,11 +445,21 @@ def _bridge_worker():
 
         # 连续失败要退避：原来固定 3 秒，故障时每 3 秒把整段启动横幅刷一遍，
         # 4 分钟就把日志撑到 47 KB，真正的线索被淹没。
-        delay = 3 if fails <= 2 else (10 if fails <= 5 else 30)
+        #
+        # ⚠ v1.0.28：第一档改用 `config.json` 里的 `reconnect_delay`。
+        #   以前这里写死 3 秒，而 `main()` 里那个**没人用**的循环读的才是
+        #   `cfg.reconnect_delay` —— 用户在设置里把重连延时从 5 改成 30，
+        #   装的却是托盘版，**改了完全没反应**，而且日志上一点痕迹都没有。
+        #   现在两处都以配置为准，托盘的多次失败再往上退避。
+        try:
+            base = max(1.0, float(Config.load().reconnect_delay))
+        except Exception:                            # noqa: BLE001
+            base = 5.0
+        delay = base if fails <= 2 else (max(base, 10.0) if fails <= 5 else max(base, 30.0))
         if fails and not state.get().last_event:
             # 不覆盖 run_bridge 写下的具体原因（如"配对记录已失效"），
             # 那比"启动失败"有用得多。
-            state.update(last_event=f"启动失败，{delay} 秒后重试（第 {fails} 次）")
+            state.update(last_event=f"启动失败，{delay:.0f} 秒后重试（第 {fails} 次）")
         time.sleep(delay)
 
 
