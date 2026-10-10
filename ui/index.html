@@ -31,6 +31,13 @@
       <svg viewBox="0 0 16 16" class="tab-ico"><rect x="2" y="3" width="12" height="10" rx="2" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M5 7h6M5 10h3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
       按键映射
     </button>
+    <!-- 鼠标模式（v1.0.31）：**默认隐藏**，只在真的进入鼠标模式时才出现，
+         并且那一刻自动翻到这一页（见 app.js 的 renderMouse）。
+         平时看不到它 = 平时方向键就是方向键，没有"鼠标模式"这回事。 -->
+    <button class="tab" data-page="mouse" id="tab-mouse" hidden>
+      <svg viewBox="0 0 16 16" class="tab-ico"><rect x="3.6" y="1.6" width="8.8" height="12.8" rx="4.4" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M8 1.6v4.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      鼠标模式
+    </button>
     <button class="tab" data-page="settings">
       <svg viewBox="0 0 16 16" class="tab-ico"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
       设置
@@ -43,6 +50,14 @@
 
   <div class="run-state" id="run-state">
     <span class="dot"></span><span id="run-text">正在运行</span>
+  </div>
+
+  <!-- 鼠标模式指示（v1.0.31）。
+       ⚠ 必须**显眼**：鼠标模式会**接管方向键**，用户不知道自己在里面，
+         就会把「按方向键没反应」当成故障来报 —— 这个项目被"静默状态"坑过太多次。
+         所以它同时出现在顶栏（每 130ms 刷新）和「按键映射」页那张卡片上。 -->
+  <div class="mouse-state" id="mouse-state" hidden>
+    <span class="dot"></span><span>鼠标模式</span>
   </div>
 </header>
 
@@ -290,7 +305,138 @@
 
   </div>
 
+  <!-- ══════════ 鼠标模式（v1.0.31）══════════════
+       方向键推指针。⚠ 这张卡**必须显眼** —— 它是个"接管方向键"的模式，
+       用户不知道自己在里面就会把"按方向键没反应"当成故障来报。
+       开关 + 四个滑块都是**热生效**（主循环每轮读一次 config）。 -->
+  <div class="card mouse-card" id="mouse-card">
+    <div class="mouse-head">
+      <div class="mouse-head-l">
+        <svg class="mouse-ico" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="3.6" y="1.6" width="8.8" height="12.8" rx="4.4"
+                stroke="currentColor" stroke-width="1.3" fill="none"/>
+          <path d="M8 1.6v4.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+        </svg>
+        <div>
+          <div class="map-table-title">鼠标模式</div>
+          <div class="map-table-sub">
+            方向键推指针 —— 方向=移动、确认=左键、返回=右键、音量±=滚轮、静音=中键
+          </div>
+        </div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="mouse-enabled">
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+        <span class="switch-label">启用鼠标模式</span>
+      </label>
+    </div>
+
+    <div class="mouse-status" id="mouse-status">
+      <span class="dot"></span>
+      <span id="mouse-status-text">未进入鼠标模式</span>
+      <span class="mouse-live" id="mouse-live"></span>
+    </div>
+
+    <div class="mouse-tip">
+      在遥控器上按一下<strong>「信源」</strong>键进入，再按一下退出
+      （想换别的键：在上面那张映射表里把它的动作改成「鼠标模式（切换）」）。
+    </div>
+
+    <div class="mouse-grid">
+      <div class="set-row">
+        <label>起步速度</label>
+        <input type="range" id="mouse-speed" min="1" max="20" step="0.5" class="range">
+        <b id="mouse-speed-val">5.0</b><span class="unit">px/帧</span>
+      </div>
+      <div class="set-row">
+        <label>上限速度</label>
+        <input type="range" id="mouse-speed-max" min="2" max="60" step="1" class="range">
+        <b id="mouse-speed-max-val">20</b><span class="unit">px/帧</span>
+      </div>
+      <div class="set-row">
+        <label>加速时间</label>
+        <input type="range" id="mouse-accel" min="0" max="3000" step="100" class="range">
+        <b id="mouse-accel-val">800</b><span class="unit">ms</span>
+      </div>
+      <div class="set-row">
+        <label>空闲自动退出</label>
+        <input type="range" id="mouse-idle" min="0" max="600" step="10" class="range">
+        <b id="mouse-idle-val">60</b><span class="unit">秒</span>
+      </div>
+    </div>
+
+    <div class="mouse-note">
+      起步慢是为了能<strong>精细地停在按钮上</strong>，按住之后按曲线加速到上限
+      （「加速时间」设成 <code>0</code> 就是固定速度）。60 帧/秒。
+      <strong>空闲自动退出建议别关</strong>：遥控器搁在沙发上很容易压到方向键，
+      没有这一条指针会一直往一个方向跑。
+    </div>
+  </div>
+
   <div class="hint-line" id="native-hint"></div>
+</section>
+
+<!-- ══════════ 鼠标模式（v1.0.31）══════════════
+     只在真的进入鼠标模式时才出现（tab 默认 hidden、由 app.js 打开）。
+     这一页的职责是**说清楚现在是什么状态、怎么用、怎么出去** ——
+     鼠标模式接管了方向键，用户不知道自己在哪里就会把"按方向键没反应"
+     当成故障来报（这个项目被"静默状态"坑过太多次）。 -->
+<section class="page" data-page="mouse">
+  <div class="card mouse-hero">
+    <div class="mouse-hero-top">
+      <span class="dot"></span>
+      <div class="mouse-hero-head">
+        <div class="mouse-hero-title">鼠标模式 · 使用中</div>
+        <div class="mouse-hero-sub">遥控器的方向键现在在推指针，不再发送方向键</div>
+      </div>
+      <div class="mouse-hero-live" id="mouse-hero-live">—</div>
+    </div>
+
+    <table class="mouse-table">
+      <thead>
+        <tr><th>遥控器键</th><th>在鼠标模式里做什么</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="mk">方向上</span><span class="mk">方向下</span><span class="mk">方向左</span><span class="mk">方向右</span></td>
+          <td>移动指针 —— <strong>按住会持续移动</strong>（60 帧/秒，越按越快）</td>
+        </tr>
+        <tr><td><span class="mk">确认</span></td><td>左键单击</td></tr>
+        <tr><td><span class="mk">返回</span></td><td>右键单击</td></tr>
+        <tr><td><span class="mk">音量＋</span><span class="mk">音量－</span></td><td>滚轮向上 / 向下</td></tr>
+        <tr><td><span class="mk">静音</span></td><td>中键单击</td></tr>
+        <tr>
+          <td><span class="mk">语音</span></td>
+          <td>照旧：按一下开始 / 再按一下结束语音输入（<strong>不受鼠标模式影响</strong>）</td>
+        </tr>
+        <tr>
+          <td><span class="mk">Home</span><span class="mk">YouTube</span><span class="mk">Netflix</span><span class="mk">电源</span></td>
+          <td>照旧按「按键映射」页里设的动作走（鼠标模式没接管它们）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="mouse-exit">
+      <div class="mouse-exit-row">
+        <span class="mouse-exit-ico">⏏</span>
+        <div>
+          <div class="mouse-exit-title">怎么退出</div>
+          <div class="mouse-exit-sub">
+            再按一下遥控器上的 <span class="mk">信源</span> 键 ——
+            或者托盘图标右键 → 「鼠标模式（方向键推指针）」。
+            <span id="mouse-idle-hint"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mouse-note">
+      手感（起步速度 / 上限速度 / 加速时间 / 空闲自动退出）在
+      <strong>「按键映射」页最下面那张「鼠标模式」卡片</strong>里调，改完立刻生效。
+      方向键只能一次按一个（遥控器的报告一次只带一个按键），所以
+      <strong>斜着推做不了</strong>，按住一个方向再按另一个会自动换向。
+    </div>
+  </div>
 </section>
 
 <!-- ══════════ 设置 ══════════ -->

@@ -125,6 +125,30 @@ _KEYEVENTF_KEYUP       = 0x0002
 _KEYEVENTF_SCANCODE    = 0x0008
 _INPUT_KEYBOARD        = 1
 
+# ── 鼠标（SendInput 的鼠标通道，v1.0.31）────────────────────────────────────
+# `_MOUSEINPUT` 和 `_INPUTUNION.mi` 从第一版起就声明好了（见下面），只是**从来
+# 没人往里填过东西** —— 所以加鼠标注入不需要新依赖、不需要新 API，照抄 `_send_key`
+# 的路子即可。这一节就是把那个空位填上。
+_INPUT_MOUSE = 0
+_MOUSEEVENTF_MOVE       = 0x0001
+_MOUSEEVENTF_LEFTDOWN   = 0x0002
+_MOUSEEVENTF_LEFTUP     = 0x0004
+_MOUSEEVENTF_RIGHTDOWN  = 0x0008
+_MOUSEEVENTF_RIGHTUP    = 0x0010
+_MOUSEEVENTF_MIDDLEDOWN = 0x0020
+_MOUSEEVENTF_MIDDLEUP   = 0x0040
+_MOUSEEVENTF_WHEEL      = 0x0800
+# ⚠⚠ 移动**必须**带这一位。不带的话系统会把相邻的多次小位移**合并**成一个大位移，
+#   再拿合并后的结果去走"指针精确度"那条加速曲线 —— 于是「慢慢推」会变成
+#   一跳一跳的（每次合并都落在曲线的高段）。这正是"细腻操作做不了"的根因。
+_MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
+_WHEEL_DELTA = 120          # 一格滚轮；mouseData 的单位就是它
+_MOUSE_BUTTONS: dict[str, tuple[int, int]] = {
+    "left":   (_MOUSEEVENTF_LEFTDOWN,   _MOUSEEVENTF_LEFTUP),
+    "right":  (_MOUSEEVENTF_RIGHTDOWN,  _MOUSEEVENTF_RIGHTUP),
+    "middle": (_MOUSEEVENTF_MIDDLEDOWN, _MOUSEEVENTF_MIDDLEUP),
+}
+
 # 扩展键（必须带 EXTENDEDKEY 标志，否则左/右 Win、方向键会被系统认成小键盘）
 _EXTENDED_VKS = {0x5B, 0x5C, 0x5D, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
                  0x2D, 0x2E, 0x2C,
@@ -707,6 +731,68 @@ def tap_key(name: str) -> bool:
         _send_key(p, up=True)
         time.sleep(0.008)
     return True
+
+
+def _send_mouse(dx: int = 0, dy: int = 0, flags: int = 0, data: int = 0) -> bool:
+    """下发一条鼠标事件（v1.0.31）。dx/dy 是**相对位移**，单位是"米奇"。
+
+    ⚠ 这里**故意不调 `_mark_injected()`**：那个登记是给键盘钩子识别"这条按键是
+      我们自己发的"用的（见 `was_self_injected`），而鼠标事件根本不经过键盘钩子
+      —— 登记进去只会白占表位，还可能把某个同名的键盘事件误判成回声。
+    """
+    if _user32 is None:
+        return False
+    inp = _INPUT(type=_INPUT_MOUSE)
+    inp.u.mi.dx          = int(dx)
+    inp.u.mi.dy          = int(dy)
+    # mouseData 是 DWORD，而滚轮要给**有符号**的值（负数=向下）
+    # ⇒ 先按 32 位取模再塞，别让它变成 Python 的负数溢出。
+    inp.u.mi.mouseData   = int(data) & 0xFFFFFFFF
+    inp.u.mi.dwFlags     = flags
+    inp.u.mi.time        = 0
+    inp.u.mi.dwExtraInfo = None
+    return bool(_user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)))
+
+
+def mouse_move(dx: int, dy: int) -> bool:
+    """相对移动指针。
+
+    dx/dy 为 0 时**直接返回、不发事件** —— 空事件也会走一遍系统的指针处理，
+    在 60 Hz 的移动循环里纯属浪费（而且 `SendInput` 每次都有系统调用开销）。
+    """
+    dx, dy = int(dx), int(dy)
+    if dx == 0 and dy == 0:
+        return True
+    return _send_mouse(dx, dy, _MOUSEEVENTF_MOVE | _MOUSEEVENTF_MOVE_NOCOALESCE)
+
+
+def mouse_button(which: str = "left", down: bool = True) -> bool:
+    """按下/抬起鼠标键。which ∈ {left, right, middle}。"""
+    pair = _MOUSE_BUTTONS.get(str(which).strip().lower())
+    if pair is None:
+        logger.warning(f"unknown mouse button '{which}' — skipped")
+        return False
+    return _send_mouse(flags=pair[0] if down else pair[1])
+
+
+def mouse_click(which: str = "left", delay: float = 0.012) -> bool:
+    """点一下鼠标键（按下 + 抬起）。
+
+    ⚠ 必须成对。只发 down 不发 up 的话，系统会一直认为那个键按着 ——
+      表现为"点什么都是拖拽"，用户只会觉得电脑坏了。
+    """
+    if not mouse_button(which, True):
+        return False
+    time.sleep(delay)
+    return mouse_button(which, False)
+
+
+def mouse_scroll(notches: int) -> bool:
+    """滚轮。正数向上，一格 = `_WHEEL_DELTA`。"""
+    n = int(notches)
+    if n == 0:
+        return True
+    return _send_mouse(flags=_MOUSEEVENTF_WHEEL, data=n * _WHEEL_DELTA)
 
 
 def hotkey_down(keys: list[str]) -> None:

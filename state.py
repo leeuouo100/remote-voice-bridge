@@ -80,6 +80,17 @@ class BridgeState:
     out_dev_name: str = ""
     sys_mic_ready: bool = False      # 系统麦克风采集是否真的开起来了
 
+    # ── 鼠标模式（v1.0.31）─────────────────────────────────────────────
+    # ⚠ `mouse_mode` 必须能被**一眼看到**（托盘图标变色 / 控制台顶部状态条 /
+    #   进入退出时的气泡）。这个项目被"静默状态"坑过太多次 ——
+    #   鼠标模式是个**接管方向键**的模式，用户不知道自己在里面，
+    #   就会把"按方向键没反应"当成故障来报（方向键此时在推指针，不再发方向键）。
+    mouse_mode:      bool  = False
+    # 当前每帧位移（px/tick），给控制台画个"速度条"用。0 = 没在移动。
+    mouse_speed_now: float = 0.0
+    # 本次进入鼠标模式以来累计走了多少像素（诊断用：判断"到底动没动"）。
+    mouse_moved_px:  int   = 0
+
     def as_dict(self) -> dict:
         return asdict(self)
 

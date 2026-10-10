@@ -64,10 +64,20 @@ def _enable_dpi_awareness() -> None:
 
 
 # ── 图标 ──────────────────────────────────────────────────────────────────────
-def _icon_image(size: int = 64, connected: bool = False, streaming: bool = False):
-    """手绘麦克风图标。未连接=灰，已连接=暖橙，推流中=橙红。"""
+def _icon_image(size: int = 64, connected: bool = False, streaming: bool = False,
+                mouse: bool = False):
+    """手绘麦克风图标。
+
+    未连接=灰，已连接=暖橙，推流中=橙红，**鼠标模式=蓝 + 右下角一颗实心点**。
+
+    ⚠ 鼠标模式必须**一眼看出来**：它接管了方向键，用户不知道自己在里面，
+      就会把「按方向键没反应」当成故障来报（`_status_text` 里也有对应的一行）。
+      光靠颜色不够（16px 的托盘图标 + 色觉差异），所以那颗点不能省。
+    """
     if streaming:
         body = (232, 96, 48, 255)
+    elif mouse:
+        body = (86, 156, 255, 255)
     elif connected:
         body = (238, 158, 58, 255)
     else:
@@ -90,6 +100,10 @@ def _icon_image(size: int = 64, connected: bool = False, streaming: bool = False
           start=0, end=180, fill=body, width=lw)
     d.line([cx, h * 0.80, cx, h * 0.90], fill=body, width=lw)
     d.line([cx - w * 0.15, h * 0.90, cx + w * 0.15, h * 0.90], fill=body, width=lw)
+    if mouse:
+        # 右下角那颗点：麦克风底座横线在中间，右下角是空的。
+        r = max(2.0, w * 0.14)
+        d.ellipse([w - 2 * r - 1, h - 2 * r - 1, w - 1, h - 1], fill=body)
     return img
 
 
@@ -128,6 +142,10 @@ def _status_text(item=None) -> str:
     dev = s.device or "遥控器"
     if s.streaming:
         return f"● 语音中 · {dev}"
+    # ⚠ 鼠标模式必须**说出来**：它接管了方向键，用户不知道自己在里面，
+    #   就会把「按方向键没反应」当成故障来报（图标也会同时变成蓝色 + 右下角一个点）。
+    if s.mouse_mode:
+        return f"● 鼠标模式 · {dev}"
     if s.connected:
         return f"● 已连接 · {dev}"
     # ⚠ 这里以前无条件写「按遥控器任意键唤醒」—— 那句话只对"设备睡着了"成立。
@@ -153,6 +171,35 @@ def _make_im_action(key: str):
 def _toggle_autostart(icon, item):
     _set_autostart(not _is_autostart())
     icon.update_menu()
+
+
+def _toggle_mouse_mode(icon=None, item=None):
+    """托盘里切换鼠标模式（v1.0.31）。
+
+    ⚠ 为什么必须留这条路：模式状态（`main._mouse_mode`）是桥线程里的**局部**状态，
+      托盘够不着，所以只能"请求"，由主循环去切。而遥控器上那个「信源」键万一被
+      用户改成别的动作、或者遥控器不在手边，他就**没有任何办法进出这个模式** ——
+      "进得去出不来"比没有这个功能更糟。
+
+    ⚠ 这里**不自己翻转 state**：那样界面会先显示"已切换"、而桥线程还没动
+      （状态和事实相反，正是这个项目栽过很多次的那类 bug）。状态由桥线程写。
+    """
+    try:
+        import main
+        main.request_mouse_toggle()
+    except Exception as e:                            # noqa: BLE001
+        _notify(icon, f"切换鼠标模式失败：{e}")
+        return
+    want = not bool(state.get().mouse_mode)
+    _notify(icon, "正在进入鼠标模式：方向键推指针，确认=左键、返回=右键。\n"
+                  "再按一次「信源」键（或再点这里）退出。"
+            if want else
+            "正在退出鼠标模式：方向键恢复成方向键。")
+    if icon is not None:
+        try:
+            icon.update_menu()
+        except Exception:                             # noqa: BLE001
+            pass
 
 
 def _request_reconnect(icon=None, item=None):
@@ -412,7 +459,7 @@ def _menu_fingerprint() -> tuple:
     except Exception:                                # noqa: BLE001
         auto = False
     return (bool(s.connected), bool(s.streaming), s.device or "",
-            s.last_event or "", im, bool(auto))
+            s.last_event or "", im, bool(auto), bool(s.mouse_mode))
 
 
 def _refresh(icon=None) -> None:
@@ -451,7 +498,8 @@ def _refresh(icon=None) -> None:
         return
     s = state.get()
     try:
-        ic.icon = _icon_image(connected=s.connected, streaming=s.streaming)
+        ic.icon = _icon_image(connected=s.connected, streaming=s.streaming,
+                              mouse=bool(s.mouse_mode))
         ic.title = f"{APP_NAME} — {_status_text()}"
     except Exception:                                # noqa: BLE001
         pass
@@ -487,6 +535,10 @@ def build_menu(icon) -> pystray.Menu:
         pystray.MenuItem("控制台", _open_console, default=True),
         pystray.MenuItem("输入法 / 语音触发键", pystray.Menu(*im_items)),
         pystray.MenuItem("重新连接", _request_reconnect),
+        # 鼠标模式（v1.0.31）。checked 读的是**桥线程写进 state 的真状态**，
+        # 不是本地变量 —— 否则托盘勾选会和事实不一致。
+        pystray.MenuItem("鼠标模式（方向键推指针）", _toggle_mouse_mode,
+                         checked=lambda item: bool(state.get().mouse_mode)),
         # 修复 / 诊断（2026-09-29 武哥建议）：出问题时右键就有，不用去翻目录。
         # ⚠ 子菜单里的顺序 = 出问题的排查顺序：连不上 → 先体检 → 再修；
         #   按键不灵 → 遥控器诊断。别把"修"排在"查"前面。

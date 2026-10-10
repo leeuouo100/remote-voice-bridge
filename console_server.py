@@ -462,6 +462,11 @@ def build_live() -> dict:
             "streaming": bool(s.streaming),
             "device": s.device or "",
             "running": True,
+            # 鼠标模式（v1.0.31）。放进 `status` 而不是另开一块：前端是**高频**
+            # 轮询这个接口的（150ms），模式切换必须**立刻**在界面上看到 ——
+            # 这个项目被"静默状态"坑过太多次，而鼠标模式是**接管方向键**的模式，
+            # 用户不知道自己在里面就会把"按方向键没反应"当成故障来报。
+            "mouse_mode": bool(s.mouse_mode),
         },
         "levels": {
             "sys": round(s.sys_level_db, 1),
@@ -486,6 +491,10 @@ def build_live() -> dict:
             # 界面上要能看见"AGC 正在替你往下收"，否则用户只会觉得"声音怎么变小了"。
             "agc_factor": round(s.agc_factor, 3),
             "agc_enabled": bool(s.agc_enabled),
+            # 鼠标模式（v1.0.31）：当前每帧位移 + 本次进入以来累计走了多少像素。
+            # 「到底动没动」是用户最想知道的一件事 —— 只给一个"已进入"没法排查。
+            "mouse_speed_now": round(s.mouse_speed_now, 2),
+            "mouse_moved_px": int(s.mouse_moved_px),
         },
     }
 
@@ -575,6 +584,15 @@ def build_state(force_devices: bool = False) -> dict:
             # （跟 hid_frida_* 一样属于"高级项"，UI 上不铺开关，改 config.json。）
             "log_redact": bool(getattr(cfg, "log_redact", True)),
             "log_raw_hid": bool(getattr(cfg, "log_raw_hid", False)),
+            # 鼠标模式（v1.0.31）。面板要能看见、也要能改 ——
+            # 尤其是「空闲自动退出」：遥控器搁沙发上很容易压到方向键。
+            "mouse_mode_enabled": bool(getattr(cfg, "mouse_mode_enabled", True)),
+            "mouse_speed": float(getattr(cfg, "mouse_speed", 5.0) or 5.0),
+            "mouse_speed_max": float(
+                getattr(cfg, "mouse_speed_max", 20.0) or 20.0),
+            "mouse_accel_ms": int(getattr(cfg, "mouse_accel_ms", 800) or 0),
+            "mouse_idle_exit_s": int(
+                getattr(cfg, "mouse_idle_exit_s", 60) or 0),
         },
         "devices": {
             # `system_mic` 是**程序真正打开**的那只（由 SystemMic.start 写入 state），
@@ -926,6 +944,11 @@ class Handler(BaseHTTPRequestHandler):
             # 「等遥控器出声再叫输入法」（v1.0.29，默认关）。同样必须进白名单：
             # 不进就是"界面上打开了、后端当没听见"，而用户只会觉得"它不听话"。
             "hotkey_wait_first_frame": bool, "hotkey_wait_max_ms": int,
+            # 鼠标模式（v1.0.31）。**必须进白名单** —— 不进就是"界面上拖了滑块
+            # 没反应"，而 `_get_cfg()` 那边还会**静默**退回默认值。
+            "mouse_mode_enabled": bool, "mouse_speed": float,
+            "mouse_speed_max": float, "mouse_accel_ms": int,
+            "mouse_idle_exit_s": int,
         }
         ignored: list[str] = []
 

@@ -26,8 +26,10 @@ from atvv import (
 )
 from adpcm import IMAADPCMDecoder
 from session import SessionCoordinator, Phase
-from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up, tap_key, is_modifier
+from keys import (voice_hotkey_down, voice_hotkey_up, hotkey_up, tap_key,
+                  is_modifier, mouse_click, mouse_scroll)
 from buttons import resolve_button
+import mouse_mode
 import mixer
 
 # 语音会话最长持续时间（秒）。超过就由程序自动收尾 ——
@@ -270,6 +272,42 @@ _im_closed_by_key = False
 _INJECTION_ARTIFACT_KEYS = {"reserved"}
 
 
+# ── 鼠标模式（v1.0.31）──────────────────────────────────────────────────────
+#
+# 用遥控器方向键推指针。**移动引擎**在 `mouse_mode.py`（纯逻辑、可单测），
+# 这里只管"模式状态机 + 按键派发"。
+#
+# ⚠⚠ 三条硬约束（每条都有真机依据，别凭感觉改）：
+#
+# ① **报告一次只带一个按键** ⇒ 按住 A 再按 B 时 **A 的松开永远收不到**。
+#    实测 2026-10-10 15:48：`up` 与 `vol_down` 各丢了一次松开。
+#    ⇒ 任何"新的键按下"都必须先 `release_all()`（新键按下在逻辑上就蕴含
+#      "旧键已经不在按了"），否则指针会一直往那个方向跑，用户只能拔遥控器电池。
+#
+# ② **按住不动不会再有事件** ⇒ 移动必须由我们自己的 60 Hz 定时器产生
+#    （见 mouse_mode 模块开头）。所以 down/up 只是"开始/停止"两个沿。
+#
+# ③ **`_on_hid_button` 里那条「语音会话中按确认键 = 收尾」优先级最高**，
+#    鼠标模式必须排在它**后面** —— 否则一边说话一边误点左键。
+#
+# ⚠ 为什么"信源"单击就切换、而不是长按：`frida_tap` 那边只在**报告内容变化**时
+#   才上报，一次长按我们只能拿到 down/up 两个沿，"按住多久"要自己掐表；
+#   而单击语义简单、和别的键一致。防误触靠 `_MOUSE_TOGGLE_DEBOUNCE`
+#   （实测 15:41 那阵「确认」键有 439/430/220/180 ms 的连发斜坡 ⇒
+#    一次按住可能来好几对 down/up，没有去抖就会切来切去）。
+_MOUSE_TOGGLE_DEBOUNCE = 0.8
+
+# 模式状态。`last_key_at` 是"最后一次鼠标模式相关的按键时刻"，
+# 空闲超时（`config.mouse_idle_exit_s`）看它 —— 遥控器搁沙发上很容易压到方向键，
+# 不能让它一直推着指针跑。
+_mouse_mode: dict = {"on": False, "last_toggle_at": 0.0, "last_key_at": 0.0}
+
+# 鼠标模式下"方向键 → 指针"的键位表（**不跟随用户的按键映射**）。
+# 理由：映射表是给"注入按键"用的，鼠标模式要的是方向语义本身；
+# 用户把方向上改成 `w` 之后，在鼠标模式里按"方向上"仍然该推指针向上。
+_MOUSE_DIRS = ("up", "down", "left", "right")
+
+
 def _looks_like_user_key(e) -> bool:
     """这一下是不是「用户真的敲了一个键」（而不是我们自己注入的副产品）？
 
@@ -305,6 +343,20 @@ def request_stop() -> None:
     _stop_request.set()
     # 连接阶段在 `_hold_ble_connection` 里睡 0.5s 一轮，重连请求能把它叫醒
     _reconnect_request.set()
+
+
+# 鼠标模式的切换请求（v1.0.31）。托盘菜单点「鼠标模式」时置位，主循环消费。
+#
+# ⚠ 为什么要有这条**独立的**路：模式状态（`_mouse_mode`）是 `_run_bridge_inner`
+#   里的局部状态，托盘线程根本够不着。而遥控器上那个「信源」键万一被用户改成了
+#   别的动作、或者遥控器不在手边，用户就**没有任何办法进出鼠标模式** ——
+#   一个"进得去出不来"的模式比没有这个功能更糟。
+_mouse_toggle_request = threading.Event()
+
+
+def request_mouse_toggle() -> None:
+    """请求主循环把鼠标模式切一下（托盘菜单用）。"""
+    _mouse_toggle_request.set()
 
 
 # ── 语音结束后的「自动发送」（⚠ 默认关，是可选项）────────────────────────
@@ -1266,6 +1318,10 @@ class _BridgeResources:
         self.sysmic = None           # mixer.SystemMic
         self.hid_buttons = None      # remote_hid.RemoteHidButtons
         self.hid_tap = None          # frida_hid.RemoteHidTap
+        # 鼠标模式的移动引擎（v1.0.31）。⚠ 必须收尾：它有一条 60 Hz 的注入线程，
+        # 退出时若还"认为"某个方向按着，指针会一直往那边跑 ——
+        # 用户看到的是"软件都关了，鼠标自己还在动"。
+        self.mouse_mover = None
         self.kb = None               # keyboard 模块（装了钩子才非 None）
         self.voice_active = False
         self.ran_ok = False
@@ -1372,6 +1428,11 @@ class _BridgeResources:
             except Exception: pass
         if self.hid_tap is not None:
             try: self.hid_tap.stop()
+            except Exception: pass
+        # 鼠标移动线程：先松开所有"还按着"的方向，再停线程（stop() 里就是这么做的）。
+        # 放在键盘钩子之后：万一 stop 里那次 release 还要注入一帧，钩子得还在。
+        if self.mouse_mover is not None:
+            try: self.mouse_mover.stop()
             except Exception: pass
         if self.ble is not None:
             try: self.ble.close()
@@ -2755,6 +2816,114 @@ async def _run_bridge_inner(device_type: str | None = None,
     # 首次见到的键名只报一次，见 _on_key 里那两处。
     _seen_keys: set[str] = set()
 
+    # ── 鼠标模式状态机（v1.0.31）───────────────────────────────────────────
+    #
+    # ⚠ `MouseMover.__init__` **不起线程**（线程在第一次 press 时才起），
+    #   所以这里直接建出来是安全的 —— 没进过鼠标模式就一个后台线程都没有。
+    #   提前建的好处：`configure()` 能在进模式之前就把速度参数灌进去。
+    _mover = mouse_mode.MouseMover()
+    res.mouse_mover = _mover
+    # 上一次灌进引擎的速度参数。变了才 configure + 打日志（别每 200ms 刷一屏）。
+    _mouse_cfg_seen: tuple | None = None
+
+    def _mouse_idle_s() -> float:
+        """空闲自动退出的秒数（0 = 不自动退出）。读的是实时配置，不用重启。"""
+        try:
+            return float(_get_cfg().get("mouse_idle_exit_s") or 0)
+        except Exception:                               # noqa: BLE001
+            return 0.0
+
+    def _mouse_set(on: bool, reason: str) -> None:
+        """进/出鼠标模式。幂等；进出都打日志 + 更新 state（UI 靠它显示）。"""
+        on = bool(on)
+        if on == bool(_mouse_mode["on"]):
+            return
+        _mouse_mode["on"] = on
+        _mouse_mode["last_key_at"] = time.time()
+        if on:
+            # ⚠ 语音会话与鼠标模式互斥：一边说话一边被方向键推指针没有意义，
+            #   而且「语音会话中按确认键」那条规则会先被吃掉（见 _MOUSE_DIRS ③）。
+            #   先收掉语音（send=False：用户是在切模式，不是"说完了"）。
+            if voice_active:
+                logger.info("🎙️ 语音会话【结束】（要进鼠标模式，先收掉语音）")
+                end_voice_session("进入鼠标模式", send=False)
+            _mover.release_all()
+            state.update(mouse_mode=True, mouse_moved_px=0)
+            logger.info(
+                "🖱 鼠标模式【进入】（%s）—— 方向键现在推指针："
+                "方向=移动 / 确认=左键 / 返回=右键 / 音量=滚轮 / 静音=中键；"
+                "再按一下「信源」退出%s。",
+                reason,
+                f"，{_mouse_idle_s():.0f} 秒不碰遥控器也会自动退出"
+                if _mouse_idle_s() > 0 else "",
+            )
+        else:
+            _mover.release_all()
+            state.update(mouse_mode=False, mouse_speed_now=0.0)
+            logger.info("🖱 鼠标模式【退出】（%s）—— 方向键恢复成方向键", reason)
+
+    def _mouse_handle(btn_id: str, is_down: bool, keymap: dict) -> bool:
+        """鼠标模式下的按键派发。返回 True = 这一下被鼠标模式吃掉了。
+
+        ⚠ 调用点在 `_on_hid_button` 里那条「语音会话中按确认键 = 收尾」**之后**
+          （见 `_MOUSE_DIRS` 上方 ③）—— 所以这里可以放心把 ok 当成左键。
+
+        ⚠ 切换键**认映射表**（`mapped == "mouse_mode"`），不写死「信源」：
+          默认表把「信源」挂在它上面，但用户完全可以把别的键改成鼠标模式、
+          或者把「信源」改回 Alt+Tab —— 那种情况下 Alt+Tab 必须还能用。
+        """
+        mapped = str((keymap or {}).get(btn_id) or "").strip()
+        if mapped == "mouse_mode":
+            if not is_down:
+                return True                     # 抬起不重复触发（否则一次按会切两回）
+            now = time.time()
+            gap = now - float(_mouse_mode["last_toggle_at"] or 0.0)
+            if gap < _MOUSE_TOGGLE_DEBOUNCE:
+                # 实测 15:41 那阵「确认」有 439/430/220/180 ms 的连发斜坡 ⇒
+                # 一次按住可能来好几对 down/up，没这道去抖就会来回切。
+                logger.debug("🖱 鼠标模式切换键连发（间隔 %.0f ms < %.0f ms）→ 忽略",
+                             gap * 1000.0, _MOUSE_TOGGLE_DEBOUNCE * 1000.0)
+                return True
+            _mouse_mode["last_toggle_at"] = now
+            _mouse_set(not _mouse_mode["on"], f"{btn_id} 键")
+            return True
+
+        if not _mouse_mode["on"]:
+            return False
+
+        _mouse_mode["last_key_at"] = time.time()
+
+        if btn_id in _MOUSE_DIRS:
+            if is_down:
+                # ⚠ 见 `_MOUSE_DIRS` 上方 ①：新键按下 ⇒ 旧方向的松开已经丢了。
+                #   不先清干净，"按住上再按右"会让指针一直往上跑。
+                _mover.release_all()
+                _mover.press(btn_id)
+            else:
+                _mover.release(btn_id)
+            return True
+
+        if is_down:
+            # 任何新键按下都可能顶掉"还按着的方向"的松开 ⇒ 先清干净。
+            _mover.release_all()
+            if btn_id == "ok":
+                mouse_click("left")
+            elif btn_id == "back":
+                mouse_click("right")
+            elif btn_id == "mute":
+                mouse_click("middle")
+            elif btn_id == "vol_up":
+                mouse_scroll(1)
+            elif btn_id == "vol_down":
+                mouse_scroll(-1)
+            else:
+                return False                    # 没接管：交回普通映射表
+            return True
+
+        # 抬起：上面那五个键在鼠标模式下归我们管，别再走普通映射
+        # （尤其 mute —— 普通映射下它是"按住连发退格"，在鼠标模式里会乱删字）。
+        return btn_id in ("ok", "back", "mute", "vol_up", "vol_down")
+
     # 按键旁路（Frida）的句柄。⚠ 必须**在这里**先声明成 None：
     # 下面的 `_get_cfg()` 会在旁路起来之前就被调用（本函数第 1997 行那次预热），
     # 而"配置一变就下发屏蔽表"要读它 —— 晚一步声明就会撞
@@ -2851,6 +3020,19 @@ async def _run_bridge_inner(device_type: str | None = None,
                     # 开着 = 按物理空格会被当成遥控器确认键、再注入一个回车）。
                     "keyboard_page_keys": bool(
                         getattr(new, "keyboard_page_keys", False)),
+                    # ── 鼠标模式（v1.0.31）──────────────────────────────────
+                    # ⚠ 同样必须进白名单：控制台改滑块写的是 config.json，
+                    #   这里读不到就**静默**退回默认值（老坑，见上面那段注释）。
+                    "mouse_mode_enabled": bool(
+                        getattr(new, "mouse_mode_enabled", True)),
+                    "mouse_speed": float(
+                        getattr(new, "mouse_speed", 5.0) or 5.0),
+                    "mouse_speed_max": float(
+                        getattr(new, "mouse_speed_max", 20.0) or 20.0),
+                    "mouse_accel_ms": int(
+                        getattr(new, "mouse_accel_ms", 800) or 0),
+                    "mouse_idle_exit_s": int(
+                        getattr(new, "mouse_idle_exit_s", 60) or 0),
                 }
                 _warn_bad_keymap(_cfg_cache["keymap"])
                 # 映射表变了就立刻下发（P1-6）：控制台改完 / 手改 config.json
@@ -3115,6 +3297,17 @@ async def _run_bridge_inner(device_type: str | None = None,
             end_voice_session("厂商页确认键", send=True)
             return
 
+        # ── 鼠标模式（v1.0.31）──────────────────────────────────────────────
+        # ⚠ 位置**必须**在上面那条「语音会话中按确认键 = 收尾」之后：
+        #   正在说话时误按确认键，应该是"关掉语音"，而不是点出一发左键
+        #   （否则用户会对着聊天窗口乱点）。
+        try:
+            if _mouse_handle(btn_id, is_down, cached.get("keymap") or {}):
+                return
+        except Exception as e:                      # noqa: BLE001
+            # 鼠标模式出问题**不能**把按键派发整条掐掉 —— 记一行、放它走普通映射。
+            logger.error("鼠标模式派发异常（这一下按键已忽略）：%s", e)
+
         resolve_button(
             btn_id,
             event_type="down" if is_down else "up",
@@ -3307,6 +3500,52 @@ async def _run_bridge_inner(device_type: str | None = None,
                     _agc_reset()
             except Exception as e:                      # noqa: BLE001
                 logger.debug("自动增益同步异常（已忽略）：%r", e)
+
+            # ── 鼠标模式：速度参数同步 + 空闲自动退出（v1.0.31）──────────────
+            #   ⚠ 和 AGC 一样，"读配置"这件事只能放在主循环 ——
+            #     `_on_hid_button` 跑在 BLE 回调线程上，那里每按一次键读一遍
+            #     config.json 太重（它已经读一次了，够用），而空闲超时是**时间**驱动的，
+            #     天然属于循环。
+            try:
+                # 托盘菜单点的「鼠标模式」—— 消费在前，好让下面"配置里禁用了"能立刻否决它。
+                if _mouse_toggle_request.is_set():
+                    _mouse_toggle_request.clear()
+                    _mouse_set(not _mouse_mode["on"], "托盘菜单")
+                _mc = _get_cfg()
+                _msig = (_mc.get("mouse_speed"), _mc.get("mouse_speed_max"),
+                         _mc.get("mouse_accel_ms"))
+                if _msig != _mouse_cfg_seen:
+                    _mouse_cfg_seen = _msig
+                    _mover.configure(base_speed=_msig[0], max_speed=_msig[1],
+                                     accel_ms=_msig[2])
+                    logger.info(
+                        "🖱 鼠标速度参数已更新：起步 %.1f px/帧、上限 %.1f px/帧、"
+                        "加速 %.0f ms（控制台「鼠标」页可调，热生效）",
+                        float(_msig[0] or 0.0), float(_msig[1] or 0.0),
+                        float(_msig[2] or 0))
+                # 配置里把鼠标模式 / 映射总开关关掉 ⇒ 退出鼠标模式。
+                # ⚠ 这一条是**退路**：`_on_hid_button` 在映射总开关关掉时会提前
+                #   return，连「信源」切换都进不来 —— 不在模式里退出，用户就没法出来了。
+                if _mouse_mode["on"] and not (_mc.get("mouse_mode_enabled", True)
+                                              and _mc.get("mapping_enabled", True)):
+                    _mouse_set(False, "配置里已禁用")
+                _idle_s = float(_mc.get("mouse_idle_exit_s") or 0)
+                if (_mouse_mode["on"] and _idle_s > 0
+                        and (time.time() - float(_mouse_mode["last_key_at"] or 0.0)) > _idle_s):
+                    logger.info(
+                        "🖱 鼠标模式：%.0f 秒没碰遥控器 → 自动退出"
+                        "（遥控器搁在沙发上很容易压到方向键，不能让它一直推指针）",
+                        _idle_s)
+                    _mouse_set(False, "空闲超时")
+                # 速度条：只有真在动、或刚停下时才写 state（别每 200ms 白刷一次）
+                _sp = _mover.speed_now()
+                _mv = _mover.moved_px()
+                _cur = state.get()
+                if (round(_sp, 2) != _cur.mouse_speed_now
+                        or _mv != _cur.mouse_moved_px):
+                    state.update(mouse_speed_now=round(_sp, 2), mouse_moved_px=_mv)
+            except Exception as e:                      # noqa: BLE001
+                logger.debug("鼠标模式同步异常（已忽略）：%r", e)
 
             # ── 「等遥控器出声再叫输入法」（默认关，见 `_hotkey_pending` 注释）──
             #   置位在 on_control（BLE 回调线程），消费在这里。

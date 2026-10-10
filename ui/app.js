@@ -125,18 +125,31 @@ function paintMeter(key, db) {
 }
 
 // ── 页面切换 ──────────────────────────────────────────────────────────────────
+function activePage() {
+  return $('.page.is-active')?.dataset.page || '';
+}
+
+/* `persist=false` 用于**自动翻页**（鼠标模式进出那一下）。
+   ⚠ 自动翻的页绝不能写进 localStorage：下次打开控制台会去"恢复"它，
+     而那时鼠标模式根本没开 —— 用户一进来就看到一张「鼠标模式 · 使用中」
+     的说明页，状态和事实相反（这个项目栽过很多次的那类 bug）。 */
+function activatePage(page, persist = true) {
+  const btn = $(`.tab[data-page="${page}"]`);
+  if (!btn || btn.hidden) return false;       // 隐藏的页签（＝鼠标模式页）不许进
+  $$('.tab').forEach(b => b.classList.toggle('is-active', b === btn));
+  $$('.page').forEach(p => p.classList.toggle('is-active', p.dataset.page === page));
+  if (persist) localStorage.setItem('rvb.tab', page);
+  if (page === 'log') refreshLog(true);
+  // 波形要画得流畅就得高频轮询；离开音频页时降回低频省电
+  fastTimer();
+  return true;
+}
+
 function initTabs() {
-  $$('.tab').forEach(btn => btn.addEventListener('click', () => {
-    $$('.tab').forEach(b => b.classList.toggle('is-active', b === btn));
-    const page = btn.dataset.page;
-    $$('.page').forEach(p => p.classList.toggle('is-active', p.dataset.page === page));
-    localStorage.setItem('rvb.tab', page);
-    if (page === 'log') refreshLog(true);
-    // 波形要画得流畅就得高频轮询；离开音频页时降回低频省电
-    fastTimer();
-  }));
+  $$('.tab').forEach(btn => btn.addEventListener('click', () => activatePage(btn.dataset.page)));
   const saved = localStorage.getItem('rvb.tab');
-  if (saved) $(`.tab[data-page="${saved}"]`)?.click();
+  // ⚠ 不恢复「鼠标模式」那一页：它只在真的进入鼠标模式时才存在。
+  if (saved && saved !== 'mouse') activatePage(saved);
 }
 
 // ── 渲染：顶部运行状态 ────────────────────────────────────────────────────────
@@ -489,6 +502,79 @@ function fillSelect(sel, values, current) {
   if (document.activeElement !== sel && current !== undefined) sel.value = current;
 }
 
+// ── 渲染：鼠标模式（v1.0.31）─────────────────────────────────────────────────
+let _mouseWasOn = false;       // 上一次渲染时是否在鼠标模式里（用来抓"进入/退出"那一沿）
+let _mousePrevPage = null;     // 进鼠标模式之前停在哪个页面（退出时翻回去）
+
+// ⚠ 这个函数必须在**快档**（130ms）也调：鼠标模式是"接管方向键"的状态，
+//   晚一秒才显示出来，用户就已经把"按方向键没反应"当成故障了 ——
+//   这个项目被"静默状态"坑过太多次（见 CHANGELOG v1.0.25 / v1.0.30）。
+function renderMouse() {
+  const on = !!(state.status && state.status.mouse_mode);
+  const chip = $('#mouse-state');
+  if (chip) chip.hidden = !on;                 // 顶栏那颗胶囊只在真的进模式时出现
+
+  // 鼠标模式那一页：**只在进入时存在**，并在进入的那一刻自动翻过去
+  // （用户原话：「要进入鼠标模式，就要按那个信源键，然后在控制台里面也会出一个页面，
+  //   说明这个鼠标模式是怎么使用的」）。退出时如果正停在这一页就翻回原来那一页 ——
+  // 别把用户留在一张页签已经消失的页面上。
+  const tab = $('#tab-mouse');
+  if (tab) tab.hidden = !on;
+  if (on && !_mouseWasOn) {
+    const cur = activePage();
+    if (cur && cur !== 'mouse') _mousePrevPage = cur;
+    activatePage('mouse', false);
+  } else if (!on && _mouseWasOn && activePage() === 'mouse') {
+    activatePage(_mousePrevPage || 'mapping', false);
+  }
+  _mouseWasOn = on;
+
+  const box = $('#mouse-status');
+  if (box) {
+    box.classList.toggle('is-on', on);
+    $('#mouse-status-text').textContent = on
+      ? '正在鼠标模式：方向键推指针（再按一下「信源」退出）'
+      : '未进入鼠标模式';
+  }
+  const d = state.diagnostics || {};
+  // 「到底动没动」是用户最想知道的一件事 —— 只给一个"已进入"没法排查。
+  const txt = on
+    ? `${(+d.mouse_speed_now || 0).toFixed(1)} px/帧 · 本次已走 ${d.mouse_moved_px || 0} px`
+    : '';
+  const live = $('#mouse-live');
+  if (live) live.textContent = txt;
+  const hero = $('#mouse-hero-live');
+  if (hero) hero.textContent = txt || '—';
+  const hint = $('#mouse-idle-hint');
+  if (hint) {
+    const s = +(state.config && state.config.mouse_idle_exit_s);
+    hint.textContent = (on && s > 0)
+      ? `（${s} 秒不碰遥控器会自动退出，防止搁在沙发上被压到）`
+      : '';
+  }
+}
+
+// 鼠标模式的开关 + 四个滑块（值来自 config，和设置页一样受 settingsTouched 保护 ——
+// 用户正在拖的时候不许从服务端回填，否则滑块会被拽回去）
+function renderMouseConfig() {
+  if (Date.now() - settingsTouched <= 2500) return;
+  const c = state.config || {};
+  const set = (sel, val, fmt) => {
+    const r = $(sel);
+    if (!r) return;
+    if (document.activeElement !== r) r.value = val;
+    const lab = $(sel + '-val');
+    if (lab) lab.textContent = fmt(val);
+  };
+  // `!== false`：字段缺失时按"默认开"显示 —— 和 config.py 的默认值同向。
+  // 写成 `=== true` 会让老配置（没有这个字段）显示成"已关闭"，与后端实际相反。
+  $('#mouse-enabled').checked = c.mouse_mode_enabled !== false;
+  set('#mouse-speed',     +c.mouse_speed || 5,        v => (+v).toFixed(1));
+  set('#mouse-speed-max', +c.mouse_speed_max || 20,   v => String(Math.round(+v)));
+  set('#mouse-accel',     c.mouse_accel_ms ?? 800,    v => String(Math.round(+v)));
+  set('#mouse-idle',      c.mouse_idle_exit_s ?? 60,  v => String(Math.round(+v)));
+}
+
 // ── 日志 ──────────────────────────────────────────────────────────────────────
 async function refreshLog(force) {
   try {
@@ -525,6 +611,7 @@ async function pollLive() {
     renderRunState();
     renderChannels();
     renderDiag();
+    renderMouse();
   } catch (_) { /* 失联时交给慢档去报错，这里不重复刷 */ }
 }
 
@@ -544,6 +631,8 @@ async function poll() {
     renderDevices();
     renderMapping();
     renderSettings();
+    renderMouse();
+    renderMouseConfig();
   } catch (e) {
     $('#run-state .dot').className = 'dot bad';
     $('#run-text').textContent = '与控制台服务失联';
@@ -706,6 +795,28 @@ function initEvents() {
     api('/api/config', { send_after_voice_delay_ms: ms });
   });
   $('#set-autostart').addEventListener('change', e => api('/api/autostart', { enabled: e.target.checked }));
+
+  // ── 鼠标模式（v1.0.31）────────────────────────────────────────────────────
+  // 全部**热生效**：桥的主循环每轮读一次 config.json（mtime 缓存），
+  // 改完下一轮就按新值走，不用重连（重连一次遥控器要哑几秒）。
+  $('#mouse-enabled').addEventListener('change', e =>
+    api('/api/config', { mouse_mode_enabled: e.target.checked }));
+
+  const mslider = (sel, key, fmt) => {
+    $(sel).addEventListener('input', e => {
+      touch();
+      $(sel + '-val').textContent = fmt(e.target.value);
+      api('/api/config', { [key]: +e.target.value });
+    });
+  };
+  // ⚠ 取值域必须在前端也守一道：服务端白名单只做类型转换、**不夹取值域**
+  //   （见 `_patch_config`）。起步速度 < 1 会慢到"按了跟没按一样"；
+  //   上限低于起步时引擎会自己抬到起步（`MouseMover.configure`），
+  //   但界面上两个滑块看起来自相矛盾，不如在这里就挡住。
+  mslider('#mouse-speed',     'mouse_speed',       v => Math.max(1, +v).toFixed(1));
+  mslider('#mouse-speed-max', 'mouse_speed_max',   v => String(Math.round(Math.max(2, +v))));
+  mslider('#mouse-accel',     'mouse_accel_ms',    v => String(Math.round(Math.max(0, +v))));
+  mslider('#mouse-idle',      'mouse_idle_exit_s', v => String(Math.round(Math.max(0, +v))));
 
   $('#btn-reload-dev').addEventListener('click', async () => {
     // ?devices=1 绕过服务端的声卡列表缓存，强制重新枚举

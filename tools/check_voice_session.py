@@ -61,6 +61,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -103,6 +104,25 @@ def _block(src: str, start_pat: str, end_pat: str) -> str:
     return m.group(1) if m else ""
 
 
+def _imports_name_from(src: str, module: str, name: str) -> bool:
+    """`src` 里有没有 `from <module> import ... <name> ...`？
+
+    ⚠ 必须走 ast，不能用 `re.search(r"from keys import[^\\n]*\\bis_modifier\\b")`：
+      `import` 一旦因为加长而写成**带括号的换行**形式
+      （v1.0.31 加鼠标原语时就是这样），`[^\\n]*` 立刻跨不过去 ⇒ 判据变红，
+      而代码其实是对的。判据不该依赖"import 写在第几行、有没有换行"。
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and (n.module or "") == module:
+            if any(a.name == name for a in n.names):
+                return True
+    return False
+
+
 def _indent4_block(text: str, header: str) -> str:
     """取以 `header` 开头、到下一个「恰好 4 空格缩进」的语句为止的**原文**。
 
@@ -128,7 +148,6 @@ def _indent4_block(text: str, header: str) -> str:
 def _audio_start_block(code: str) -> str:
     return _block(code, r'elif event\["type"\] == "audio_start":',
                   r'elif event\["type"\] == "audio_stop":')
-
 
 def _audio_stop_block(code: str) -> str:
     return _block(code, r'elif event\["type"\] == "audio_stop":',
@@ -548,7 +567,11 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
               "⑧ _on_key 里声明了 global _im_closed_by_key"))
     c.append(("if voice_active and _looks_like_user_key(e):" in ok_body,
               "⑧ 置位判据 = 会话开着 + `_looks_like_user_key(e)`"))
-    c.append((re.search(r"from keys import[^\n]*\bis_modifier\b", code) is not None,
+    # ⚠ 这里必须传 `src`（原文）而不是 `code`（`_code_only()` 剥过的）：
+    #   `_code_only` 会把整行 `logger.xxx(...)` 删掉，而它可能是某个 if 的**唯一**
+    #   函数体 ⇒ 剥完的源码**语法就不成立了**（实测 SyntaxError），`ast.parse`
+    #   直接失败 ⇒ 判据永远为假。导入语句在模块顶层，本来就不受注释剥离影响。
+    c.append((_imports_name_from(src, "keys", "is_modifier"),
               "⑧ main.py 从 keys 导入了 is_modifier"))
 
     # `_looks_like_user_key` 三条排除，缺一条都会误判（各自都有真机证据）：

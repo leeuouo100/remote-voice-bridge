@@ -97,7 +97,12 @@ def run_checks(main_src: str, cfg_src: str) -> list[tuple[bool, str]]:
                    and "cfg.send_after_voice = False" in cfg_src,
                    "config：_migrate 把旧配置里被打开的自动发送**归位成关**"
                    "（跑过未发布开发版的配置也得归位）"))
-    checks.append((bool(re.search(r"^CONFIG_VERSION\s*=\s*3", cfg_src, re.M)),
+    # ⚠ 判据是「**至少** 3」，不是「正好 3」：CONFIG_VERSION 会随着**别的**功能
+    #   继续往上走（v1.0.31 就是 4）。写死等号的话，每加一次版本就得回来改这道闸
+    #   —— 而改闸的人多半会顺手把它放宽成永远为真（那才是真的失效）。
+    #   这里要守的只是"引入 send_after_voice 时**确实**把版本号抬过 3"。
+    _cv = re.search(r"^CONFIG_VERSION\s*=\s*(\d+)", cfg_src, re.M)
+    checks.append((bool(_cv) and int(_cv.group(1)) >= 3,
                    "config：CONFIG_VERSION 已同步（改默认值必须一起改，"
                    "否则老配置读不到新默认）"))
     checks.append((bool(re.search(r"c\.send_after_voice\s*=\s*False", cfg_src)),
@@ -500,7 +505,8 @@ def main() -> int:
          cfg_src.replace("if from_version < 3:", "if False:")),
         ("CONFIG_VERSION 不同步",
          main_src,
-         cfg_src.replace("CONFIG_VERSION = 3", "CONFIG_VERSION = 2")),
+         re.sub(r"^CONFIG_VERSION\s*=\s*\d+", "CONFIG_VERSION = 2", cfg_src,
+                count=1, flags=re.M)),
         ("「呆瓜配置」里又替用户打开自动发送",
          main_src,
          cfg_src.replace("c.send_after_voice   = False", "c.send_after_voice   = True")),

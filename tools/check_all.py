@@ -122,6 +122,7 @@ STEPS = [
                   "tools/check_frida_tap.py",
                   "tools/check_audio_watchdog.py",
                   "tools/check_send_after_voice.py",
+                  "tools/check_mouse_mode.py",
                   "tools/dump_report_descriptor.py",
                   "tools/probe_gatt_hid.py", "tools/probe_hid_claim.py",
                   "tools/watch_all_channels.py",
@@ -293,6 +294,15 @@ STEPS = [
     ("连接等待窗口与反馈", [PY, "tools/check_connect_wait.py"]),
     ("托盘菜单与退出", [PY, "tools/check_tray_menu.py"]),
     ("自动增益（AGC）", [PY, "tools/check_audio_agc.py"]),
+    # 鼠标模式（v1.0.31：方向键推指针）。这个功能的**每一条错法都直接伤到用户**，
+    # 而且全是静默的：松开丢了 ⇒ 指针一直跑（只能拔电池）；注入持锁 ⇒ 手都松了
+    # 还在走；不做亚像素累加 ⇒ 慢慢推纹丝不动；被语音收尾抢走优先级 ⇒ 说话时
+    # 误点一发左键。好在移动引擎是**纯逻辑**（输入=方向/沿/时刻，输出=位移序列），
+    # 拿假时钟 + 记录调用的桩就能完全不碰硬件地跑真值表。
+    # 另外钉接线：`_mouse_handle` 必须排在「语音会话中按确认键收尾」之后、
+    # `_get_cfg` 白名单必须有 5 个 mouse_* 字段（不加就静默不生效）、
+    # 引擎要登记进 teardown（否则退出后指针自己动）。6 条反例自证。
+    ("鼠标模式（方向键推指针）", [PY, "tools/check_mouse_mode.py"]),
     ("日志降噪", [PY, "tools/check_log_noise.py"]),
     # "波形在动、输入法却收不到声音，重启才好"（2026-09-17 真机）——
     # 输出流建一次就没人管 + 静音期间不消费队列导致 queue.Full 静默丢帧。
