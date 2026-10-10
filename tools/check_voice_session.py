@@ -541,19 +541,37 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
                   "⑧ 每一处 voice_hotkey_down() 后面都紧跟 _hk_fired = True"
                   "（漏一处 ⇒ 那条路收尾时不释放）"))
 
-    # 观测点：会话开着 + **非修饰键**按下 ⇒ 记一笔
+    # 观测点：会话开着 + **用户真的敲了一个键** ⇒ 记一笔
     ok_body = _indent4_block(src, "    def _on_key")
     c.append((bool(ok_body), "⑧ 找得到 _on_key 的函数体"))
     c.append(("global _im_closed_by_key" in ok_body,
               "⑧ _on_key 里声明了 global _im_closed_by_key"))
-    c.append((re.search(r"if \(voice_active and e\.event_type == \"down\" and e\.name\s*\n"
-                        r"\s+and not is_modifier\(e\.name\)\):", ok_body) is not None,
-              "⑧ 置位判据 = 会话开着 + 按下 + **非修饰键**"
-              "（少了 `not is_modifier` ⇒ 我们自己的热键组合 lctrl+lwin+lshift 会被"
-              "当成「用户敲的键」（`keys.tap_key` 不登记 self-injected）⇒ "
-              "每一段会话收尾都误跳过释放）"))
+    c.append(("if voice_active and _looks_like_user_key(e):" in ok_body,
+              "⑧ 置位判据 = 会话开着 + `_looks_like_user_key(e)`"))
     c.append((re.search(r"from keys import[^\n]*\bis_modifier\b", code) is not None,
               "⑧ main.py 从 keys 导入了 is_modifier"))
+
+    # `_looks_like_user_key` 三条排除，缺一条都会误判（各自都有真机证据）：
+    #   · 修饰键 —— 我们自己的热键组合 lctrl+lwin+lshift 全是修饰键
+    #   · 注入副产品 `reserved ` —— Win 键在 Ctrl 已按下时被系统改写成 vkCode 0xFC，
+    #     **不是修饰键**，光靠 `is_modifier` 挡不住 ⇒ 会话刚开就被自己收尾
+    #   · 抬起 —— 不产生新字符
+    i_h = code.find("def _looks_like_user_key")
+    helper = code[i_h:i_h + 900] if i_h >= 0 else ""
+    c.append((bool(helper), "⑧ 找得到 _looks_like_user_key 的函数体"))
+    c.append(("is_modifier(e.name)" in helper,
+              "⑧ `_looks_like_user_key` 排除修饰键"))
+    c.append((re.search(r"_INJECTION_ARTIFACT_KEYS\s*=\s*\{[^}]*\"reserved\"", code)
+              is not None,
+              "⑧ 有「注入副产品键名」黑名单，且含 `reserved`"
+              "（真机 10:54:05,173 `🔘 程序看到一个键 'reserved '（scan=-252）` "
+              "紧跟热键注入之后 —— 它是 Win 键被改写成 vkCode 0xFC 的那一个，"
+              "不是修饰键，不挡就是「会话刚开就被自己收尾」）"))
+    c.append(("_INJECTION_ARTIFACT_KEYS" in helper,
+              "⑧ `_looks_like_user_key` 用上了那张黑名单"
+              "（定义了却不用 = 白定义）"))
+    c.append(('e.event_type != "down"' in helper,
+              "⑧ `_looks_like_user_key` 只认按下（抬起不产生新字符）"))
 
     # 消费点：主循环看到这笔账 ⇒ 立刻收尾（否则托盘会一直显示「语音中」，
     # 而输入法早就不在语音态了 —— 用户报的第三句话就是这个）。
@@ -928,11 +946,18 @@ def main() -> int:
                             '            logger.debug("🎤 会话本来就没开', 1))
 
     # 反例 30：去掉 `not is_modifier(...)`（＝我们自己的热键组合被当成用户敲的键）
-    _expect_red("置位判据去掉 `not is_modifier(e.name)`"
-                "（＝自己的 lctrl+lwin+lshift 被当成用户敲的键 ⇒ "
-                "每段会话收尾都误跳过释放）",
-                src.replace("                and not is_modifier(e.name)):",
-                            "                ):", 1))
+    _expect_red("置位判据去掉修饰键排除（＝自己的 lctrl+lwin+lshift 被当成"
+                "用户敲的键 ⇒ 每段会话收尾都误跳过释放）",
+                src.replace("    if is_modifier(e.name):\n        return False\n",
+                            "", 1))
+
+    # 反例 30b：去掉注入副产品黑名单（＝`reserved ` 被当成用户敲的键 ⇒
+    #   会话刚开就被自己收尾；`hotkey_wait_first_frame` 打开时必中）
+    _expect_red("去掉注入副产品黑名单（＝热键注入时系统多报的 `reserved ` "
+                "被当成用户敲的键 ⇒ 会话刚开就被自己收尾）",
+                src.replace(
+                    "    return str(e.name).strip().lower() not in _INJECTION_ARTIFACT_KEYS",
+                    "    return True", 1))
 
     # 反例 31：去掉紧跟在 voice_hotkey_down() 后面的 _hk_fired = True
     #   （＝按下过也不记账 ⇒ 收尾时不释放，输入法一直留在语音态）

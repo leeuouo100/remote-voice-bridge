@@ -250,6 +250,41 @@ _hk_fired = False
 # （我们自己的热键组合全是修饰键，而 `tap_key` 不登记 self-injected）。
 _im_closed_by_key = False
 
+# ⚠⚠ 我们自己注入语音热键时，钩子那边会**额外**冒出一个**不是修饰键**的名字：
+#     `reserved `（scan=-252）
+#
+# 真机实证（2026-10-10 10:54:05，紧随 `🎤 voice hotkey TAP` 之后 20ms）：
+#   10:54:05,138 🎤 voice hotkey TAP (toggle 模式): lctrl+lwin+lshift
+#   10:54:05,157 🔘 程序看到一个键 'left windows'（scan=91）
+#   10:54:05,173 🔘 程序看到一个键 'reserved '（scan=-252）
+#
+# 它是 Win 键在「Ctrl 已经按下」时被系统改写成 `vkCode 0xFC` 的那一个
+# （机制见 `keys.hotkey_down` 里那段实测注释），**不是**用户敲的键。
+#
+# ⚠ 光靠 `is_modifier()` 挡不住它：`reserved` 不在修饰键族里 ⇒ 会被当成真按键
+#   ⇒ **每开一段会话就立刻被自己收尾**。而且这条在
+#   `hotkey_wait_first_frame` 打开时**必中**：那条路的注入发生在会话开始**之后**
+#   （主循环里消费 `_hotkey_pending`），那时 `voice_active` 早就是 True 了。
+#   关着的时候也只是"抢在 `voice_active = True` 之前到达"这个**竞态**没被触发而已
+#   （机器一忙、钩子线程一延迟就会中）。
+_INJECTION_ARTIFACT_KEYS = {"reserved"}
+
+
+def _looks_like_user_key(e) -> bool:
+    """这一下是不是「用户真的敲了一个键」（而不是我们自己注入的副产品）？
+
+    只有真按键才可能把输入法的语音态顶掉（切换模式「按任意键结束」）。
+    三类一律不算：
+      · 不是按下（抬起不产生新字符，切换模式也不靠它结束）
+      · 修饰键（`is_modifier`）—— 我们自己的热键组合 lctrl+lwin+lshift 全是它
+      · 我们注入热键时系统额外冒出来的副产品（见 `_INJECTION_ARTIFACT_KEYS`）
+    """
+    if e.event_type != "down" or not e.name:
+        return False
+    if is_modifier(e.name):
+        return False
+    return str(e.name).strip().lower() not in _INJECTION_ARTIFACT_KEYS
+
 # 手动重连请求。控制台点「重新连接」时置位，主循环看到就断开重来。
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
 # 连接和同一个托盘图标，谁赢不确定，表现为"点了重连就时好时坏"。
@@ -2857,16 +2892,16 @@ async def _run_bridge_inner(device_type: str | None = None,
         #      → 用户下一次真按语音键，那一下反而把它**关掉**（用不了）。
         # 真机实证见文件顶部 `_im_closed_by_key` 那段注释（2026-10-10 11:28/11:29）。
         #
-        # 判据只认「**非修饰键**的按下」：
+        # 判据只认「**用户真的敲了一个键**」，见 `_looks_like_user_key` 的注释：
         #   · 修饰键不算 —— 我们自己的热键组合 lctrl+lwin+lshift **全是修饰键**，
         #     而 `keys.tap_key` **不登记** self-injected（它没调 mark_injected），
         #     所以那三个键会被当成"用户敲的键"漏进来；只看非修饰键正好绕开这个坑。
         #     真机证据：2026-10-10 11:29:31,998 紧跟热键注入之后那行
         #     `🔘 程序看到一个键 'ctrl'（scan=29）` 就是它自己。
-        #   · 只认按下（down）—— 抬起不产生新字符，切换模式也不靠它结束。
-        #   · 会话没开着时不算 —— 那不属于"某一段会话被打断"。
-        if (voice_active and e.event_type == "down" and e.name
-                and not is_modifier(e.name)):
+        #   · 注入副产品不算 —— `reserved `（scan=-252）是 Win 键在 Ctrl 已按下时
+        #     被系统改写成 vkCode 0xFC 的那一个，**不是修饰键**，只能靠
+        #     `_INJECTION_ARTIFACT_KEYS` 挡；不挡就是"会话刚开就被自己收尾"。
+        if voice_active and _looks_like_user_key(e):
             _im_closed_by_key = True
 
         # ⚠ 第二个盲区：**键名本身为空**。
