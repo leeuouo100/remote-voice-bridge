@@ -469,6 +469,104 @@ def audit(src: str, state_src: str = "") -> list[tuple[bool, str]]:
               "（记在门后 → 要抓的情形里它永远不刷新 → 自愈条件永远不成立，"
               "代码在、永远跑不到）"))
 
+    # ── ⑧ 输入法相位账本：tap 模式的"释放"是一次**翻转**，必须严格配对 ────────
+    #
+    # 真机故障（2026-10-10，用户原话）：
+    #   「软件会自己打开语音输入 / 当我想用的时候语音输入又用不了 /
+    #     图标显示语音中，但没有微信输入法的语音输入图标」
+    #
+    # 根因：`end_voice_session` 里那句注释「幂等，重复调用没有副作用」**是错的** ——
+    #   tap 模式的 up 走 `send_combo()`，语义是**再点一下切换键**。
+    #   而断连/退出那条路（`teardown`）**无条件**调 `end_voice_session()` ⇒
+    #   没有会话也白按一下切换键 ⇒ 输入法相位被凭空翻转。
+    #   日志实证（每次前面都只有一行 TAP、**没有任何会话开始**）：
+    #     10:56:49,231 🎤 voice hotkey TAP → 10:56:49,317 🔚 会话收尾（断开或退出）
+    #     11:06:09,685 🎤 voice hotkey TAP → 11:06:09,774 🔚 会话收尾（断开或退出）
+    #     11:37:45,839 🎤 voice hotkey TAP → 11:37:45,936 🔚 会话收尾（断开或退出）
+    #
+    # 第二重：切换模式**按任意键都会结束**（CHANGELOG v1.0.9 那张表原话
+    #   「按下即开始，按任意键结束（切换模式）」），而程序是**盲按**切换键的。
+    #   日志实证 2026-10-10：
+    #     11:28:18,953 🔘 程序看到一个键 'enter'      ← 会话中用户敲了键盘
+    #     11:29:11,431 🎤 voice hotkey TAP            ← 收尾盲按 ⇒ 把已关掉的又点开
+    #     11:29:31,981 🎤 voice hotkey TAP            ← 用户真去按，反而把它关掉
+    c.append(("_hk_fired = False" in code,
+              "⑧ 有「本段会话到底按下去过没有」这笔账（_hk_fired）"))
+    c.append(("_im_closed_by_key = False" in code,
+              "⑧ 有「会话中用户敲过键盘 ⇒ 输入法已自己退出语音态」这笔账"
+              "（_im_closed_by_key）"))
+
+    evs2 = _indent4_block(src, "    def end_voice_session")
+    c.append(("global _hk_fired" in evs2,
+              "⑧ 收尾里声明了 global _hk_fired"
+              "（漏了 ⇒ 赋的是局部名 ⇒ 账永远不清 ⇒ 下一次收尾漏释放，"
+              "输入法一直留在语音态）"))
+    # 判据必须落在**最近的那个 If** 上：释放长在 `if _hk_fired:` 里面，
+    # 而它外面天然还包着别的 if —— 用"存在某个 If"当判据会永远为真（假绿）。
+    c.append((re.search(r"if _hk_fired:\s*\n\s+_hk_fired = False\s*\n"
+                        r"\s+if _im_was_closed:", evs2) is not None,
+              "⑧ 释放热键被 `if _hk_fired:` 守住（＝只有这一段按下去过才释放）"))
+    c.append(("_hk_fired = False" in evs2,
+              "⑧ 收尾把账清零（不清 ⇒ 下一次断连又白按一下切换键）"))
+    # ⚠ 「没有按下去过就绝不许释放」必须用**位置 + 次数**判，不能只判"有没有这个词"：
+    #   老形态（断连/退出时也去按一下）是在 else 分支里多写一句 voice_hotkey_up()，
+    #   而"存在 voice_hotkey_up()"对它照样为真 ⇒ 假绿。
+    i_fired = evs2.find("if _hk_fired:")
+    i_up = evs2.find("voice_hotkey_up()")
+    i_armed = evs2.find("elif _hk_was_armed:")
+    c.append((0 <= i_fired < i_up < i_armed,
+              "⑧ 唯一那次 voice_hotkey_up() 夹在 `if _hk_fired:` 与 "
+              "`elif _hk_was_armed:` 之间（＝只有按下过才释放）"))
+    c.append((evs2.count("voice_hotkey_up()") == 1,
+              "⑧ 收尾里 voice_hotkey_up() 只能出现**一次**"
+              "（多出来的那句就是「没按过也去释放」⇒ 翻转输入法相位）"))
+    c.append((re.search(r"if _hk_never_fired:", evs2) is None,
+              "⑧ 不许退回「只判 pending、其余一律 up」的老形态"
+              "（_hk_never_fired 那个变量连同它的逻辑一起退休了）"))
+    # ⚠ 这条**不能**过 `_code_only()`：它会把 `logger.` 开头的整行剥掉
+    #   （见它的实现）⇒ 锚点 `logger.info` 落空 ⇒ 假红。
+    #   也不能直接 `if _im_was_closed:\s*\n\s+logger\.info`：两者之间夹着一段
+    #   解释"为什么必须跳过"的注释。⇒ 允许中间夹任意行注释。
+    c.append((re.search(r"if _im_was_closed:\s*\n(?:\s*#[^\n]*\n)*\s+logger\.info",
+                        evs2) is not None,
+              "⑧ 会话中敲过键盘时**跳过**补按切换键"
+              "（不跳 ⇒ 把已经关掉的输入法又点开 = 用户报的「自己打开语音输入」）"))
+
+    # 置位点：每一处 voice_hotkey_down() 后面都要紧跟这一笔（漏一处 ⇒ 那条路不释放）
+    n_down = len(re.findall(r"voice_hotkey_down\(\)", code))
+    c.append((n_down >= 2,
+              "⑧ 找得到两处 voice_hotkey_down()（立刻注入 + 等首帧后的兜底注入）"))
+    for m in re.finditer(r"voice_hotkey_down\(\)", code):
+        c.append(("_hk_fired = True" in code[m.end():m.end() + 200],
+                  "⑧ 每一处 voice_hotkey_down() 后面都紧跟 _hk_fired = True"
+                  "（漏一处 ⇒ 那条路收尾时不释放）"))
+
+    # 观测点：会话开着 + **非修饰键**按下 ⇒ 记一笔
+    ok_body = _indent4_block(src, "    def _on_key")
+    c.append((bool(ok_body), "⑧ 找得到 _on_key 的函数体"))
+    c.append(("global _im_closed_by_key" in ok_body,
+              "⑧ _on_key 里声明了 global _im_closed_by_key"))
+    c.append((re.search(r"if \(voice_active and e\.event_type == \"down\" and e\.name\s*\n"
+                        r"\s+and not is_modifier\(e\.name\)\):", ok_body) is not None,
+              "⑧ 置位判据 = 会话开着 + 按下 + **非修饰键**"
+              "（少了 `not is_modifier` ⇒ 我们自己的热键组合 lctrl+lwin+lshift 会被"
+              "当成「用户敲的键」（`keys.tap_key` 不登记 self-injected）⇒ "
+              "每一段会话收尾都误跳过释放）"))
+    c.append((re.search(r"from keys import[^\n]*\bis_modifier\b", code) is not None,
+              "⑧ main.py 从 keys 导入了 is_modifier"))
+
+    # 消费点：主循环看到这笔账 ⇒ 立刻收尾（否则托盘会一直显示「语音中」，
+    # 而输入法早就不在语音态了 —— 用户报的第三句话就是这个）。
+    c.append(('end_voice_session("输入法已退出语音态"' in code,
+              "⑧ 主循环消费这笔账：输入法已退出语音态时**立刻收尾**"
+              "（不收尾 ⇒ 托盘一直显示「语音中」却一个字都输入不了）"))
+    i_imc = code.find("if _im_closed_by_key and voice_active:")
+    i_align = code.find("if state.get().streaming != voice_active:")
+    c.append((0 <= i_imc < i_align,
+              "⑧ 那条收尾必须排在「状态归位」**之前**"
+              "（排在后面 ⇒ 归位那一句看的是旧 `voice_active`，"
+              "UI 要等下一轮才熄，白多一轮谎报）"))
+
     # ── ⑧ 自愈的**宽限期**（2026-09-30 真机）────────────────────────────────
     #
     # 为什么要这一组：我们发完 MIC_CLOSE 之后，遥控器手里/空中的那几帧还会到
@@ -812,7 +910,57 @@ def main() -> int:
                 src.replace("                               and _audio_frames == 0\n",
                             "", 1))
 
-    if n_red < 24:
+    # ── 反例 28~33（v1.0.30）：输入法相位账本 ────────────────────────────
+    #
+    # 反例 28：去掉 `if _hk_fired:` 这道闸（＝退回"无条件释放"）
+    #   ⇒ 断连/退出时明明没有会话，也去按一下切换键 ⇒ 输入法被凭空点开。
+    _expect_red("去掉 `if _hk_fired:` 这道闸（＝没按过也去释放，"
+                "断连时把输入法凭空点开）",
+                src.replace("        if _hk_fired:\n            _hk_fired = False",
+                            "        if True:\n            _hk_fired = False", 1))
+
+    # 反例 29：在"没有会话"那个 else 分支里补一句 voice_hotkey_up()
+    #   （＝老形态复活：判据只判 pending、其余一律 up）
+    _expect_red("在「没有会话」的 else 分支里补一句 voice_hotkey_up()"
+                "（＝老形态复活，断连一次就翻转一次输入法）",
+                src.replace('            logger.debug("🎤 会话本来就没开',
+                            '            voice_hotkey_up()\n'
+                            '            logger.debug("🎤 会话本来就没开', 1))
+
+    # 反例 30：去掉 `not is_modifier(...)`（＝我们自己的热键组合被当成用户敲的键）
+    _expect_red("置位判据去掉 `not is_modifier(e.name)`"
+                "（＝自己的 lctrl+lwin+lshift 被当成用户敲的键 ⇒ "
+                "每段会话收尾都误跳过释放）",
+                src.replace("                and not is_modifier(e.name)):",
+                            "                ):", 1))
+
+    # 反例 31：去掉紧跟在 voice_hotkey_down() 后面的 _hk_fired = True
+    #   （＝按下过也不记账 ⇒ 收尾时不释放，输入法一直留在语音态）
+    _expect_red("去掉紧跟 voice_hotkey_down() 的那句 `_hk_fired = True`"
+                "（＝按下过也不记账 ⇒ 收尾不释放，输入法留在语音态）",
+                src.replace("                        _hk_fired = True\n", "", 1))
+
+    # 反例 32：去掉「会话中敲过键盘就跳过补按」这条
+    _expect_red("去掉「会话中敲过键盘 ⇒ 跳过补按切换键」"
+                "（＝盲按会把已经关掉的输入法又点开 = 用户报的"
+                "「自己打开语音输入」）",
+                src.replace("            if _im_was_closed:\n",
+                            "            if False:\n", 1))
+
+    # 反例 33：收尾里漏掉 global 声明（＝账写在局部名上，模块级那个永不清）
+    _expect_red("收尾漏声明 `global _hk_fired`"
+                "（＝赋的是局部名 ⇒ 账永不清 ⇒ 下一次收尾漏释放）",
+                src.replace("        global _hk_fired, _im_closed_by_key\n",
+                            "", 1))
+
+    # 反例 34：主循环不再消费这笔账（＝托盘一直显示「语音中」，
+    #   可输入法早就不在语音态了）
+    _expect_red("主循环不再消费「输入法已退出语音态」这笔账"
+                "（＝托盘一直显示「语音中」，却一个字都输入不了）",
+                src.replace("            if _im_closed_by_key and voice_active:\n",
+                            "            if False:\n", 1))
+
+    if n_red < 30:
         ok = False
 
     print()

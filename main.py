@@ -26,7 +26,7 @@ from atvv import (
 )
 from adpcm import IMAADPCMDecoder
 from session import SessionCoordinator, Phase
-from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up, tap_key
+from keys import voice_hotkey_down, voice_hotkey_up, hotkey_up, tap_key, is_modifier
 from buttons import resolve_button
 import mixer
 
@@ -204,6 +204,51 @@ _last_audio_stop_frames = -1
 # 由 `on_control`（BLE 回调线程）置位、由**主循环**消费：主循环那边能安全地
 # 读 `voice_active`（判断会话是不是已经结束了），也方便做超时兜底。
 _hotkey_pending: dict = {"at": 0.0, "armed": False}
+
+# ── 输入法相位账本（v1.0.30）────────────────────────────────────────────────
+#
+# ⚠⚠ 铁律：**tap 模式下的"释放"是一次翻转，不是幂等的。**
+#
+# `keys.voice_hotkey_up()` 在 tap 模式下走的是 `send_combo(keys)` —— 也就是
+# **再点一下**那个切换键。而微信输入法的「启动语音输入」是**切换模式**：
+# 按一下开始、再按一下结束（见 CHANGELOG v1.0.9 那张表、
+# config.INPUT_METHODS['wechat_hold_mode'] 的注释）。
+#
+# 于是"按一次、放一次"必须**严格配对**。老代码里那句
+#   `# ① 释放输入法热键（幂等，重复调用没有副作用）`
+# 是**错的**，而且已经造成了真机故障 —— 2026-10-10 用户报
+# 「软件会自己打开语音输入 / 当我想用的时候又用不了 / 图标显示语音中但没有
+#   微信输入法的语音输入图标」，根因就是**没按下也去释放**：
+#
+#   10:56:49,231 🎤 voice hotkey TAP   ← 当时**没有**任何会话
+#   10:56:49,317 🔚 会话收尾（断开或退出）
+#   （同样的事 11:06:09、11:37:45 各来一次 —— 每次断连都白按一下切换键）
+#
+#   断开/退出那条路会**无条件**调 `end_voice_session()`（main.py 的
+#   `_BridgeResources.teardown`），本意只是让 UI 归位，却顺手把输入法的
+#   语音态**翻转**了一次。用户看到微信输入法的语音面板自己冒出来；
+#   等他真去按遥控器语音键，那一下反而把输入法**关掉** ⇒ 托盘「语音中」、
+#   输入法却不在语音态、一个字也输入不了。而且账面上程序没错 ——
+#   它确实开了会话，是**输入法的相位**和程序对不上了。
+#
+# ⇒ 所以这里记一笔"这一段会话我们到底按下去过没有"，只有按过才许释放。
+_hk_fired = False
+
+# 「会话中用户敲过键盘 ⇒ 输入法已经自己退出语音态」（v1.0.30）。
+#
+# 微信输入法那个切换模式**按任意键都会结束**（CHANGELOG v1.0.9 那张表写的就是
+# 「按下即开始，按任意键结束（切换模式）」）。而程序是**盲按**切换键的 ——
+# 它不知道输入法已经被顶掉了。真机实证（2026-10-10，同一次会话内）：
+#
+#   11:28:03,797 🎙️ 语音会话【开始】
+#   11:28:18,953 🔘 程序看到一个键 'enter'      ← 用户敲了键盘 ⇒ 输入法退出语音态
+#   11:28:23,757 🔘 程序看到一个键 'backspace'
+#   11:29:11,431 🎤 voice hotkey TAP            ← 会话收尾，盲按 ⇒ 把**已关掉的**又点开
+#   11:29:31,981 🎤 voice hotkey TAP            ← 用户真去按，反而把它**关掉** ⇒ 用不了
+#
+# 判据只认「**非修饰键**的按下」，理由见 `_on_key` 里置位处的注释
+# （我们自己的热键组合全是修饰键，而 `tap_key` 不登记 self-injected）。
+_im_closed_by_key = False
 
 # 手动重连请求。控制台点「重新连接」时置位，主循环看到就断开重来。
 # 为什么不在控制台里 Popen 一个新进程：那样会出现两个实例同时抢同一个 BLE
@@ -1323,6 +1368,9 @@ async def _run_bridge_inner(device_type: str | None = None,
                             stop_event: "threading.Event | None" = None,
                             res: "_BridgeResources | None" = None):
     """真正干活的那一层。收尾**不在这里** —— 见 `_BridgeResources.teardown`。"""
+    # v1.0.30：主循环里那条「等首帧到了再叫输入法」的兜底路径也要记这一笔
+    # （它同样是"按下去过"），否则收尾时会漏掉配对释放 —— 见 `_hk_fired` 注释。
+    global _hk_fired
     if res is None:                       # 允许单独调用（诊断/测试）
         res = _BridgeResources()
     stop = stop_event if stop_event is not None else _stop_request
@@ -1779,24 +1827,51 @@ async def _run_bridge_inner(device_type: str | None = None,
         返回 True 表示"调用之前会话确实开着"。
         """
         nonlocal voice_active, voice_started_at, pending_mic_echo, mic_echo_since
+        global _hk_fired, _im_closed_by_key
         was_active = voice_active
 
-        # ① 释放输入法热键（幂等，重复调用没有副作用）。
+        # ① 释放输入法热键 —— **只有这一段会话真的按下去过，才许释放**。
         #    放在最前面：万一下面任何一步抛异常，也绝不能把 Ctrl/Win 按着不放 ——
         #    那会让整台电脑的键盘都不正常。
         #
-        # ⚠⚠ v1.0.29：「等首帧再叫输入法」开着时（`hotkey_wait_first_frame`），
-        #   这一次的 down **可能压根没发出去**（会话在首帧到达前就结束了）。
-        #   而 tap 模式下的 up 是"**再点一下**"（见 keys.voice_hotkey_up）——
-        #   对一次没按过的键发 up，等于把输入法**叫起来**，正好和这个开关的
-        #   目的相反。所以这里必须先看 pending：还没注入过就**不发 up**。
-        _hk_never_fired = _hotkey_pending["armed"]
+        # ⚠⚠ v1.0.30：判据从"无条件释放"改成"**按过才释放**"。老代码那句
+        #   「幂等，重复调用没有副作用」是错的 —— tap 模式下的 up 是
+        #   **再点一下切换键**（`send_combo`），是一次**翻转**，根本不幂等。
+        #   它造成的真机故障与取证见文件顶部 `_hk_fired` 那段注释，一句话：
+        #   **断连/退出时明明没有会话，也去按了一下切换键** ⇒ 输入法被凭空点开
+        #   ⇒ 用户下一次真按语音键反而把它关掉（「托盘语音中、输入法却没图标」）。
+        #
+        #   三段判据，互斥且穷尽：
+        #     · `_hk_fired`      —— 这一段按下过 ⇒ 必须配对释放。
+        #     · `_hk_was_armed`  —— 「等首帧再叫输入法」开着（v1.0.29），
+        #       而会话在首帧到达前就结束了：down **压根没发出去**。对一次没按过的
+        #       键发 up 等于把输入法**叫起来**，正好和这个开关的目的相反 ⇒ 不发。
+        #     · 其余（含断连/退出时无会话）—— 输入法根本没被这一次叫起来 ⇒
+        #       **绝不发 up**。这一条就是 v1.0.30 修的那个洞。
+        _hk_was_armed = _hotkey_pending["armed"]
         _hotkey_pending["armed"] = False
-        if _hk_never_fired:
+        _im_was_closed = _im_closed_by_key
+        _im_closed_by_key = False
+        if _hk_fired:
+            _hk_fired = False
+            if _im_was_closed:
+                # 会话中用户敲过键盘 ⇒ 输入法已经自己退出语音态（切换模式
+                # 「按任意键结束」）。这一下**绝不能**盲按切换键 —— 那会把
+                # 已经关掉的输入法又点开，正是用户报的「软件自己打开语音输入」。
+                logger.info(
+                    "🎤 会话中你敲过键盘 → 输入法已经自己退出语音态，"
+                    "**不再**补按切换键（补了会把关掉的输入法又点开）"
+                )
+            else:
+                voice_hotkey_up()
+        elif _hk_was_armed:
             logger.info("🎤 语音会话结束 → 取消「等首帧」：输入法这次**没被叫起来**"
                         "（遥控器一直没出声）")
         else:
-            voice_hotkey_up()
+            # 会话本来就没开着（典型：断连/退出时只是让 UI 归位）。
+            # 这里什么都不做是**关键**，不是省事 —— 见 `_hk_fired` 那段注释。
+            logger.debug("🎤 会话本来就没开 → 不注入输入法热键"
+                         "（tap 模式下那是**翻转**，会凭空把输入法点开）")
 
         # ② 命令遥控器关麦。**必须在清状态之前**，而且要**不看相位**地发。
         #    这是让遥控器真正停止推流的唯一手段。
@@ -1853,6 +1928,7 @@ async def _run_bridge_inner(device_type: str | None = None,
         nonlocal pending_mic_echo, mic_echo_since
         global _audio_frames, _audio_peak, _echo_swallowed, _remote_frame_last_at
         global _last_audio_stop_at, _last_audio_stop_frames
+        global _hk_fired, _im_closed_by_key
         last_ble_activity = time.time()
         try:
             data = bytes(args.characteristic_value)
@@ -2000,6 +2076,9 @@ async def _run_bridge_inner(device_type: str | None = None,
                     # 回响计数按会话归零：这样每一段的前 3 次"吞掉"都会以 INFO
                     # 出现在日志里，一眼能看出这一段有没有被回响干扰。
                     _echo_swallowed = 0
+                    # v1.0.30：新的一段开始了 ⇒ "用户敲过键盘"这笔账重新算
+                    # （见 `_im_closed_by_key` 的注释）。
+                    _im_closed_by_key = False
                     _hk_cfg = Config.load()
                     if _hk_cfg.hotkey_wait_first_frame:
                         # 「等遥控器出声再叫输入法」（默认关，见 config 里那段注释）。
@@ -2019,6 +2098,9 @@ async def _run_bridge_inner(device_type: str | None = None,
                             _hk_cfg.hotkey_wait_max_ms)
                     else:
                         voice_hotkey_down()  # tap=点按开始 / hold=按下并保持
+                        # v1.0.30：记下"这一段按下去过"，收尾时才允许配对释放
+                        # （tap 模式下的释放是一次**翻转**，不配对就会把输入法点反）。
+                        _hk_fired = True
                     voice_active     = True
                     res.voice_active = True
                     voice_started_at = time.time()
@@ -2746,6 +2828,7 @@ async def _run_bridge_inner(device_type: str | None = None,
 
     def _on_key(e):
         nonlocal last_key_activity, last_ble_activity, voice_active, voice_started_at
+        global _im_closed_by_key
         if e.event_type == "down":
             last_key_activity = time.time()
             # ⚠ 这里**分不出遥控器和物理键盘**（低级钩子看不到来源设备，
@@ -2764,6 +2847,27 @@ async def _run_bridge_inner(device_type: str | None = None,
         # （确认键 → Enter 就是典型），不挡掉就会无限自激。
         if was_self_injected(e.name):
             return True
+
+        # ── 输入法相位：这一下会不会把输入法的语音态顶掉？（v1.0.30）──────────
+        # 微信输入法的「启动语音输入」是**切换模式**，而切换模式**按任意键都会
+        # 结束**（CHANGELOG v1.0.9 那张表原话：「按下即开始，按任意键结束
+        # （切换模式）」）。程序却是**盲按**切换键的 —— 它不知道输入法已经被顶掉了。
+        # 于是：会话中敲一下键盘 → 输入法自己退出语音态 → 程序仍以为在语音中
+        #      → 会话收尾时再盲按一次切换键 → **把已经关掉的输入法又点开了**
+        #      → 用户下一次真按语音键，那一下反而把它**关掉**（用不了）。
+        # 真机实证见文件顶部 `_im_closed_by_key` 那段注释（2026-10-10 11:28/11:29）。
+        #
+        # 判据只认「**非修饰键**的按下」：
+        #   · 修饰键不算 —— 我们自己的热键组合 lctrl+lwin+lshift **全是修饰键**，
+        #     而 `keys.tap_key` **不登记** self-injected（它没调 mark_injected），
+        #     所以那三个键会被当成"用户敲的键"漏进来；只看非修饰键正好绕开这个坑。
+        #     真机证据：2026-10-10 11:29:31,998 紧跟热键注入之后那行
+        #     `🔘 程序看到一个键 'ctrl'（scan=29）` 就是它自己。
+        #   · 只认按下（down）—— 抬起不产生新字符，切换模式也不靠它结束。
+        #   · 会话没开着时不算 —— 那不属于"某一段会话被打断"。
+        if (voice_active and e.event_type == "down" and e.name
+                and not is_modifier(e.name)):
+            _im_closed_by_key = True
 
         # ⚠ 第二个盲区：**键名本身为空**。
         #   `keyboard` 库遇到它解析不出来的键，会把 e.name 报成 None/空串。
@@ -3189,6 +3293,8 @@ async def _run_bridge_inner(device_type: str | None = None,
                             "首帧已到" if _hk_seen else "等首帧超时，兜底先叫",
                             _hk_ms)
                         voice_hotkey_down()
+                        # v1.0.30：记下"这一段按下去过"，收尾时才允许配对释放。
+                        _hk_fired = True
 
             # 音频输出流监护：回调静默超时就重建（见 _supervise_audio 注释）。
             # 放在每一轮的最前面 —— 这是"没声音"里唯一能自愈的一条，越早发现越好。
@@ -3240,6 +3346,25 @@ async def _run_bridge_inner(device_type: str | None = None,
                 #   宁可不发，让用户自己看一眼再决定。
                 #   send=False 会顺手**取消**待发送，防别处残留的登记在这一刻被触发。
                 end_voice_session("超时自动收尾", send=False)
+
+            # ①' 输入法已经自己退出语音态 ⇒ 这一段语音**已经没有意义了**，立刻收尾。
+            #
+            # 微信输入法的切换模式**按任意键都会结束**，而会话期间敲一下键盘
+            # （物理键盘、或遥控器上还没映射的键）都会走到这里 —— 账由 `_on_key`
+            # 记（见 `_im_closed_by_key` 的注释）。
+            # 此时继续挂着会话只有一个后果：托盘/控制台一直显示「语音中」，
+            # 却一个字都输入不了 —— 用户 2026-10-10 的原话正是
+            # 「图标是显示语音中，但没有微信输入法的语音输入图标」。
+            #
+            # ⚠ 收尾**会跳过**补按切换键（`end_voice_session` 里看这笔账）——
+            #   不跳就等于把刚被顶掉的输入法又**点开**，那正是另一半故障
+            #   （「软件会自己打开语音输入」）。
+            # ⚠ 不自动发送（send=False）：用户敲键盘多半是在打字，不是"说完了"。
+            # ⚠ 收尾必须放在 ② 状态归位**之前** —— 归位那一句看的是 `voice_active`，
+            #   放在后面就得等下一轮才把 UI 熄掉。
+            if _im_closed_by_key and voice_active:
+                logger.info("🎙️ 语音会话【结束】（会话中敲了键盘 → 输入法已退出语音态）")
+                end_voice_session("输入法已退出语音态", send=False)
 
             # ② 状态归位：`streaming` 是 UI 上「有没有在收音」的**唯一真源**
             #    （托盘图标变橙红、控制台顶部那行「语音中」都直接读它），
