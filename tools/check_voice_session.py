@@ -985,6 +985,76 @@ def main() -> int:
                 src.replace("            if _im_closed_by_key and voice_active:\n",
                             "            if False:\n", 1))
 
+    # ── 行为级：`_looks_like_user_key` 真的能把三类排除掉吗？────────────────
+    # ⚠ 静态判据只能证明"那三句话还在"，证明不了它们的**语义** ——
+    #   把 `not in` 写成 `in`、把 `!= "down"` 写成 `== "down"`，静态判据照样全绿。
+    #   所以把函数**原文抠出来**、配上真的 `keys.is_modifier` 跑一遍真值表。
+    #   抠的是 `src`（不是 `code`）：`exec` 不介意注释，而 `code` 会把
+    #   `logger.` 开头的整行剥掉，万一函数里将来加了日志就会抠出半截。
+    print()
+    print("── 行为级：`_looks_like_user_key` 真值表 ──")
+    try:
+        from keys import is_modifier as _real_mod
+    except Exception as _e:                                  # noqa: BLE001
+        print(f"  ⚠ 拿不到 keys.is_modifier（{_e!r}）—— 跳过行为级真值表")
+        _real_mod = None
+
+    _re_set = re.compile(r"_INJECTION_ARTIFACT_KEYS\s*=\s*\{[^}]*\}")
+    _re_fn = re.compile(r"(def _looks_like_user_key\(e\).*?)(?=\n\S)", re.S)
+
+    def _run_truth_table(text: str) -> list[tuple[bool, str]]:
+        """返回 [(是否符合预期, 说明)]；抠不出函数就返回空表。"""
+        m_set, m_fn = _re_set.search(text), _re_fn.search(text)
+        if not m_set or not m_fn:
+            return []
+        ns: dict = {"is_modifier": _real_mod}
+
+        class _Ev:
+            def __init__(self, t: str, n: str) -> None:
+                self.event_type, self.name = t, n
+
+        try:
+            exec(m_set.group(0) + "\n" + m_fn.group(1), ns)      # noqa: S102
+            looks = ns["_looks_like_user_key"]
+        except Exception as _e:                                  # noqa: BLE001
+            return [(False, f"抠出来的函数跑不起来：{_e!r}")]
+        rows = [
+            ("down", "reserved ", False, "注入副产品 `reserved `（Win 被改写成 0xFC）"),
+            ("down", "left windows", False, "修饰键 lwin"),
+            ("down", "ctrl", False, "修饰键 ctrl"),
+            ("up", "a", False, "抬起（不是按下）"),
+            ("down", "", False, "无名事件"),
+            ("down", "enter", True, "用户敲回车"),
+            ("down", "backspace", True, "用户敲退格"),
+            ("down", "g", True, "用户敲字母"),
+        ]
+        out = []
+        for t, n, want, why in rows:
+            got = bool(looks(_Ev(t, n)))
+            out.append((got == want, f"{why}：name={n!r} → {got}（期望 {want}）"))
+        return out
+
+    if _real_mod is not None:
+        _table = _run_truth_table(src)
+        if not _table:
+            print("  ❌ 抠不出 `_looks_like_user_key` —— 行为级真值表没跑成")
+            ok = False
+        for good, desc in _table:
+            print(f"  {'✅' if good else '❌'} {desc}")
+            if not good:
+                ok = False
+        # 反例自证：把「不在黑名单里」反过来写，真值表必须抓到
+        _bad = src.replace(
+            "    return str(e.name).strip().lower() not in _INJECTION_ARTIFACT_KEYS",
+            "    return str(e.name).strip().lower() in _INJECTION_ARTIFACT_KEYS", 1)
+        _bad_rows = _run_truth_table(_bad)
+        _caught = bool(_bad_rows) and any(not g for g, _ in _bad_rows)
+        print(f"  {'✅' if _caught else '❌'} 反例：把 `not in` 反过来写"
+              f"（`reserved ` 就会变成「用户敲的键」）→ "
+              f"{'真值表抓到了' if _caught else '真值表居然没抓到'}")
+        if not _caught:
+            ok = False
+
     if n_red < 30:
         ok = False
 
